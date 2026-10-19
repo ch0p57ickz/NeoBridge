@@ -1,0 +1,82 @@
+{
+  "chunks": [
+    "c08141004e656f20736d61727470656e20413100312e302e300000000000000000000000322e31380000000000000000000000000000000000000000010000000000000000c1",
+    "c06b0d0000bc0a0003070000000c000000c1",
+    "c0630e00000068e5cf8b0100000000000000c1",
+    "c06c0e00000a0002e803f40119325a5a0000c1",
+    "c06c0e00000a5802e903f5011e3c5a5a0000c1",
+    "c06c0e00000abc02ea03f60100005a5a0000c1",
+    "c06c0e00000a2003eb03f7014b195a5a0000c1",
+    "c0630e00013268e5cf8b0100000000000000c1"
+  ],
+  "comment": "Realtime down, four dots, and up on one page, preceded by version info.",
+  "evidenceLevel": "officialSDK",
+  "expected": [
+    {
+      "commandByte": "0x81",
+      "kind": "packet",
+      "payloadHex": "4e656f20736d61727470656e20413100312e302e300000000000000000000000322e31380000000000000000000000000000000000000000010000000000000000"
+    },
+    {
+      "commandByte": "0x6B",
+      "kind": "packet",
+      "payloadHex": "00bc0a0003070000000c000000"
+    },
+    {
+      "commandByte": "0x63",
+      "kind": "packet",
+      "payloadHex": "000068e5cf8b0100000000000000"
+    },
+    {
+      "commandByte": "0x6C",
+      "kind": "packet",
+      "payloadHex": "000a0002e803f40119325a5a0000"
+    },
+    {
+      "commandByte": "0x6C",
+      "kind": "packet",
+      "payloadHex": "000a5802e903f5011e3c5a5a0000"
+    },
+    {
+      "commandByte": "0x6C",
+      "kind": "packet",
+      "payloadHex": "000abc02ea03f60100005a5a0000"
+    },
+    {
+      "commandByte": "0x6C",
+      "kind": "packet",
+      "payloadHex": "000a2003eb03f7014b195a5a0000"
+    },
+    {
+      "commandByte": "0x63",
+      "kind": "packet",
+      "payloadHex": "013268e5cf8b0100000000000000"
+    }
+  ],
+  "expectedPage": {
+    "book": 7,
+    "owner": 2748,
+    "page": 12,
+    "section": 3
+  },
+  "expectedProtocolVersion": "2.18",
+  "expectedStrokeCount": 1,
+  "fixtureVersion": 1,
+  "id": "a1-realtime-stroke",
+  "provenance": {
+    "captureDate": "2026-10-18",
+    "deviceModel": "A1 (F151)",
+    "firmware": "unverified",
+    "observedProtocolVersion": "2.18",
+    "source": "Neo iOS SDK 3.0 (github.com/NeoSmartpen/iOS-SDK3.0)"
+  },
+  "sanitization": {
+    "notes": "Bluetooth address bytes are zeroed. Connection codes, serial numbers, and password material are absent. Coordinates are synthetic and do not reproduce personal handwriting.",
+    "removed": [
+      "bluetoothAddress",
+      "serialNumber",
+      "authenticationMaterial",
+      "handwritingContent"
+    ]
+  }
+}

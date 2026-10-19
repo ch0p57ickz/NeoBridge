@@ -1,0 +1,46 @@
+{
+  "chunks": [
+    "c081009000000000c1",
+    "c081c80000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000c1c08141004e656f20736d61727470656e20413100312e302e300000000000000000000000322e31380000000000000000000000000000000000000000010000000000000000c1"
+  ],
+  "comment": "An oversized declared payload and a frame that overflows the buffer, then a valid frame.",
+  "evidenceLevel": "officialSDK",
+  "expected": [
+    {
+      "error": "payloadExceedsLimit",
+      "kind": "error"
+    },
+    {
+      "error": "bufferedInputExceedsLimit",
+      "kind": "error"
+    },
+    {
+      "commandByte": "0x81",
+      "kind": "packet",
+      "payloadHex": "4e656f20736d61727470656e20413100312e302e300000000000000000000000322e31380000000000000000000000000000000000000000010000000000000000"
+    }
+  ],
+  "expectedProtocolVersion": "2.18",
+  "fixtureVersion": 1,
+  "id": "a1-size-limit-recovery",
+  "limits": {
+    "maxBufferedBytes": 68,
+    "maxPayloadBytes": 32000
+  },
+  "provenance": {
+    "captureDate": "2026-10-18",
+    "deviceModel": "A1 (F151)",
+    "firmware": "unverified",
+    "observedProtocolVersion": "2.18",
+    "source": "Neo iOS SDK 3.0 (github.com/NeoSmartpen/iOS-SDK3.0)"
+  },
+  "sanitization": {
+    "notes": "Bluetooth address bytes are zeroed. Connection codes, serial numbers, and password material are absent. Coordinates are synthetic and do not reproduce personal handwriting.",
+    "removed": [
+      "bluetoothAddress",
+      "serialNumber",
+      "authenticationMaterial",
+      "handwritingContent"
+    ]
+  }
+}

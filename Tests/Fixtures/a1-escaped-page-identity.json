@@ -1,0 +1,38 @@
+{
+  "chunks": [
+    "c06b0d00007de07de17d5d03070000000c000000c1"
+  ],
+  "comment": "A page identity whose owner bytes collide with the framing markers, so the wire bytes are escaped.",
+  "evidenceLevel": "officialSDK",
+  "expected": [
+    {
+      "commandByte": "0x6B",
+      "kind": "packet",
+      "payloadHex": "00c0c17d03070000000c000000"
+    }
+  ],
+  "expectedPage": {
+    "book": 7,
+    "owner": 8241600,
+    "page": 12,
+    "section": 3
+  },
+  "fixtureVersion": 1,
+  "id": "a1-escaped-page-identity",
+  "provenance": {
+    "captureDate": "2026-10-18",
+    "deviceModel": "A1 (F151)",
+    "firmware": "unverified",
+    "observedProtocolVersion": "2.18",
+    "source": "Neo iOS SDK 3.0 (github.com/NeoSmartpen/iOS-SDK3.0)"
+  },
+  "sanitization": {
+    "notes": "Bluetooth address bytes are zeroed. Connection codes, serial numbers, and password material are absent. Coordinates are synthetic and do not reproduce personal handwriting.",
+    "removed": [
+      "bluetoothAddress",
+      "serialNumber",
+      "authenticationMaterial",
+      "handwritingContent"
+    ]
+  }
+}
