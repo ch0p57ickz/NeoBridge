@@ -1,33 +1,71 @@
-# Xcode & macOS
+# macOS and editor files
 .DS_Store
-DerivedData/
-*.pbxuser
-!default.pbxuser
-*.mode1v3
-!default.mode1v3
-*.mode2v3
-!default.mode2v3
-*.perspectivev3
-!default.perspectivev3
-xcuserdata/
-*.xccheckout
-*.moved-aside
-*.xcuserstate
-*.xcscmblueprint
-
-# Swift Package Manager
-.build/
-Packages/*/.build/
-.swiftpm/
-Packages/*/.swiftpm/
-
-# Fastlane / Artifacts
-fastlane/report.xml
-fastlane/Preview.html
-fastlane/screenshots
-fastlane/test_output
-
-# Linux temporary files
+._*
 *~
 *.swp
 *.swo
+.idea/
+.vscode/
+
+# Swift Package Manager (including Packages/NeoCore and Packages/NeoProtocol)
+.build/
+.swiftpm/
+*.xcodeproj/project.xcworkspace/xcuserdata/
+
+# Xcode and macOS build output
+DerivedData/
+xcuserdata/
+*.xcuserstate
+*.xccheckout
+*.xcscmblueprint
+*.moved-aside
+*.pbxuser
+*.mode1v3
+*.mode2v3
+*.perspectivev3
+*.xcactivitylog
+*.xcresult
+*.xcarchive
+*.dSYM/
+*.dSYM.zip
+
+# Local build and release artifacts
+build/
+dist/
+artifacts/
+*.app/
+*.ipa
+*.pkg
+*.dmg
+
+# Test and coverage output
+.coverage/
+coverage/
+*.profraw
+*.profdata
+fastlane/report.xml
+fastlane/Preview.html
+fastlane/screenshots/
+fastlane/test_output/
+
+# Local configuration and signing material
+.env
+.env.*
+!.env.example
+!.env.sample
+*.p12
+*.p8
+*.mobileprovision
+*.provisionprofile
+*.keychain
+*.keychain-db
+
+# Unsanitized pen captures and local test data
+Tests/Fixtures/raw/
+Tests/Hardware/Results/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+# SwiftPM manifests, Package.resolved, sanitized fixtures, OpenSpec
+# artifacts, and source-controlled Xcode project files remain trackable.
