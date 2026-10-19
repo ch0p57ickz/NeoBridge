@@ -111,30 +111,48 @@ def dot_payload(delta, force, x_int, x_frac, y_int, y_frac, event_count=0, offli
     return bytes(payload)
 
 
-def offline_payload(section, owner, book, page, down_time, up_time, dots):
-    strokes = bytearray()
-    strokes += struct.pack("<I", page)
-    strokes += struct.pack("<q", down_time)
-    strokes += struct.pack("<q", up_time)
-    strokes += bytes([0])  # pen tip type
-    strokes += b"\x00\x00\x00\x00"  # pen colour
-    strokes += struct.pack("<H", len(dots))
+def offline_stroke(page, down_time, up_time, dots):
+    """One offline stroke record (27 bytes) followed by its 16-byte dots."""
+    record = bytearray()
+    record += struct.pack("<I", page)
+    record += struct.pack("<q", down_time)
+    record += struct.pack("<q", up_time)
+    record += bytes([0])  # pen tip type
+    record += b"\x00\x00\x00\x00"  # pen colour
+    record += struct.pack("<H", len(dots))
     for dot in dots:
-        strokes += dot
-    assert len(strokes) == 27 + 16 * len(dots), len(strokes)
+        record += dot
+    assert len(record) == 27 + 16 * len(dots), len(record)
+    return bytes(record)
+
+
+# Transfer positions, from ResponseStruct.swift (OfflineTransPosition).
+TRANSFER_START, TRANSFER_MIDDLE, TRANSFER_END = 0, 1, 2
+
+
+def offline_payload(section, owner, book, strokes, packet_id, position):
+    """One offline data packet: an 18-byte header followed by stroke records.
+
+    The pen sends one of these per host acknowledgement, so a multi-packet
+    fixture is a sequence of these with contiguous packet identifiers and
+    positions start, middle*, end.
+    """
+    body = bytearray()
+    for stroke in strokes:
+        body += stroke
 
     header = bytearray()
-    header += struct.pack("<H", 1)  # packet id
+    header += struct.pack("<H", packet_id)
     header += bytes([0])  # not compressed
-    header += struct.pack("<H", len(strokes))  # size before compression
-    header += struct.pack("<H", len(strokes))  # size after compression
-    header += bytes([2])  # transfer position: end
+    header += struct.pack("<H", len(body))  # size before compression
+    header += struct.pack("<H", 0)  # size after compression: unused when uncompressed
+    header += bytes([position])
     header += struct.pack("<I", owner)[:3]
     header += bytes([section])
     header += struct.pack("<I", book)
-    header += struct.pack("<H", 1)  # stroke count
+    header += struct.pack("<H", len(strokes))  # stroke count in this packet
     assert len(header) == 18, len(header)
-    return bytes(header + strokes)
+    return bytes(header + body)
 
 
 PROVENANCE = {
@@ -225,7 +243,14 @@ def build():
         dot_payload(15, 620, 1001, 30, 501, 60, offline=True),
         dot_payload(15, 740, 1002, 0, 502, 0, offline=True),
     ]
-    offline = offline_payload(SECTION, OWNER, BOOK, PAGE, DOWN_TIME, DOWN_TIME + 30, offline_dots)
+    offline = offline_payload(
+        SECTION,
+        OWNER,
+        BOOK,
+        [offline_stroke(PAGE, DOWN_TIME, DOWN_TIME + 30, offline_dots)],
+        packet_id=1,
+        position=TRANSFER_END,
+    )
     offline_frames = [(0x81, version_payload), (0xA4, offline)]
     fixtures.append(
         fixture(
@@ -241,6 +266,52 @@ def build():
                 "page": PAGE,
             },
             expectedStrokeCount=1,
+        )
+    )
+
+    # A three-packet transfer in the shape the physical A1 sends: one packet per
+    # acknowledgement, contiguous packet identifiers, and positions start, middle,
+    # end. The data packets use the command the pen actually sends
+    # (REQ2_OFFLINE_DATA, 0x24); 0xA4 is the host-side acknowledgement.
+    multipacket_dots = [
+        [TRANSFER_START, PAGE, [
+            dot_payload(0, 500, 2000, 10, 900, 20, offline=True),
+            dot_payload(12, 620, 2001, 15, 901, 25, offline=True),
+        ]],
+        [TRANSFER_MIDDLE, PAGE + 1, [
+            dot_payload(0, 480, 2010, 40, 910, 60, offline=True),
+            dot_payload(18, 560, 2011, 45, 911, 65, offline=True),
+            dot_payload(18, 640, 2012, 50, 912, 70, offline=True),
+        ]],
+        [TRANSFER_END, PAGE + 2, [
+            dot_payload(0, 520, 2020, 80, 920, 90, offline=True),
+        ]],
+    ]
+    multipacket = [
+        offline_payload(
+            SECTION,
+            OWNER,
+            BOOK,
+            [offline_stroke(page, DOWN_TIME + index * 1000, DOWN_TIME + index * 1000 + 25, dots)],
+            packet_id=index,
+            position=position,
+        )
+        for index, (position, page, dots) in enumerate(multipacket_dots, start=1)
+    ]
+    fixtures.append(
+        fixture(
+            "a1-offline-multipacket",
+            "Three-packet offline transfer (start, middle, end) carried as "
+            "REQ2_OFFLINE_DATA 0x24 packets with one stroke each.",
+            [hexs(frame(0x24, payload)) for payload in multipacket],
+            [packet_outcome(0x24, payload) for payload in multipacket],
+            expectedPage={
+                "section": SECTION,
+                "owner": OWNER,
+                "book": BOOK,
+                "page": PAGE,
+            },
+            expectedStrokeCount=3,
         )
     )
 

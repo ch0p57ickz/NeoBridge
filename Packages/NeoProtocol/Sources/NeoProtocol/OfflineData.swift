@@ -10,7 +10,11 @@ public enum OfflineTransferPosition: UInt8, Hashable, Sendable {
     case end = 2
 }
 
-/// The header of an offline data packet (`0xA4`).
+/// The header of an offline data packet.
+///
+/// The pen sends offline data as `REQ2_OFFLINE_DATA` (`0x24`) and the host
+/// acknowledges each packet with `RES2_OFFLINE_DATA` (`0xA4`). A physical A1
+/// capture on 2026-10-18 confirmed both directions.
 ///
 /// Wire layout from Neo iOS SDK 3.0 `ResponseStruct.swift` (`OffLineData`):
 /// packet id (2), compression flag (1), uncompressed size (2), compressed size
@@ -71,17 +75,22 @@ public enum OfflineDataParseOutcome: Hashable, Sendable {
     case error(PenProtocolError)
 }
 
-/// Parses offline data packets into domain strokes.
+/// Parses one offline data packet into domain strokes.
 ///
-/// Only the single-packet, uncompressed transfer shape that the official SDK
-/// documents is supported. Compressed payloads and multi-packet transfers are
-/// reported as unsupported until a physical A1 capture provides evidence for
-/// them.
+/// A packet is one slice of a transfer, so decoding one says nothing about
+/// whether the whole transfer arrived. Callers that import offline data should
+/// feed every packet to `OfflineTransferAssembler`, which tracks the sequence
+/// and reports completion.
+///
+/// Uncompressed payloads are supported. Compressed payloads are reported as
+/// unsupported because no physical A1 has been observed sending them: the
+/// traced pen reports its compression capability byte clear and streams
+/// uncompressed data.
 public enum OfflineDataParser {
     /// Wire size of one stroke record header.
     static let strokeRecordBytes = 27
 
-    /// Parses a `RES2_OFFLINE_DATA` payload.
+    /// Parses one `REQ2_OFFLINE_DATA` (`0x24`) packet payload.
     ///
     /// - Parameters:
     ///   - payload: The frame payload, without the command and length bytes.
@@ -94,14 +103,14 @@ public enum OfflineDataParser {
     ) -> OfflineDataParseOutcome {
         guard payload.count >= OfflineDataHeader.payloadBytes else {
             return .error(
-                .malformedPayload(command: .responseOfflineData, reason: "offline header is too short")
+                .malformedPayload(command: .offlineDataRequest2, reason: "offline header is too short")
             )
         }
 
         guard let transferPosition = OfflineTransferPosition(rawValue: payload[7]) else {
             return .error(
                 .malformedPayload(
-                    command: .responseOfflineData,
+                    command: .offlineDataRequest2,
                     reason: "offline transfer position \(payload[7]) is not a known value"
                 )
             )
@@ -122,11 +131,6 @@ public enum OfflineDataParser {
         guard !header.isCompressed else {
             return .unsupported(reason: "compressed offline payloads are not validated on the A1")
         }
-        guard header.transferPosition == .end else {
-            return .unsupported(
-                reason: "multi-packet offline transfers are not validated on the A1"
-            )
-        }
 
         var records: [OfflineStrokeRecord] = []
         records.reserveCapacity(Int(header.strokeCount))
@@ -136,7 +140,7 @@ public enum OfflineDataParser {
             guard payload.count >= cursor + strokeRecordBytes else {
                 return .error(
                     .malformedPayload(
-                        command: .responseOfflineData,
+                        command: .offlineDataRequest2,
                         reason: "offline stroke record is truncated"
                     )
                 )
@@ -152,7 +156,7 @@ public enum OfflineDataParser {
             guard payload.count >= cursor + dotCount * PenDot.offlinePayloadBytes else {
                 return .error(
                     .malformedPayload(
-                        command: .responseOfflineData,
+                        command: .offlineDataRequest2,
                         reason: "offline dot data is truncated"
                     )
                 )
@@ -169,7 +173,7 @@ public enum OfflineDataParser {
                 guard let dot = PenDot(payload: dotPayload) else {
                     return .error(
                         .malformedPayload(
-                            command: .responseOfflineData,
+                            command: .offlineDataRequest2,
                             reason: "offline dot payload is invalid"
                         )
                     )
@@ -187,7 +191,7 @@ public enum OfflineDataParser {
                 guard let point = PenSampleNormalizer.normalize(sample) else {
                     return .error(
                         .malformedPayload(
-                            command: .responseOfflineData,
+                            command: .offlineDataRequest2,
                             reason: "offline coordinate hundredths are out of range"
                         )
                     )
@@ -215,5 +219,131 @@ public enum OfflineDataParser {
         }
 
         return .strokes(header: header, records: records)
+    }
+}
+
+/// What one accepted packet contributes to an offline transfer.
+public struct OfflineTransferProgress: Hashable, Sendable {
+    /// The packet's header.
+    public let header: OfflineDataHeader
+
+    /// The strokes carried by this packet.
+    public let records: [OfflineStrokeRecord]
+
+    /// Whether this packet declared itself the last of the transfer.
+    ///
+    /// The host acknowledges this packet with `Stop` and every earlier packet
+    /// with `Continue`.
+    public let isTransferComplete: Bool
+
+    /// How many packets were assembled, including this one.
+    public let assembledPacketCount: Int
+
+    /// How many strokes were assembled, including this packet's.
+    public let assembledStrokeCount: Int
+
+    /// How many dots were assembled, including this packet's.
+    public let assembledDotCount: Int
+}
+
+/// The result of feeding one offline data packet to an assembler.
+public enum OfflineTransferOutcome: Hashable, Sendable {
+    /// The packet belongs to the transfer being assembled.
+    case packet(OfflineTransferProgress)
+
+    /// The packet uses a transfer shape this build has no evidence for.
+    case unsupported(reason: String)
+
+    /// The packet is malformed, or it does not fit the transfer in progress.
+    case error(PenProtocolError)
+}
+
+/// Assembles the packets of one offline transfer into a stroke stream.
+///
+/// The pen sends one packet per host acknowledgement. Each packet carries an
+/// identifier and a transfer position: `start` for the first, `middle` for the
+/// rest, and `end` for the last. A 604-packet capture from a physical A1 on
+/// 2026-10-18 ran its identifiers contiguously from 1 to 604 and ended with a
+/// single `end` packet, so the assembler uses the identifier sequence to detect a
+/// dropped packet instead of silently importing a hole.
+///
+/// A `start` packet is not required. A transfer that resumes after a reconnect
+/// attaches mid-stream, which is also how the SDK parser treats the stream.
+public struct OfflineTransferAssembler: Sendable {
+    /// The number of packets assembled so far.
+    public private(set) var assembledPacketCount = 0
+
+    /// The number of strokes assembled so far.
+    public private(set) var assembledStrokeCount = 0
+
+    /// The number of dots assembled so far.
+    public private(set) var assembledDotCount = 0
+
+    /// Whether a packet declaring the transfer position `end` has arrived.
+    public private(set) var isComplete = false
+
+    private var lastPacketID: UInt16?
+
+    /// Creates an assembler for one transfer.
+    public init() {}
+
+    /// Adds one offline data packet to the transfer.
+    ///
+    /// - Parameters:
+    ///   - payload: The frame payload, without command, error, and length bytes.
+    ///   - penClockIsTrusted: Whether the pen's clock may be trusted for
+    ///     cross-source deduplication.
+    /// - Returns: The packet's contribution, or an explicit unsupported or error
+    ///   result.
+    public mutating func ingest(
+        payload: [UInt8],
+        penClockIsTrusted: Bool = true
+    ) -> OfflineTransferOutcome {
+        guard !isComplete else {
+            return .error(
+                .malformedPayload(
+                    command: .offlineDataRequest2,
+                    reason: "an offline packet arrived after the transfer ended"
+                )
+            )
+        }
+
+        switch OfflineDataParser.parse(payload: payload, penClockIsTrusted: penClockIsTrusted) {
+        case .unsupported(let reason):
+            return .unsupported(reason: reason)
+
+        case .error(let error):
+            return .error(error)
+
+        case .strokes(let header, let records):
+            if let lastPacketID, lastPacketID &+ 1 != header.packetID {
+                return .error(
+                    .malformedPayload(
+                        command: .offlineDataRequest2,
+                        reason: "offline packet \(header.packetID) does not follow \(lastPacketID)"
+                    )
+                )
+            }
+
+            lastPacketID = header.packetID
+            assembledPacketCount += 1
+            assembledStrokeCount += records.count
+            assembledDotCount += records.reduce(0) { total, record in
+                total + record.stroke.points.count
+            }
+            let isTransferComplete = header.transferPosition == .end
+            isComplete = isTransferComplete
+
+            return .packet(
+                OfflineTransferProgress(
+                    header: header,
+                    records: records,
+                    isTransferComplete: isTransferComplete,
+                    assembledPacketCount: assembledPacketCount,
+                    assembledStrokeCount: assembledStrokeCount,
+                    assembledDotCount: assembledDotCount
+                )
+            )
+        }
     }
 }

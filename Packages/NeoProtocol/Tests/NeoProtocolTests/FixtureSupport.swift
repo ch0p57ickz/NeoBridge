@@ -72,25 +72,52 @@ enum FixtureSupport {
         return events
     }
 
+    /// Whether a frame carries offline stroke data.
+    ///
+    /// A physical A1 sends offline data as `REQ2_OFFLINE_DATA` (`0x24`). The
+    /// `RES2_OFFLINE_DATA` (`0xA4`) label is the SDK's host-side acknowledgement,
+    /// but the earlier fixtures carried the payload on `0xA4`, so both are
+    /// accepted while those fixtures remain.
+    static func isOfflineData(_ frame: PenFrame) -> Bool {
+        frame.command == .offlineDataRequest2 || frame.command == .responseOfflineData
+    }
+
+    /// The offline data packets of a fixture, in order.
+    static func offlineDataFrames(_ fixture: ProtocolFixture) throws -> [PenFrame] {
+        try frames(fixture).filter(isOfflineData)
+    }
+
     /// The completed strokes a fixture yields.
     ///
-    /// Offline data packets are parsed by `OfflineDataParser`; every other
-    /// fixture is assembled from normalized events.
+    /// Offline data packets are assembled by `OfflineTransferAssembler`; every
+    /// other fixture is assembled from normalized events.
     static func strokes(
         _ fixture: ProtocolFixture,
         registry: CommandEvidenceRegistry = .neoSDK3
     ) throws -> [Stroke] {
         let frames = try frames(fixture)
 
-        if let offlineFrame = frames.first(where: { $0.command == .responseOfflineData }) {
-            switch OfflineDataParser.parse(payload: offlineFrame.payload) {
-            case .strokes(_, let records):
-                return records.map(\.stroke)
-            case .unsupported(let reason):
-                throw XCTSkip("offline transfer shape is unsupported: \(reason)")
-            case .error(let error):
-                throw error
+        let offlineFrames = frames.filter(isOfflineData)
+        if !offlineFrames.isEmpty {
+            var assembler = OfflineTransferAssembler()
+            var offlineStrokes: [Stroke] = []
+
+            for frame in offlineFrames {
+                switch assembler.ingest(payload: frame.payload) {
+                case .packet(let progress):
+                    offlineStrokes.append(contentsOf: progress.records.map(\.stroke))
+                case .unsupported(let reason):
+                    throw XCTSkip("offline transfer shape is unsupported: \(reason)")
+                case .error(let error):
+                    throw error
+                }
             }
+
+            // A partial transfer must not be mistaken for a complete import.
+            if !assembler.isComplete {
+                throw XCTSkip("offline transfer never reached its end packet")
+            }
+            return offlineStrokes
         }
 
         var assembler = StrokeAssembler()

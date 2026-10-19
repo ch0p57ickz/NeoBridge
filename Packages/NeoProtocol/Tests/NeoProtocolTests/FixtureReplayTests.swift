@@ -75,7 +75,7 @@ final class FixtureReplayTests: XCTestCase {
                 // An offline packet carries the page in its own header rather
                 // than in a page event, so read it from the assembled stroke.
                 let reportedPage: PageIdentity?
-                if try FixtureSupport.frames(fixture).contains(where: { $0.command == .responseOfflineData }) {
+                if try !FixtureSupport.offlineDataFrames(fixture).isEmpty {
                     reportedPage = try FixtureSupport.strokes(fixture).first?.page
                 } else {
                     reportedPage = decoder.currentPage
@@ -237,5 +237,41 @@ final class FixtureReplayTests: XCTestCase {
         XCTAssertEqual(stroke.points.count, 3)
         XCTAssertEqual(stroke.points.map(\.penTimeOffsetMilliseconds), [0, 15, 30])
         XCTAssertEqual(stroke.points.first?.x, 100_025)
+    }
+
+    func testOfflineMultipacketFixtureAssemblesEveryPacket() throws {
+        let fixtures = try FixtureSupport.all()
+        let fixture = try FixtureSupport.fixture("a1-offline-multipacket", in: fixtures)
+
+        // A physical A1 sends offline data as REQ2_OFFLINE_DATA, one packet per
+        // acknowledgement, in positions start, middle, end.
+        let frames = try FixtureSupport.offlineDataFrames(fixture)
+        XCTAssertEqual(
+            frames.compactMap(\.command),
+            [.offlineDataRequest2, .offlineDataRequest2, .offlineDataRequest2]
+        )
+
+        var assembler = OfflineTransferAssembler()
+        var strokes: [Stroke] = []
+        var completeness: [Bool] = []
+
+        for frame in frames {
+            guard case .packet(let progress) = assembler.ingest(payload: frame.payload) else {
+                return XCTFail("expected every packet of the transfer to be accepted")
+            }
+            completeness.append(progress.isTransferComplete)
+            strokes.append(contentsOf: progress.records.map(\.stroke))
+        }
+
+        XCTAssertEqual(completeness, [false, false, true], "only the last packet ends the transfer")
+        XCTAssertTrue(assembler.isComplete)
+        XCTAssertEqual(assembler.assembledPacketCount, 3)
+        XCTAssertEqual(assembler.assembledStrokeCount, 3)
+        XCTAssertEqual(strokes.count, 3)
+        XCTAssertEqual(strokes.map(\.page.page), [12, 13, 14])
+        XCTAssertEqual(Set(strokes.map(\.page.section)), [3])
+        XCTAssertEqual(Set(strokes.map(\.page.owner)), [0x000ABC])
+        XCTAssertEqual(Set(strokes.map(\.page.book)), [7])
+        XCTAssertTrue(strokes.allSatisfy { $0.source == .offline })
     }
 }

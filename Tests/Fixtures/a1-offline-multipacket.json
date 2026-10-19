@@ -1,0 +1,51 @@
+{
+  "chunks": [
+    "c0244d000100003b00000000bc0a00030700000001000c000000e86be5cf8b010000016ce5cf8b0100000000000000020000f401d00784030a145a5a00000000250c6c02d10785030f195a5a00000000b6c1",
+    "c0245d000200004b00000001bc0a00030700000001000d000000d06fe5cf8b010000e96fe5cf8b0100000000000000030000e001da078e03283c5a5a000000006b123002db078f032d415a5a00000000da128002dc07900332465a5a0000000036c1",
+    "c0243d000300002b00000002bc0a00030700000001000e000000b873e5cf8b010000d173e5cf8b01000000000000000100000802e4079803505a5a5a00000000eec1"
+  ],
+  "comment": "Three-packet offline transfer (start, middle, end) carried as REQ2_OFFLINE_DATA 0x24 packets with one stroke each.",
+  "evidenceLevel": "officialSDK",
+  "expected": [
+    {
+      "commandByte": "0x24",
+      "kind": "packet",
+      "payloadHex": "0100003b00000000bc0a00030700000001000c000000e86be5cf8b010000016ce5cf8b0100000000000000020000f401d00784030a145a5a00000000250c6c02d10785030f195a5a00000000b6"
+    },
+    {
+      "commandByte": "0x24",
+      "kind": "packet",
+      "payloadHex": "0200004b00000001bc0a00030700000001000d000000d06fe5cf8b010000e96fe5cf8b0100000000000000030000e001da078e03283c5a5a000000006b123002db078f032d415a5a00000000da128002dc07900332465a5a0000000036"
+    },
+    {
+      "commandByte": "0x24",
+      "kind": "packet",
+      "payloadHex": "0300002b00000002bc0a00030700000001000e000000b873e5cf8b010000d173e5cf8b01000000000000000100000802e4079803505a5a5a00000000ee"
+    }
+  ],
+  "expectedPage": {
+    "book": 7,
+    "owner": 2748,
+    "page": 12,
+    "section": 3
+  },
+  "expectedStrokeCount": 3,
+  "fixtureVersion": 1,
+  "id": "a1-offline-multipacket",
+  "provenance": {
+    "captureDate": "2026-10-18",
+    "deviceModel": "A1 (F151)",
+    "firmware": "unverified",
+    "observedProtocolVersion": "2.18",
+    "source": "Neo iOS SDK 3.0 (github.com/NeoSmartpen/iOS-SDK3.0)"
+  },
+  "sanitization": {
+    "notes": "Bluetooth address bytes are zeroed. Connection codes, serial numbers, and password material are absent. Coordinates are synthetic and do not reproduce personal handwriting.",
+    "removed": [
+      "bluetoothAddress",
+      "serialNumber",
+      "authenticationMaterial",
+      "handwritingContent"
+    ]
+  }
+}
