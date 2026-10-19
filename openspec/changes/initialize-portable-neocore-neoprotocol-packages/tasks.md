@@ -26,4 +26,16 @@
 - [x] 4.2 Run `Scripts/test-portable.sh` on Linux and record the passing command output; verify no Apple imports appear in portable packages. Recorded in `docs/portable-verification.md`.
 - [ ] 4.3 Run `xcodebuild` and SwiftUI compilation on the remote Mac runner when the app target exists, then run physical A1 acceptance tests there; verify results are recorded and pen cleanup remains in `keepOnPen` mode until hardware acceptance passes.
 
-  _Blocked: this change adds no app target, and the remote Mac runner and physical A1 are not available from this host. `PenCleanupPolicy.deletionEnabled` is hard-coded `false`, so cleanup stays in `keepOnPen` mode._
+  _Partially unblocked on a macOS host. The portable packages now compile and pass
+  their tests under the Apple toolchain — Apple Swift 6.4, Xcode 27.1, target
+  `arm64-apple-macosx27.2.0` — recorded in `docs/portable-verification.md`. That
+  run surfaced one macOS-only compile failure: `FakePenTransport` uses
+  `Synchronization.Mutex`, which needs macOS 15, while `Packages/NeoProtocol`
+  declared `.macOS(.v13)`; Linux applies no such gate, so it passed there. The
+  deployment target is now `.macOS(.v15)`.
+
+  Still outstanding: `xcodebuild` and SwiftUI compilation of the app target, and
+  physical A1 acceptance testing. Neither is possible from this host yet: this
+  change adds no `Apps/NeoBridgeMac` target, and the pen is not connected.
+  `PenCleanupPolicy.deletionEnabled` is hard-coded `false`, so cleanup stays in
+  `keepOnPen` mode._

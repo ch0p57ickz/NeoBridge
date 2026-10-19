@@ -6,8 +6,10 @@ context: |
 
   Development Topology:
   - Primary Development Host: Linux (including ARM64 Linux on GX10). Editing, portable unit tests, and simulated protocol fixtures run locally.
+  - Local macOS Host: A macOS machine with Xcode can run the same `Scripts/test-portable.sh` under the Apple toolchain. This catches availability gates that Linux does not enforce.
   - Remote macOS Runner: Required for Xcode builds, SwiftUI/CoreBluetooth compilation, code signing, notarization, packaging, and physical hardware acceptance testing via SSH.
   - Portability Boundary: Core logic and protocol handling are isolated into portable Swift packages that compile and pass `swift test` on Linux without Apple frameworks.
+  - macOS Deployment Floor: `Packages/NeoProtocol` declares `.macOS(.v15)` because `Synchronization.Mutex` (used by its public `FakePenTransport` test double) is available only on macOS 15.0 and later. Linux applies no availability gate, so the floor is invisible there. Any macOS target that links the package, including a future `Apps/NeoBridgeMac`, must declare macOS 15.0 or later.
 
   Architecture & Package Layout:
   - Packages/NeoCore: Ncode page identity (section, owner, book, page), normalized pen events, stroke assembly, replay-safe dedup (SHA-256 fingerprints), sync state machine, domain interfaces. No Apple UI or Bluetooth imports.

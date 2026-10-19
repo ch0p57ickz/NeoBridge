@@ -124,7 +124,10 @@ Planned but not present yet: `Packages/NeoStorage`, `Packages/NeoExport`,
   on a cold machine still needs network access to fetch `swift-crypto` and `swift-asn1`.
 - Packages use swift-tools-version 6.0, which defaults to the Swift 6 language mode, so
   strict concurrency applies. `NSLock` is unavailable from async contexts; use
-  `Synchronization.Mutex` with `withLock` instead.
+  `Synchronization.Mutex` with `withLock` instead. `Mutex` is macOS 15.0 and later, so
+  `Packages/NeoProtocol` declares `.macOS(.v15)` and any macOS target that links
+  `Packages/NeoProtocol` must declare the same floor. Linux has no availability gate, so
+  a missed floor passes on Linux and fails only under the Apple toolchain.
 - XCTest assertions take autoclosures, so bind `await` and `try` expressions to a local
   variable before asserting on them.
 

@@ -6,8 +6,11 @@ import PackageDescription
 // on Linux, so it may not import SwiftUI, AppKit, UIKit, or CoreBluetooth.
 let package = Package(
     name: "NeoProtocol",
+    // `Synchronization.Mutex` (used by `FakePenTransport`) is available on macOS
+    // 15.0 and later. Linux applies no such availability gate, so the macOS
+    // deployment target has to state the requirement explicitly.
     platforms: [
-        .macOS(.v13)
+        .macOS(.v15)
     ],
     products: [
         .library(name: "NeoProtocol", targets: ["NeoProtocol"])
