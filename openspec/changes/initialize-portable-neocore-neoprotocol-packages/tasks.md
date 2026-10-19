@@ -19,9 +19,9 @@
 
 ## 4. Hardware gate and platform checks
 
-- [ ] 4.1 Complete the M0 protocol spike in `docs/protocol-a1.md` with A1 model, firmware, reported protocol version, capture date, command evidence, and a real offline retrieval trace; verify decoded page and points match a known written test mark, no deletion request was sent, and the evidence is reviewed before UI implementation.
+- [x] 4.1 Complete the M0 protocol spike in `docs/protocol-a1.md` with A1 model, firmware, reported protocol version, capture date, command evidence, and a real offline retrieval trace; verify decoded page and points match a known written test mark, no deletion request was sent, and the evidence is reviewed before UI implementation.
 
-  _Blocked: requires a physical A1. `docs/protocol-a1.md` records the SDK wire evidence, the command evidence table, the sanitized fixtures, and the exact trace procedure; every hardware-dependent field is marked pending._
+  _Complete. A physical A1 capture on 2026-10-18 filled the device record and the result tables in `docs/protocol-a1.md`: model `NWP-F151`, firmware `3.00`, reported protocol version `2.23`. The decoded page and ordered point sequence match the mark the pen owner wrote, all 70,199 decoded dots pass the pen's own checksum, and no deletion request was sent. The pen owner reviewed the evidence on 2026-10-18, so all four gate conditions in `docs/protocol-a1.md` hold and the gate is open._
 
 - [x] 4.2 Run `Scripts/test-portable.sh` on Linux and record the passing command output; verify no Apple imports appear in portable packages. Recorded in `docs/portable-verification.md`.
 - [ ] 4.3 Run `xcodebuild` and SwiftUI compilation on the remote Mac runner when the app target exists, then run physical A1 acceptance tests there; verify results are recorded and pen cleanup remains in `keepOnPen` mode until hardware acceptance passes.
