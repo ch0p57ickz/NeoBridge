@@ -1,4 +1,16 @@
 /// The framing limits applied by `PenFrameDecoder`.
+///
+/// The 16-bit length field caps a frame's payload at 65,535 bytes, so the largest
+/// well-formed frame body the decoder can buffer is `3 + 65,535 = 65,538` bytes.
+/// The decoder undoes byte stuffing as bytes arrive, so a frame's length on the
+/// wire does not count against `maxBufferedBytes`.
+///
+/// The default `maxBufferedBytes` of 131,072 leaves headroom above the largest
+/// legal body, so with the default limits only a frame whose body outgrows what
+/// its declared length allows — an unterminated or over-long frame — can reach
+/// it. A smaller configured value is a stricter limit that also rejects
+/// well-formed frames larger than it. The SDK's own `PACKET_MAX_LEN` is 32,000
+/// bytes, so A1 traffic is expected to stay well below both defaults.
 public struct FrameLimits: Hashable, Sendable {
     /// Maximum decoded payload size.
     ///
@@ -10,7 +22,9 @@ public struct FrameLimits: Hashable, Sendable {
     /// Maximum bytes buffered inside a frame that has not ended yet.
     ///
     /// A frame that never ends is discarded once this limit is crossed, so a
-    /// stalled or hostile peer cannot grow the buffer without bound.
+    /// stalled or hostile peer cannot grow the buffer without bound. With the
+    /// default limits only a frame whose body outgrows its declared length can
+    /// reach it; see `FrameLimits` for how this relates to `maxPayloadBytes`.
     public let maxBufferedBytes: Int
 
     /// The protocol defaults.

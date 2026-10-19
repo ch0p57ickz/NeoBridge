@@ -166,15 +166,68 @@ final class PenFrameDecoderTests: XCTestCase {
         XCTAssertEqual(frames(outcomes).first?.command, .eventPenNewId)
     }
 
-    func testDefaultLimitAcceptsTheProtocolMaximumPayload() throws {
-        // The declared length field is 16 bits, so the default limit is the
-        // protocol's own maximum.
+    func testDefaultLimitsAcceptTheProtocolMaximumPayload() {
+        // The declared length field is 16 bits, so the default payload limit is
+        // the protocol's own maximum.
         XCTAssertEqual(FrameLimits.default.maxPayloadBytes, 65_535)
         XCTAssertEqual(FrameLimits.default.maxBufferedBytes, 131_072)
 
-        let payload = [UInt8](repeating: 0x5A, count: 4_096)
-        let frame = try XCTUnwrap(frames(decode(PenFrameEncoder.encode(command: .responseOfflineData, payload: payload))).first)
-        XCTAssertEqual(frame.payload.count, 4_096)
+        let payload = [UInt8](repeating: 0x5A, count: 65_535)
+        let outcomes = decode(PenFrameEncoder.encode(command: .responseOfflineData, payload: payload))
+
+        XCTAssertEqual(errors(outcomes), [])
+        XCTAssertEqual(frames(outcomes).first?.payload.count, 65_535)
+    }
+
+    func testMaximumPayloadWithEveryByteEscapedIsStillDecoded() {
+        // Byte stuffing doubles the frame's size on the wire, but the decoder
+        // buffers decoded body bytes, so escaping does not consume the buffer
+        // limit. A maximum payload needs only 3 + 65,535 buffered bytes, well
+        // under the default 131,072.
+        let payload = [UInt8](repeating: PenFraming.start, count: 65_535)
+        let bytes = PenFrameEncoder.encode(command: .responseOfflineData, payload: payload)
+
+        // Every payload byte is escaped, so the wire form is nearly twice as
+        // long as the decoded body.
+        XCTAssertEqual(bytes.count, 131_075)
+
+        let outcomes = decode(bytes)
+        XCTAssertEqual(errors(outcomes), [])
+        let frame = frames(outcomes).first
+        XCTAssertEqual(frame?.payload.count, 65_535)
+        XCTAssertEqual(frame?.payload.first, PenFraming.start)
+        XCTAssertEqual(frame?.payload.last, PenFraming.start)
+    }
+
+    func testDefaultBufferedInputLimitIsEnforcedAndRecovers() {
+        // A frame that never ends is discarded once the default 131,072-byte
+        // buffer limit is crossed, and the next frame still parses.
+        let runaway: [UInt8] = [PenFraming.start]
+            + [UInt8](repeating: 0x00, count: FrameLimits.default.maxBufferedBytes + 1)
+        let valid = PenFrameEncoder.encode(command: .eventPenNewId, payload: [0x07])
+
+        let outcomes = decode(runaway + valid)
+        XCTAssertEqual(errors(outcomes), [.bufferedInputExceedsLimit(limit: 131_072)])
+        XCTAssertEqual(frames(outcomes).first?.payload, [0x07])
+    }
+
+    func testBufferedLimitBoundaryIsExact() {
+        let limits = FrameLimits(maxPayloadBytes: 64, maxBufferedBytes: 32)
+
+        // A body of exactly 32 bytes fits; one byte more does not.
+        let accepted = decode(
+            PenFrameEncoder.encode(command: .eventPenNewId, payload: [UInt8](repeating: 0x5A, count: 29)),
+            limits: limits
+        )
+        XCTAssertEqual(errors(accepted), [])
+        XCTAssertEqual(frames(accepted).count, 1)
+
+        let rejected = decode(
+            PenFrameEncoder.encode(command: .eventPenNewId, payload: [UInt8](repeating: 0x5A, count: 30)),
+            limits: limits
+        )
+        XCTAssertEqual(errors(rejected), [.bufferedInputExceedsLimit(limit: 32)])
+        XCTAssertEqual(frames(rejected).count, 0)
     }
 
     func testResetDiscardsPartialFrame() throws {

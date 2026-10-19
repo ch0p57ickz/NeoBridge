@@ -55,11 +55,31 @@ enum FixtureSupport {
         }
     }
 
+    /// The normalized pen events a fixture yields.
+    static func events(
+        _ fixture: ProtocolFixture,
+        registry: CommandEvidenceRegistry = .neoSDK3
+    ) throws -> [PenEvent] {
+        var decoder = PenEventDecoder(registry: registry)
+        var events: [PenEvent] = []
+
+        for frame in try frames(fixture) {
+            guard case .events(let decoded) = decoder.decode(frame) else {
+                continue
+            }
+            events.append(contentsOf: decoded)
+        }
+        return events
+    }
+
     /// The completed strokes a fixture yields.
     ///
     /// Offline data packets are parsed by `OfflineDataParser`; every other
     /// fixture is assembled from normalized events.
-    static func strokes(_ fixture: ProtocolFixture) throws -> [Stroke] {
+    static func strokes(
+        _ fixture: ProtocolFixture,
+        registry: CommandEvidenceRegistry = .neoSDK3
+    ) throws -> [Stroke] {
         let frames = try frames(fixture)
 
         if let offlineFrame = frames.first(where: { $0.command == .responseOfflineData }) {
@@ -73,18 +93,12 @@ enum FixtureSupport {
             }
         }
 
-        var decoder = PenEventDecoder()
         var assembler = StrokeAssembler()
         var strokes: [Stroke] = []
 
-        for frame in frames {
-            guard case .events(let events) = decoder.decode(frame) else {
-                continue
-            }
-            for event in events {
-                if case .completed(let stroke) = assembler.consume(event) {
-                    strokes.append(stroke)
-                }
+        for event in try events(fixture, registry: registry) {
+            if case .completed(let stroke) = assembler.consume(event) {
+                strokes.append(stroke)
             }
         }
         return strokes

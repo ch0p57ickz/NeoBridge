@@ -291,6 +291,52 @@ final class PenEventDecoderTests: XCTestCase {
         XCTAssertFalse(events.first?.context.originTime.isReliable ?? true)
     }
 
+    func testProvisionalStrokeCommandsCannotCompleteAStroke() throws {
+        // Every command in the realtime stroke sequence is marked provisional,
+        // which is the situation the spec calls out: a mapping with no official
+        // SDK evidence and no physical A1 validation.
+        let provisionalCommands: [PenCommand] = [
+            .responseVersionInfo,
+            .eventNewPenNewId,
+            .eventPenUpDown,
+            .eventNewPenDot
+        ]
+        let registry = CommandEvidenceRegistry(
+            entries: Dictionary(
+                uniqueKeysWithValues: provisionalCommands.map {
+                    ($0, CommandEvidence(command: $0, level: .provisional, source: "unvalidated mapping"))
+                }
+            )
+        )
+
+        for command in provisionalCommands {
+            XCTAssertFalse(registry.maySendProductionRequest(command), "\(command)")
+            XCTAssertFalse(registry.mayEmitCompletedStroke(command), "\(command)")
+        }
+
+        let fixture = try FixtureSupport.fixture("a1-realtime-stroke", in: FixtureSupport.all())
+
+        // Positive control: the same bytes produce events and one completed
+        // stroke when the commands carry official SDK evidence, so the zero
+        // results below are attributable to the evidence level.
+        XCTAssertGreaterThan(try FixtureSupport.events(fixture, registry: .neoSDK3).count, 0)
+        XCTAssertEqual(try FixtureSupport.strokes(fixture, registry: .neoSDK3).count, 1)
+
+        let provisionalEvents = try FixtureSupport.events(fixture, registry: registry)
+        XCTAssertEqual(provisionalEvents.count, 0, "a provisional mapping must not emit pen events")
+        XCTAssertEqual(
+            try FixtureSupport.strokes(fixture, registry: registry).count,
+            0,
+            "a provisional mapping must not emit a completed stroke"
+        )
+
+        var provisionalDecoder = PenEventDecoder(registry: registry)
+        for frame in try FixtureSupport.frames(fixture) {
+            _ = provisionalDecoder.decode(frame)
+        }
+        XCTAssertNil(provisionalDecoder.observedVersion, "a provisional mapping must not report a version")
+    }
+
     func testMalformedDotPayloadIsReported() {
         var decoder = PenEventDecoder()
         _ = decoder.decode(pageFrame(page))

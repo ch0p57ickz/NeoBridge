@@ -140,6 +140,32 @@ final class FixtureReplayTests: XCTestCase {
         }
     }
 
+    func testMalformedFixturesDoNotInventPenEvents() throws {
+        let malformed = try FixtureSupport.all().filter { !$0.expectedErrorKinds.isEmpty }
+        XCTAssertFalse(malformed.isEmpty, "expected at least one malformed fixture")
+
+        for fixture in malformed {
+            let frames = try FixtureSupport.frames(fixture)
+
+            // The frames that are recovered must match the packets the fixture
+            // declares. Without this precondition the negative assertions below
+            // could pass if framing regressed to emitting nothing at all.
+            let declaredCommands = try fixture.decodedExpectedPackets()
+                .map { PenCommand(rawValue: $0.commandByte) }
+            XCTAssertEqual(
+                frames.map(\.command),
+                declaredCommands,
+                "\(fixture.id): recovered frames must match the declared packets"
+            )
+
+            // Those recovered frames carry no pen events, so malformed input
+            // never invents pen data.
+            let eventCount = try FixtureSupport.events(fixture).count
+            XCTAssertEqual(eventCount, 0, "\(fixture.id): malformed input must not invent pen events")
+            XCTAssertEqual(try FixtureSupport.strokes(fixture).count, 0, "\(fixture.id): no strokes")
+        }
+    }
+
     func testRealtimeFixtureAssemblesOneStrokeWithStableFingerprint() throws {
         let fixtures = try FixtureSupport.all()
         let fixture = try FixtureSupport.fixture("a1-realtime-stroke", in: fixtures)

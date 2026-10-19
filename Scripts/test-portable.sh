@@ -4,7 +4,8 @@
 #
 # Runs both package test suites and checks that no portable source imports an
 # Apple-only framework. The script needs only a Swift toolchain: no Xcode, no
-# macOS frameworks, no Bluetooth hardware, and no network services.
+# macOS frameworks, no Bluetooth hardware, and no network access at test time.
+# The first build on a cold cache does fetch the pinned dependencies once.
 #
 # Usage:
 #   Scripts/test-portable.sh
@@ -79,6 +80,17 @@ for package in "${PACKAGES[@]}"; do
   printf 'ok: %s imports no Apple-only framework\n' "$package"
 done
 
+section "Pinned dependency resolution"
+# The test suites must run without network services. Resolution is pinned by the
+# committed Package.resolved, so the build must succeed without re-resolving.
+for package in "${PACKAGES[@]}"; do
+  printf '\n-- swift build --disable-automatic-resolution (%s)\n' "$package"
+  if ! (cd "$ROOT/Packages/$package" && "$SWIFT" build --disable-automatic-resolution); then
+    printf 'error: %s needs dependency re-resolution; update Package.resolved\n' "$package" >&2
+    failures=1
+  fi
+done
+
 section "Package tests"
 for package in "${PACKAGES[@]}"; do
   printf '\n-- swift test (%s)\n' "$package"
@@ -93,4 +105,4 @@ if [[ "$failures" -ne 0 ]]; then
   exit 1
 fi
 
-printf 'PASSED: portable packages build, import no Apple-only framework, and pass their tests.\n'
+printf 'PASSED: portable packages build with pinned dependencies, import no Apple-only framework, and pass their tests.\n'

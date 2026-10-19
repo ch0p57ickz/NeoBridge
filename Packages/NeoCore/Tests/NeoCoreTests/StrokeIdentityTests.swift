@@ -47,6 +47,58 @@ final class StrokeIdentityTests: XCTestCase {
         XCTAssertEqual(CanonicalStrokeEncoding.version, 1)
     }
 
+    func testCanonicalEncodingPreservesExactIntegerValues() {
+        let singlePointStroke = Stroke(
+            page: page,
+            originTime: .reliable(milliseconds: originMilliseconds),
+            points: [PenPoint(x: 1234, y: -567, penTimeOffsetMilliseconds: 0, pressure: 512)],
+            source: .live
+        )
+        let bytes = CanonicalStrokeEncoding.encode(singlePointStroke)
+
+        XCTAssertEqual(bytes.count, CanonicalStrokeEncoding.headerByteCount + CanonicalStrokeEncoding.pointByteCount)
+
+        // Header: magic, section, owner, book, page.
+        XCTAssertEqual(Array(bytes[0..<4]), [0x4E, 0x43, 0x53, 0x01])
+        XCTAssertEqual(bytes[4], 3)
+        XCTAssertEqual(Array(bytes[5..<9]), [0x00, 0x00, 0x0A, 0xBC])
+        XCTAssertEqual(Array(bytes[9..<13]), [0x00, 0x00, 0x00, 0x07])
+        XCTAssertEqual(Array(bytes[13..<17]), [0x00, 0x00, 0x00, 0x0C])
+
+        // Origin: reliability flag then the milliseconds value.
+        XCTAssertEqual(bytes[17], 0)
+        XCTAssertEqual(Array(bytes[18..<26]), [0x00, 0x00, 0x01, 0x8B, 0xCF, 0xE5, 0x68, 0x7B])
+
+        // Point count.
+        XCTAssertEqual(Array(bytes[26..<30]), [0x00, 0x00, 0x00, 0x01])
+
+        // Point: x, y, pen-time offset, pressure, each encoded exactly with no
+        // rounding or truncation.
+        XCTAssertEqual(Array(bytes[30..<34]), [0x00, 0x00, 0x04, 0xD2])
+        XCTAssertEqual(Array(bytes[34..<38]), [0xFF, 0xFF, 0xFD, 0xC9])
+        XCTAssertEqual(Array(bytes[38..<46]), [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+        XCTAssertEqual(Array(bytes[46..<48]), [0x02, 0x00])
+    }
+
+    func testCanonicalEncodingMarksUnreliableOrigin() {
+        let reliable = CanonicalStrokeEncoding.encode(stroke())
+        let unreliable = CanonicalStrokeEncoding.encode(
+            stroke(originTime: .unreliable(reportedMilliseconds: originMilliseconds))
+        )
+
+        XCTAssertEqual(reliable[17], 0)
+        XCTAssertEqual(unreliable[17], 1)
+        XCTAssertEqual(reliable.count, unreliable.count)
+
+        // The reliability flag is the only difference between the two encodings,
+        // so nothing is rounded, reordered, or dropped when the flag is set.
+        let differingOffsets = zip(reliable, unreliable)
+            .enumerated()
+            .filter { $0.element.0 != $0.element.1 }
+            .map(\.offset)
+        XCTAssertEqual(differingOffsets, [17])
+    }
+
     func testGoldenFingerprintForLiveStroke() {
         let fingerprint = StrokeIdentity.fingerprint(of: stroke(source: .live))
         XCTAssertEqual(fingerprint.hexDigest, goldenLiveDigest)

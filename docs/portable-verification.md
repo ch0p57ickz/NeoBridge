@@ -31,16 +31,19 @@ Target: aarch64-unknown-linux-gnu
 == Forbidden import check
 ok: NeoCore imports no Apple-only framework
 ok: NeoProtocol imports no Apple-only framework
+== Pinned dependency resolution
+-- swift build --disable-automatic-resolution (NeoCore)
+-- swift build --disable-automatic-resolution (NeoProtocol)
 == Package tests
 -- swift test (NeoCore)
-     Executed 29 tests, with 0 failures (0 unexpected)
+     Executed 31 tests, with 0 failures (0 unexpected)
 -- swift test (NeoProtocol)
-     Executed 62 tests, with 0 failures (0 unexpected)
+     Executed 67 tests, with 0 failures (0 unexpected)
 == Result
-PASSED: portable packages build, import no Apple-only framework, and pass their tests.
+PASSED: portable packages build with pinned dependencies, import no Apple-only framework, and pass their tests.
 ```
 
-Recorded on 2026-10-19.
+Recorded on 2026-10-19 (UTC).
 
 ## What the script checks
 
@@ -49,6 +52,17 @@ Recorded on 2026-10-19.
    `Packages/NeoProtocol/Sources` imports SwiftUI, AppKit, UIKit, WatchKit,
    TVUIKit, CoreBluetooth, CoreGraphics, CoreData, CoreImage, CryptoKit, Combine,
    Metal, MapKit, or XCTest.
+3. `swift build --disable-automatic-resolution` succeeds for both packages, so
+   the committed `Package.resolved` files are complete and the build performs no
+   further dependency resolution.
+
+## Network use
+
+The test suites make no network calls. The only network step is the first fetch
+of the pinned `swift-crypto` and `swift-asn1` revisions into the SwiftPM
+dependency cache. Check 3 above constrains resolution, not fetching: it proves
+the build does not re-resolve, so a warm dependency cache needs no network. A
+cold machine needs one fetch.
 
 ## Remaining platform work
 
