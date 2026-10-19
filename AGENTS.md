@@ -8,6 +8,37 @@ happen on a remote macOS runner.
 layout, and the rules for each OpenSpec stage. Read it before proposing or applying a
 change. This file covers the operational details that are easy to get wrong.
 
+## Code exploration
+
+Navigate code through the jCodemunch index rather than reading files blindly. The
+integration is reached through Rumi, so the call path is `rumi_list_integrations`, then
+`rumi_list_tools` for the `jcodemunch` integration, then `rumi_call_tool` with
+`tool: "order"` carrying the action.
+
+```text
+order { "action": "resolve_repo", "args": { "path": "." } }                     # is this checkout indexed?
+order { "action": "index_folder", "args": { "path": "." }, "allow_state_change": true }   # index it once per machine
+```
+
+Then call `order` for an action you know, `route` when you know the goal but not the
+action, and `menu` to see what exists. `search_symbols`, `search_text`,
+`get_file_outline`, `get_file_content`, and `get_file_tree` cover most exploration.
+`check_edit_safe` and `check_delete_safe` answer whether a symbol is safe to change
+before you change it. State-changing actions need `allow_state_change: true` in the same
+`order` arguments.
+
+The index lives on the jCodemunch server, not in this repository, so indexing writes
+nothing into the working tree and a fresh clone needs `index_folder` once. The
+repository id is derived from the checkout, so read it back from `resolve_repo` instead
+of hard-coding it.
+
+Fall back to `Read`, `Grep`, `Glob`, or `Bash` only when the path is not indexed or the
+tools cannot answer the question. `Read` is still required before editing a file, so
+read the one file you are about to change rather than exploring with it.
+
+Call `jcodemunch_guide` for the version-current policy text; the summary above is not a
+copy of it.
+
 ## Knowledge base memories
 
 Store project memories under `memories/neobridge/neobridge/`. Write both segments in
