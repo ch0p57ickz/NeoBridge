@@ -1,0 +1,49 @@
+schema: spec-driven
+
+context: |
+  NeoBridge is a local-first standalone macOS application (menu bar + optional window) that connects to Neo Smartpen A1 / F151 via Bluetooth Low Energy (BLE).
+  It merges live and offline strokes into durable per-page records and exports deterministic JSON, SVG, and Markdown files into a user-selected directory without cloud dependencies.
+
+  Development Topology:
+  - Primary Development Host: Linux (including ARM64 Linux on GX10). Editing, portable unit tests, and simulated protocol fixtures run locally.
+  - Remote macOS Runner: Required for Xcode builds, SwiftUI/CoreBluetooth compilation, code signing, notarization, packaging, and physical hardware acceptance testing via SSH.
+  - Portability Boundary: Core logic and protocol handling are isolated into portable Swift packages that compile and pass `swift test` on Linux without Apple frameworks.
+
+  Architecture & Package Layout:
+  - Packages/NeoCore: Ncode page identity (section, owner, book, page), normalized pen events, stroke assembly, replay-safe dedup (SHA-256 fingerprints), sync state machine, domain interfaces. No Apple UI or Bluetooth imports.
+  - Packages/NeoProtocol: Byte framing, packet encode/decode, handshake/auth, protocol fixtures, version handling. Decoupled from CoreBluetooth, UI, and filesystem.
+  - Packages/NeoStorage: Portable persistence abstractions and SQLite-backed implementations (WAL mode).
+  - Packages/NeoExport: Deterministic JSON, SVG, and Markdown generation with atomic sibling-temp replacement. No AppKit/CoreGraphics dependencies.
+  - Apps/NeoBridgeMac: macOS native app (SwiftUI, menu-bar status, settings, CoreBluetooth transport, permissions, notifications, security-scoped bookmark folder access).
+  - Tests/: Fixtures (sanitized BLE traces), Integration (fake transport replay on Linux), Hardware (real A1 on Mac runner).
+  - Scripts/: test-portable.sh, remote-mac-build.sh.
+
+rules:
+  proposal:
+    - "Focus strictly on local-first v1 scope (no OCR, cloud sync, multi-pen concurrent handling)."
+    - "Emphasize cross-platform development topology (Linux portable core vs. remote Mac build runner)."
+    - "Explicitly state the M0 protocol spike exit gate with physical A1 hardware."
+  design:
+    - "Enforce the portability boundary: no `import SwiftUI`, `import AppKit`, or `import CoreBluetooth` in Packages/ (NeoCore, NeoProtocol, NeoStorage, NeoExport)."
+    - "Design a platform-neutral PenTransport abstraction with simulated/fixture implementations for Linux testing alongside CoreBluetoothPenTransport for macOS."
+    - "Detail the two-phase verified import and journaled deletion state machine (prepared -> requested -> confirmed)."
+    - "Specify deterministic SVG/JSON/MD export pipelines with atomic sibling-temp renames."
+    - "Define canonical page keys (section, owner, book, page) and SHA-256 stroke fingerprints."
+  tasks:
+    - "Ensure portable package unit tests pass on Linux (`swift test`) without Xcode or Apple dependencies."
+    - "Require M0 protocol spike (docs/protocol-a1.md and real offline stroke retrieval proof) as a blocking gate before UI implementation."
+    - "Include fake-transport integration tests on Linux exercising offline import, duplicate replay, interrupted sync, and recovery."
+    - "Require remote Mac runner execution for xcodebuild, SwiftUI compilation, and physical A1 acceptance tests."
+
+operations:
+  apply:
+    guidance:
+      - "Never claim a BLE feature or protocol command works without official SDK evidence or physical hardware validation."
+      - "Keep destructive pen cleanup disabled (keepOnPen mode) until hardware acceptance tests pass on real A1 hardware."
+      - "Never import Apple-only frameworks into portable packages."
+      - "Verify SQLite commits and file exports before confirming any sync batch."
+      - "Never copy Apple signing secrets or credentials to the Linux host."
+  archive:
+    guidance:
+      - "Ensure offline and live stroke replay idempotency is verified before archiving."
+      - "Confirm all portable tests pass on Linux and full app builds cleanly on the macOS runner."
