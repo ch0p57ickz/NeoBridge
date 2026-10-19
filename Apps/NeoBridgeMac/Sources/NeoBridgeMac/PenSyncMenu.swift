@@ -1,5 +1,6 @@
 import AppKit
 import NeoBridgeMacCore
+import NeoCore
 import SwiftUI
 
 /// The menu-bar item's commands and status.
@@ -8,6 +9,7 @@ import SwiftUI
 /// as disabled text and every command is a `Button`.
 struct PenSyncMenu: View {
     @Environment(\.openWindow) private var openWindow
+    @State private var folderMessage: String?
     let controller: PenSyncController
     let activation: PenSyncActivation
 
@@ -27,15 +29,29 @@ struct PenSyncMenu: View {
             }
         }
 
-        if let result = controller.result {
-            if result.isEmpty {
-                Text("The pen reported no offline note to read.")
+        if let outcome = controller.outcome {
+            Text(Self.summary(for: outcome.summary))
+            Text(outcome.notice)
+            if let export = outcome.export, !export.succeeded {
+                ForEach(export.failed, id: \.path) { artifact in
+                    Text(Self.failure(for: artifact))
+                }
             }
-            Text(Self.summary(for: result))
+        }
+
+        if controller.canRetryExport {
+            Button(PenSyncController.retryExportActionTitle) { controller.retryExport() }
         }
 
         if let message = controller.errorMessage {
             Text(message)
+        }
+
+        Divider()
+        Button("Choose Export Folder…") { folderMessage = PenExportFolderChooser.choose(into: controller) }
+        Text(Self.folderLine(controller))
+        if let folderMessage {
+            Text(folderMessage)
         }
 
         Divider()
@@ -63,7 +79,18 @@ struct PenSyncMenu: View {
         "\(pen.name ?? "Pen") (pen \(index + 1))"
     }
 
-    private static func summary(for result: PenSyncSummary) -> String {
-        "\(result.strokeCount) strokes · \(result.dotCount) dots · \(result.distinctPageCount) pages"
+    private static func summary(for summary: PenSyncSummary) -> String {
+        "\(summary.strokeCount) strokes · \(summary.dotCount) dots · \(summary.distinctPageCount) pages"
+    }
+
+    private static func failure(for artifact: PenExportArtifact) -> String {
+        "\(URL(fileURLWithPath: artifact.path).lastPathComponent): \(artifact.failureReason ?? "not written")"
+    }
+
+    private static func folderLine(_ controller: PenSyncController) -> String {
+        guard let path = controller.exportDirectoryPath else {
+            return "No export folder chosen"
+        }
+        return "Exports go to \(path)"
     }
 }

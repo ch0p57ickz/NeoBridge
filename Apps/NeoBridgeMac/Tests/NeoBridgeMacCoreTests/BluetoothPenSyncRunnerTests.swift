@@ -1,5 +1,6 @@
 import Foundation
 import NeoBridgeMacCore
+import NeoCore
 import NeoProtocol
 import XCTest
 
@@ -27,9 +28,11 @@ final class BluetoothPenSyncRunnerTests: XCTestCase {
         let runner = BluetoothPenSyncRunner(central: central, selectionWindow: quickWindow)
         let stages = StageRecorder()
 
-        let summary = try await runner.run { stages.record($0) }
+        let read = try await runner.run { stages.record($0) }
+        let summary = read.summary
 
         XCTAssertEqual(stages.values, [.scanning, .connecting, .verifying, .syncing])
+        XCTAssertTrue(read.transfer.isEmpty, "the read carried no stroke")
         XCTAssertTrue(summary.isEmpty)
         XCTAssertEqual(summary.strokeCount, 0)
         XCTAssertEqual(summary.dotCount, 0)
@@ -63,6 +66,56 @@ final class BluetoothPenSyncRunnerTests: XCTestCase {
         XCTAssertFalse(commands.contains(.deleteOfflineNoteRequest))
         XCTAssertFalse(commands.contains(.deleteOfflinePageRequest))
         XCTAssertTrue(commands.contains(.versionInfo), "the handshake must still be sent")
+    }
+
+    func testCarriesAssembledStrokesThroughTheRunner() async throws {
+        // The pen discovers the captured note, answers its page list and info
+        // request, and sends one packet that completes the transfer.
+        let connection = FakePenBluetoothConnection(inbound: [
+            FakePenFrames.versionInfo(),
+            FakePenFrames.noteList(notes: [(FakePenFrames.sectionOwnerId, FakePenFrames.note)]),
+            FakePenFrames.pageList(
+                sectionOwnerId: FakePenFrames.sectionOwnerId,
+                note: FakePenFrames.note,
+                pages: [1]
+            ),
+            FakePenFrames.offlineInfo(strokeCount: 1, uncompressedSize: 0),
+            FakePenFrames.offlineStrokePacket(),
+        ])
+        let central = FakePenBluetoothCentral(
+            advertisedPeripherals: [pen()],
+            connection: connection
+        )
+        let trace = PenTrafficLog()
+        let runner = BluetoothPenSyncRunner(
+            central: central,
+            selectionWindow: quickWindow,
+            trace: trace
+        )
+
+        let read = try await runner.run { _ in }
+
+        // The counts the shell presents and the strokes the library commits come
+        // from the same read, so neither can drift from the other.
+        XCTAssertEqual(read.summary.strokeCount, 1)
+        XCTAssertEqual(read.summary.dotCount, 1)
+        XCTAssertEqual(read.summary.distinctPageCount, 1)
+        XCTAssertEqual(read.summary.notes.count, 1)
+
+        XCTAssertEqual(read.transfer.strokeCount, 1)
+        XCTAssertEqual(read.transfer.dotCount, 1)
+        XCTAssertEqual(read.transfer.noteCount, 1)
+        XCTAssertEqual(
+            read.transfer.pages,
+            [PageIdentity(section: 3, owner: 27, book: 700, page: 1)]
+        )
+        XCTAssertEqual(read.transfer.strokes.first?.points.count, 1)
+        XCTAssertEqual(read.transfer.strokes.first?.source, .offline)
+
+        XCTAssertTrue(
+            trace.contents().contains("result strokes=1 dots=1 pages=1 notes=1"),
+            "the transcript must still record the counts"
+        )
     }
 
     // MARK: - Failures

@@ -44,12 +44,14 @@ final class SelectionRecorder: @unchecked Sendable {
 /// A runner that reports scripted stages and then produces a scripted outcome.
 ///
 /// The runner is what makes the shell testable without a radio: the controller
-/// cannot tell it from the real one.
+/// cannot tell it from the real one. Its result carries both the counts the shell
+/// presents and the strokes the library commits, so the shell tests exercise the
+/// same complete read a real session produces.
 struct StubPenSyncRunner: PenSyncRunning {
     /// What one attempt ends with.
     enum Outcome: Sendable {
         /// A completed read.
-        case success(PenSyncSummary)
+        case success(PenReadResult)
 
         /// A failure from the Bluetooth layer or the session.
         case failure(any Error & Sendable)
@@ -64,15 +66,15 @@ struct StubPenSyncRunner: PenSyncRunning {
     /// What the attempt ends with.
     let outcome: Outcome
 
-    func run(report: @escaping @Sendable (PenSyncStage) -> Void) async throws -> PenSyncSummary {
+    func run(report: @escaping @Sendable (PenSyncStage) -> Void) async throws -> PenReadResult {
         for stage in stages {
             report(stage)
             await Task.yield()
         }
 
         switch outcome {
-        case .success(let summary):
-            return summary
+        case .success(let read):
+            return read
         case .failure(let error):
             throw error
         case .waitsForCancellation:

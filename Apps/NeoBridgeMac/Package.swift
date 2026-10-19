@@ -20,14 +20,18 @@ let package = Package(
     ],
     dependencies: [
         .package(path: "../../Packages/NeoCore"),
-        .package(path: "../../Packages/NeoProtocol")
+        .package(path: "../../Packages/NeoExport"),
+        .package(path: "../../Packages/NeoProtocol"),
+        .package(path: "../../Packages/NeoStorage")
     ],
     targets: [
         .target(
             name: "NeoBridgeMacCore",
             dependencies: [
                 .product(name: "NeoCore", package: "NeoCore"),
-                .product(name: "NeoProtocol", package: "NeoProtocol")
+                .product(name: "NeoExport", package: "NeoExport"),
+                .product(name: "NeoProtocol", package: "NeoProtocol"),
+                .product(name: "NeoStorage", package: "NeoStorage")
             ]
         ),
         .executableTarget(
@@ -43,7 +47,9 @@ let package = Package(
             dependencies: [
                 "NeoBridgeMacCore",
                 .product(name: "NeoCore", package: "NeoCore"),
-                .product(name: "NeoProtocol", package: "NeoProtocol")
+                .product(name: "NeoExport", package: "NeoExport"),
+                .product(name: "NeoProtocol", package: "NeoProtocol"),
+                .product(name: "NeoStorage", package: "NeoStorage")
             ]
         )
     ]

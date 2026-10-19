@@ -4,7 +4,8 @@ This record captures the Linux verification required by
 `openspec/changes/initialize-portable-neocore-neoprotocol-packages/tasks.md`
 tasks 1.1, 1.2, and 4.2, by
 `openspec/changes/correct-a1-codec-from-hardware-evidence/tasks.md` task 3.5, and
-by `openspec/changes/add-macos-connect-and-sync/tasks.md` tasks 1.8 and 4.3.
+by `openspec/changes/add-macos-connect-and-sync/tasks.md` tasks 1.8 and 4.3, and by
+`openspec/changes/add-persistence-and-deterministic-export/tasks.md` tasks 1.2, 2.1–2.4, 3.1–3.3, 4.2, 5.1, 5.2, and 5.3.
 
 ## Command
 
@@ -312,6 +313,106 @@ reported Xcode 27.1 failing to load `IDESimulatorFoundation` because
 installed Xcode. Refreshing the Xcode installation's `PrivateFrameworks` (dated
 2026-10-18 23:57 in this run) resolved it, and the gate has passed since.
 
+## Verification for `add-persistence-and-deterministic-export`
+
+This change adds the portable `NeoStorage` and `NeoExport` packages, a
+`Tests/Integration` package of end-to-end fake-transport scenarios, and the app's
+save/export flow. `Scripts/test-portable.sh` now covers every portable package
+and the integration package, and checks for the SQLite development header that
+`NeoStorage` needs.
+
+### Linux verification (tasks 1.2, 2.1–2.4, 3.1–3.3, 5.1, 5.2)
+
+| Item | Value |
+| --- | --- |
+| Host platform | Linux (Ubuntu 26.04.1 LTS, aarch64) in a Docker container on macOS 27.2 (26B5112a), arm64 |
+| Container image | `swift:6.4.1` |
+| Toolchain | Swift 6.4.1 (swift-6.4.1-RELEASE), target `aarch64-unknown-linux-gnu` |
+| Xcode | Not used |
+| Bluetooth hardware | Not used |
+
+```text
+== Toolchain
+Swift version 6.4.1 (swift-6.4.1-RELEASE)
+Target: aarch64-unknown-linux-gnu
+== SQLite header check
+ok: the SQLite development header is available
+== Forbidden import check
+ok: Packages/NeoCore imports no Apple-only framework
+ok: Packages/NeoProtocol imports no Apple-only framework
+ok: Packages/NeoStorage imports no Apple-only framework
+ok: Packages/NeoExport imports no Apple-only framework
+ok: Tests/Integration imports no Apple-only framework
+== Pinned dependency resolution
+-- swift build --disable-automatic-resolution (Packages/NeoCore)
+-- swift build --disable-automatic-resolution (Packages/NeoProtocol)
+-- swift build --disable-automatic-resolution (Packages/NeoStorage)
+-- swift build --disable-automatic-resolution (Packages/NeoExport)
+-- swift build --disable-automatic-resolution (Tests/Integration)
+== Package tests
+-- swift test (Packages/NeoCore)
+     Executed 44 tests, with 0 failures (0 unexpected)
+-- swift test (Packages/NeoProtocol)
+     Executed 141 tests, with 0 failures (0 unexpected)
+-- swift test (Packages/NeoStorage)
+     Executed 32 tests, with 0 failures (0 unexpected)
+-- swift test (Packages/NeoExport)
+     Executed 35 tests, with 0 failures (0 unexpected)
+-- swift test (Tests/Integration)
+     Executed 6 tests, with 0 failures (0 unexpected)
+== Result
+PASSED: portable packages build with pinned dependencies, import no Apple-only framework, and pass their tests, and the integration scenarios pass.
+```
+
+Recorded on 2026-10-19 (UTC). NeoCore grew from 31 tests to 44 with the new
+import/store/export contracts and the canonical page order. The integration
+package drives a whole offline read through the session, storage, and export
+packages over a fake transport and covers offline import, duplicate replay,
+interrupted sync, recovery, no deletion command, and no device identity in the
+output.
+
+### macOS verification and bundle (tasks 4.2, 4.3, 5.3)
+
+`Scripts/remote-mac-build.sh` ran the portable suites, built the app under SwiftPM
+and Xcode, and assembled the bundle:
+
+```text
+== App build (Xcode)
+ok: the Xcode build succeeded.
+== Bundle
+assembled Apps/NeoBridgeMac/.build/bundle/NeoBridgeMac.app
+== Bundle verification
+.../Contents/Info.plist: OK
+ok: CFBundleIdentifier = com.sushidev.neobridge.mac
+ok: LSUIElement = true
+.../Contents/MacOS/NeoBridgeMac: Mach-O 64-bit executable arm64
+.../NeoBridgeMac.app: satisfies its Designated Requirement
+== Result
+PASSED: portable packages verified, app built under SwiftPM and Xcode, bundle assembled.
+```
+
+The app test target grew from 54 tests to 68: the shell tests now drive a real
+SQLite library in a temporary directory and cover a saved read with every format
+published, per-file export failure and retry, a retry that is withdrawn after a
+later failed attempt, an empty read, a read with no export folder, a storage
+failure that leaves the library empty, the saving and exporting phases, and
+reopening a remembered export folder.
+
+```text
+Test Suite 'NeoBridgeMacCoreTests.xctest' passed
+     Executed 68 tests, with 0 failures (0 unexpected)
+```
+
+Recorded on 2026-10-19 (PDT).
+
+### Copying the repository into the Linux container
+
+The container copy must not carry macOS AppleDouble `._*` files. GNU `tar` on the
+Linux side turns the pax `LIBARCHIVE.xattr.*` records a macOS `tar` emits into
+`._*` sidecar files, and `ProtocolFixtureLoader` treats a sidecar named
+`._x.json` as a fixture, which fails with a JSON decode error. Strip them after
+copying (`find /work3 -name '._*' -delete`) or copy with a method that does not
+carry extended attributes.
 ## Fixture sanitization
 
 Verified when the capture-derived handshake fixture landed:
@@ -329,15 +430,18 @@ Verified when the capture-derived handshake fixture landed:
 
 ## What the script checks
 
-1. Both packages build and pass `swift test` with a Linux toolchain.
-2. No source file under `Packages/NeoCore/Sources` or
-   `Packages/NeoProtocol/Sources` imports SwiftUI, AppKit, UIKit, WatchKit,
-   TVUIKit, CoreBluetooth, CoreGraphics, CoreData, CoreImage, CryptoKit, Combine,
-   Metal, MapKit, or XCTest.
-3. `swift build --disable-automatic-resolution` succeeds for both packages, so
+1. `Packages/NeoCore`, `Packages/NeoProtocol`, `Packages/NeoStorage`,
+   `Packages/NeoExport`, and `Tests/Integration` build and pass `swift test` with
+   a Linux toolchain.
+2. No source file under any of those packages' `Sources` directories imports
+   SwiftUI, AppKit, UIKit, WatchKit, TVUIKit, CoreBluetooth, CoreGraphics,
+   CoreData, CoreImage, CryptoKit, Combine, Metal, MapKit, or XCTest.
+3. `swift build --disable-automatic-resolution` succeeds for every package, so
    the committed `Package.resolved` files are complete and the build performs no
    further dependency resolution.
-
+4. The SQLite development header (`sqlite3.h`) is present. `NeoStorage` reaches
+   SQLite through a `systemLibrary` target, so a Linux host needs
+   `libsqlite3-dev`; macOS ships the header in the SDK.
 ## Network use
 
 The test suites make no network calls. The only network step is the first fetch

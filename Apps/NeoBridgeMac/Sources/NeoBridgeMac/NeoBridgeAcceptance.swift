@@ -1,21 +1,29 @@
 import Foundation
 import NeoBridgeMacCore
+import NeoCore
 
 /// One headless read attempt, driven by the app's own controller.
 ///
 /// The physical-A1 acceptance in `Tests/Hardware/README.md` needs the app to read
-/// the pen and to record the framed bytes it sent, and a menu-bar app cannot be
-/// driven into that from a script without an accessibility grant. The same binary
-/// therefore takes this path when `NEOBRIDGE_ACCEPTANCE_TRACE` names a file: it
-/// builds the same controller the UI uses, starts one read attempt, waits for it
-/// to finish, writes the transcript, and exits non-zero when the read did not
-/// complete.
+/// the pen, save it, write its files, and record the framed bytes it sent, and a
+/// menu-bar app cannot be driven into that from a script without an accessibility
+/// grant. The same binary therefore takes this path when
+/// `NEOBRIDGE_ACCEPTANCE_TRACE` names a file: it builds the same controller the UI
+/// uses, starts one read, waits for it to finish, writes the transcript, and exits
+/// non-zero when the read did not complete.
 ///
-/// The run is the real thing: the same adapter, transport, runner, and portable
-/// session, over the real radio. Only the presentation is skipped.
+/// The run is the real thing: the same adapter, transport, runner, portable
+/// session, library, and publisher, over the real radio. Only the presentation is
+/// skipped.
 enum NeoBridgeAcceptance {
     /// The environment variable that selects this mode and names the transcript.
     static let traceEnvironmentKey = "NEOBRIDGE_ACCEPTANCE_TRACE"
+
+    /// The environment variable that names the export folder.
+    ///
+    /// A headless run cannot open a folder picker, so the folder comes from the
+    /// environment. The interface stores a security-scoped bookmark instead.
+    static let exportDirectoryEnvironmentKey = "NEOBRIDGE_EXPORT_DIRECTORY"
 
     /// How long the whole attempt may take before the run is abandoned.
     static let timeout: TimeInterval = 180
@@ -35,13 +43,24 @@ enum NeoBridgeAcceptance {
         return URL(fileURLWithPath: path)
     }
 
+    /// The export folder for this run, or `nil` to store without exporting.
+    static var exportDirectory: String? {
+        guard let path = ProcessInfo.processInfo.environment[exportDirectoryEnvironmentKey],
+            !path.isEmpty
+        else { return nil }
+        return path
+    }
+
     /// Runs one attempt and exits. Never returns.
     ///
     /// - Parameter traceURL: Where to write the transcript.
     @MainActor
     static func run(traceURL: URL) -> Never {
         let trace = PenTrafficLog()
-        let controller = PenSyncAppComposition.makeController(trace: trace)
+        let controller = PenSyncAppComposition.makeController(
+            trace: trace,
+            exportDirectory: exportDirectory
+        )
 
         controller.readPenData()
 
@@ -73,7 +92,7 @@ enum NeoBridgeAcceptance {
         }
 
         report(controller, traceURL: traceURL)
-        exit(controller.result == nil ? 1 : 0)
+        exit(controller.outcome == nil ? 1 : 0)
     }
 
     /// Prints what the run found, for the transcript's header in the checklist.
@@ -84,15 +103,33 @@ enum NeoBridgeAcceptance {
             "acceptance: transcript \(traceURL.path)",
             "acceptance: phase \(controller.statusLabel)",
         ]
-        if let result = controller.result {
+
+        if let outcome = controller.outcome {
             lines.append(
-                "acceptance: strokes \(result.strokeCount) dots \(result.dotCount)"
-                    + " pages \(result.distinctPageCount) notes \(result.notes.count)"
+                "acceptance: strokes \(outcome.summary.strokeCount) dots \(outcome.summary.dotCount)"
+                    + " pages \(outcome.summary.distinctPageCount) notes \(outcome.summary.notes.count)"
             )
-            for note in result.notes {
+            lines.append("acceptance: notice \(outcome.notice)")
+            if let save = outcome.save {
+                lines.append(
+                    "acceptance: batch \(save.batchID.uuidString) added \(save.insertion.addedStrokeCount)"
+                        + " duplicates \(save.insertion.duplicateStrokeCount)"
+                )
+            }
+            if let export = outcome.export {
+                lines.append("acceptance: export succeeded \(export.succeeded)")
+                for artifact in export.artifacts {
+                    lines.append(
+                        "acceptance: file \(artifact.path) status \(statusLabel(artifact.status))"
+                            + " bytes \(artifact.byteCount)"
+                    )
+                }
+            }
+            for note in outcome.summary.notes {
                 lines.append("acceptance: read \(note.label) strokes \(note.strokeCount) dots \(note.dotCount)")
             }
         }
+
         if let message = controller.errorMessage {
             lines.append("acceptance: error \(message)")
         }
@@ -100,5 +137,14 @@ enum NeoBridgeAcceptance {
             lines.append("acceptance: diagnostic \(diagnostic)")
         }
         standardOutput.write(Data((lines.joined(separator: "\n") + "\n").utf8))
+    }
+
+    /// A stable name for a file's outcome, for the transcript.
+    private static func statusLabel(_ status: PenExportFileStatus) -> String {
+        switch status {
+        case .unchanged: return "unchanged"
+        case .published: return "published"
+        case .failed(let reason): return "failed: \(reason)"
+        }
     }
 }

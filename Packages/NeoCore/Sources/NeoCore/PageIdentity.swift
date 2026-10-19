@@ -37,3 +37,14 @@ extension PageIdentity: CustomStringConvertible {
         "Ncode(section: \(section), owner: \(owner), book: \(book), page: \(page))"
     }
 }
+
+extension PageIdentity {
+    /// Orders pages by the four numeric key components.
+    ///
+    /// Exports and batch records use this order so a page's position never
+    /// depends on the order the pen transferred it in.
+    public static func canonicalOrder(_ first: PageIdentity, _ second: PageIdentity) -> Bool {
+        (first.section, first.owner, first.book, first.page)
+            < (second.section, second.owner, second.book, second.page)
+    }
+}

@@ -77,6 +77,60 @@ enum FakePenFrames {
         ]
     }
 
+    /// A `0x24` offline data packet carrying one stroke with one dot.
+    ///
+    /// The layout is the one `docs/protocol-a1.md` records for `OffLineData`: an
+    /// 18-byte header, a 27-byte stroke record, then one 16-byte offline dot with
+    /// its trailing checksum. A single packet at the `end` position completes the
+    /// transfer, so one packet is a whole read.
+    static func offlineStrokePacket(
+        packetID: UInt16 = 1,
+        transferPosition: OfflineTransferPosition = .end,
+        page: UInt32 = 1,
+        book: UInt32 = note,
+        section: UInt8 = 3,
+        owner: UInt32 = 27,
+        downTimeMilliseconds: Int64 = 1_700_000_000_000,
+        integerX: UInt16 = 12,
+        integerY: UInt16 = 34
+    ) -> [UInt8] {
+        var payload: [UInt8] = []
+        payload += littleEndian16(packetID)
+        payload += [0x00]  // Compression flag: clear, so the payload is uncompressed.
+        payload += littleEndian16(0)  // Size before compression.
+        payload += littleEndian16(0)  // Size after compression.
+        payload += [transferPosition.rawValue]
+        // The A1 packs the section into the high byte of the owner field.
+        payload += littleEndian32(UInt32(section) << 24 | (owner & 0x00FF_FFFF))
+        payload += littleEndian32(book)
+        payload += littleEndian16(1)  // One stroke record.
+
+        payload += littleEndian32(page)
+        payload += littleEndian64(UInt64(bitPattern: downTimeMilliseconds))
+        payload += littleEndian64(UInt64(bitPattern: downTimeMilliseconds + 40))
+        payload += [0x01]  // Tip type.
+        payload += [0x00, 0x00, 0x00, 0x00]  // Reserved.
+        payload += littleEndian16(1)  // One dot.
+
+        payload += offlineDot(integerX: integerX, integerY: integerY)
+
+        return frame(.offlineDataRequest2, payload)
+    }
+
+    /// One 16-byte offline dot, checksum included.
+    private static func offlineDot(integerX: UInt16, integerY: UInt16) -> [UInt8] {
+        var dot: [UInt8] = [0x00]  // Time delta in milliseconds.
+        dot += littleEndian16(120)  // Pressure.
+        dot += littleEndian16(integerX)
+        dot += littleEndian16(integerY)
+        dot += [0x25, 0x00]  // x and y hundredths.
+        dot += [0x00, 0x00]  // Tilt.
+        dot += littleEndian16(0)  // Twist.
+        dot += [0x00, 0x00]  // Reserved.
+        dot.append(dot.reduce(0) { UInt8(truncatingIfNeeded: Int($0) + Int($1)) })
+        return dot
+    }
+
     /// Frames one packet with the portable encoder.
     private static func frame(_ command: PenCommand, _ payload: [UInt8]) -> [UInt8] {
         guard let encoded = PenFrameEncoder.encode(command: command, payload: payload) else {
@@ -99,6 +153,10 @@ enum FakePenFrames {
 
     private static func littleEndian16(_ value: UInt16) -> [UInt8] {
         [UInt8(value & 0xFF), UInt8((value >> 8) & 0xFF)]
+    }
+
+    private static func littleEndian64(_ value: UInt64) -> [UInt8] {
+        (0..<8).map { UInt8((value >> UInt64(8 * $0)) & 0xFF) }
     }
 
     private static func littleEndian32(_ value: UInt32) -> [UInt8] {

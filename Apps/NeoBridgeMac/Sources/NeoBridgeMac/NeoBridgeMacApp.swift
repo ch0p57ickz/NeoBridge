@@ -1,5 +1,7 @@
 import AppKit
 import NeoBridgeMacCore
+import NeoCore
+import NeoStorage
 import SwiftUI
 
 /// The scene identifier and title that name the details window.
@@ -31,20 +33,54 @@ enum NeoBridgeMacMain {
 ///
 /// One Bluetooth adapter serves a whole run, because only one pen connects at a
 /// time. Each attempt still gets its own transport and session from the factory,
-/// which is what makes a retry a new scan rather than a resumed one.
+/// which is what makes a retry a new scan rather than a resumed one. One library
+/// serves the whole run, because the strokes belong to the user rather than to an
+/// attempt.
 @MainActor
 enum PenSyncAppComposition {
     /// Creates the controller the app and the acceptance run drive.
     ///
-    /// - Parameter trace: An optional traffic transcript. Only the acceptance run
-    ///   supplies one.
-    static func makeController(trace: PenTrafficLog? = nil) -> PenSyncController {
+    /// - Parameters:
+    ///   - trace: An optional traffic transcript. Only the acceptance run
+    ///     supplies one.
+    ///   - exportDirectory: A folder fixed at launch, or `nil` to use the folder
+    ///     the user chose.
+    static func makeController(
+        trace: PenTrafficLog? = nil,
+        exportDirectory: String? = nil
+    ) -> PenSyncController {
         let central = CoreBluetoothPenCentral()
+        let destination: any PenExportDestinationProviding = exportDirectory.map {
+            FixedExportDestination(directory: $0)
+        } ?? BookmarkedExportDestination()
+
         return PenSyncController(
             runners: PenSyncRunnerFactory { selection in
                 BluetoothPenSyncRunner(central: central, selection: selection, trace: trace)
-            }
+            },
+            library: makeLibrary(),
+            destination: destination
         )
+    }
+
+    /// Opens the durable library, or a coordinator that reports why it could not.
+    private static func makeLibrary() -> any PenImportCoordinator {
+        let url: URL
+        do {
+            url = try PenLibraryComposition.defaultLibraryURL()
+        } catch {
+            return UnavailableImportCoordinator(
+                libraryPath: "Application Support/NeoBridge/library.sqlite",
+                reason: String(describing: error)
+            )
+        }
+
+        do {
+            return try PenLibraryComposition.makeImporter(libraryURL: url)
+        } catch {
+            let message = (error as? StorageError)?.message ?? String(describing: error)
+            return UnavailableImportCoordinator(libraryPath: url.path, reason: message)
+        }
     }
 }
 
@@ -66,7 +102,7 @@ struct NeoBridgeMacApp: App {
         Window(PenSyncScene.windowTitle, id: PenSyncScene.windowID) {
             PenSyncView(controller: controller)
         }
-        .defaultSize(width: 480, height: 460)
+        .defaultSize(width: 520, height: 520)
         .windowResizability(.contentMinSize)
     }
 }

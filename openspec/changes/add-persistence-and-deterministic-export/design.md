@@ -1,0 +1,38 @@
+# Design
+
+## Context
+
+See `proposal.md`. `PenSessionResult` already carries assembled strokes, but `BluetoothPenSyncRunner` reduces them to `PenSyncSummary`, so the app currently cannot persist the read. `NeoCore` defines `PageIdentity`, `StrokeIdentity`, `PenStrokeStore`, `PenExportPublisher`, and an in-memory import lifecycle. The macOS shell explicitly says results are unsaved. The A1 offline retrieval spike has physical evidence; pen deletion remains disabled.
+
+## Goals / Non-Goals
+
+**Goals:** Store a validated complete transfer durably, make replay idempotent, publish repeatable page files, and present accurate save/export state. Keep storage, export, and fixture-driven integration tests portable to Linux.
+
+**Non-Goals:** Enabling pen deletion, changing A1 wire behavior, cloud services, OCR, and simultaneous pen sessions. A group of separate export files is recoverable but not one atomic filesystem transaction.
+
+## Decisions
+
+1. **Carry complete strokes through the host boundary.** Extend the runner result to include `PenSessionResult.strokes` alongside the display summary. The app coordinator validates the whole session before beginning a storage transaction. Preserve the existing `PenTransport` byte interface: `FakePenTransport` and sanitized fixture conversations drive Linux integration tests; `CoreBluetoothPenTransport` remains the macOS adapter. Alternative: reconstruct strokes from summary counts, which loses data and page identity.
+
+2. **Use one local SQLite library in WAL mode.** `NeoStorage` owns migrations, transactions, page rows keyed by `(section, owner, book, page)`, stroke payloads, fingerprint metadata, batch states, and a cleanup journal. Bind values rather than building SQL strings. Commit a complete transfer in one transaction, including its validated batch marker; never commit partial transfer output. Use a stable unique identity for reliable canonical SHA-256 fingerprints, while preserving unreliable/incomplete strokes separately with durable row IDs so matching digests across sources do not collapse them. A second import selects the existing reliable row and updates no user-visible ordering. Alternative: one file per page, which makes deduplication and crash recovery harder.
+
+3. **Use a durable two-phase import boundary.** Phase one collects and validates all note transfers. Phase two commits strokes and batch state, then publishes exports from a fresh database read. Record `collecting -> validated -> committed -> published` transitions, with failure state or retry metadata where appropriate. A storage failure yields no saved result. A successful commit yields a saved library result even if publication later fails; export completion is a separate outcome. Retry publication from committed data without reimporting. A complete zero-stroke read reports "no strokes found" and creates no page files. The wire-level `0xA4` transfer acknowledgement is required during retrieval and cannot wait for disk; it must not be confused with permission to delete pen data. Pen cleanup remains `keepOnPen`. The durable cleanup journal models `prepared -> requested -> confirmed` for a future hardware-gated deletion flow, but this change records no deletion request and never sends `0x25` or `0x27`.
+
+4. **Version and canonicalize each export.** Every non-empty page export renders JSON, SVG, and Markdown together. Sort pages by the four numeric key components and strokes lexicographically by the full `CanonicalStrokeEncoding` bytes, not database row ID or arrival order. Identical canonical bytes produce identical adjacent entries when multiple unreliable strokes are retained, preserving multiplicity without an unstable tie-breaker. JSON uses a fixed schema/version and field order: four page integers; for each stroke, origin-time reliability and reported milliseconds (nullable), then ordered point integers `x`, `y`, `penTimeOffsetMilliseconds`, and `pressure`. These are the existing normalized units. Omit live/offline source, host timestamps, storage IDs, batch IDs, device identifiers, and authentication data. SVG renders the same sorted strokes with a deterministic viewBox, fixed numeric formatting, and XML escaping. Markdown contains stable page metadata, stroke count, and relative links to the matching JSON and SVG. Use UTF-8, fixed newlines, and locale-independent integer formatting. Filenames encode all four numeric page components. Alternative: default `Codable` or locale formatting without a file contract, which can drift across hosts.
+
+5. **Preserve differing files, then publish atomically per target.** The library merges replayed pen strokes; generated files are complete projections of that library, so arbitrary user edits inside JSON, SVG, or Markdown are not parsed or merged. For each target, compare bytes first: identical content is a no-op. For differing content, preserve the prior target in a per-target history of the three most recent versions before replacement. The newly generated version becomes the primary file. Stage and verify a backup before rotating history; if backup preservation fails, leave that target untouched. Refuse to follow a target or backup symlink. Render bytes, write and flush a sibling temporary file, then rename it into place; clean orphan temps on retry. Report per-file `unchanged`, `published`, or `failed` outcomes, and report overall success only when all three targets succeed. A crash between formats can leave mixed versions, so retry all three deterministically. A user-selected export folder is accessed through a security-scoped bookmark on macOS; the portable publisher receives a resolved directory path and never imports AppKit or CoreGraphics.
+
+6. **Respect package boundaries.** `NeoStorage` and `NeoExport` depend on portable `NeoCore`; any needed SQLite system library is exposed through SwiftPM for Linux and macOS. No `SwiftUI`, `AppKit`, or `CoreBluetooth` imports enter `Packages/*/Sources`. Add both packages and integration tests to `Scripts/test-portable.sh`; keep the macOS deployment floor at 15 or later because the app links `NeoProtocol`.
+
+## Risks / Trade-offs
+
+- SQLite library or build differences across Linux and macOS → Pin the SwiftPM dependency or system-module setup, run package tests on Linux, and run the portable script plus `xcodebuild` on the Mac runner.
+- Export failure after a successful commit → Retain the committed batch, show a separate export error, and retry using the same stored rows.
+- Cross-source fingerprint collision or insufficient origin time → Use the existing canonical encoding and dedup flag; retain unreliable strokes rather than merging them.
+- Filesystem crash between multiple output files → Promise atomicity per file, not for the whole set; replay the complete deterministic export set after restart.
+- User edits in exported files → Preserve differing prior bytes in a three-version backup history; regenerate the primary files from the library rather than attempting unsafe format-specific merges.
+- Hardware evidence does not establish deletion safety → Keep `PenCleanupPolicy.deletionEnabled` false and require physical A1 acceptance before any later change enables cleanup.
+
+## Migration Plan
+
+Create the SQLite schema on first launch and migrate by explicit version. Existing memory-only reads have no durable data to migrate; the user rereads the pen, which still retains its copy. Deploy the app only after Linux package/integration tests and the remote Mac build gate pass. If the new import path fails, retain the pen copy and existing database; revert the app binary without deleting user data or export files.

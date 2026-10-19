@@ -1,11 +1,13 @@
 import Foundation
+import NeoCore
 import Observation
 
 /// Drives one read attempt and publishes what the shell shows.
 ///
 /// The controller owns the attempt lifecycle — start, cancel, retry — and no
-/// protocol or Bluetooth logic. It reads one runner per attempt from its
-/// factory, so every retry starts a new scan and a new session.
+/// protocol, storage, or file logic. It reads one runner per attempt from its
+/// factory, so every retry starts a new scan and a new session, and it hands the
+/// complete transfer to the library, so a read is saved rather than summarized.
 @MainActor
 @Observable
 public final class PenSyncController {
@@ -26,13 +28,20 @@ public final class PenSyncController {
         /// Discovering notes and reading their offline data.
         case syncing
 
+        /// Committing the read to the library.
+        case saving
+
+        /// Publishing the read's page files.
+        case exporting
+
         /// Several pens advertised the expected name, so the user chooses one.
         ///
         /// No pen is picked silently, and no candidate carries an address.
         case choosingPen(candidates: [PenPeripheral])
 
-        /// Every discovered note was read.
-        case complete(PenSyncSummary)
+        /// The read finished. The outcome says whether it was stored and whether
+        /// every requested file was written.
+        case complete(PenReadOutcome)
 
         /// A step failed. `diagnostic` describes partial data when a transfer
         /// stopped early, and is never presented as a completed sync.
@@ -42,39 +51,52 @@ public final class PenSyncController {
         public var isTerminal: Bool {
             switch self {
             case .complete, .failed: return true
-            case .idle, .scanning, .connecting, .verifying, .syncing, .choosingPen: return false
+            case .idle, .scanning, .connecting, .verifying, .syncing, .saving, .exporting,
+                .choosingPen:
+                return false
             }
         }
     }
 
     /// The title of the action that retrieves offline strokes.
     ///
-    /// The label says the app reads the pen, because this version neither
-    /// imports into a library nor exports a file.
-    public static let readActionTitle = "Read Pen Data"
+    /// The label says the app saves the pen's data, because that is what the read
+    /// does now: the strokes are committed to the library and the requested files
+    /// are written.
+    public static let readActionTitle = "Read and Save Pen Data"
 
-    /// The notice shown with a completed result.
-    public static let notSavedNotice =
-        "These results are held in memory only. Nothing was written to disk or exported."
+    /// The title of the action that publishes a stored read again.
+    public static let retryExportActionTitle = "Retry Export"
 
     /// What the shell is showing now.
     public private(set) var phase: Phase = .idle
 
     private let runners: PenSyncRunnerFactory
+    private let library: any PenImportCoordinator
+    private let destination: any PenExportDestinationProviding
     private var attempt: Task<Void, Never>?
     private var generation = 0
 
     /// Creates a controller.
     ///
-    /// - Parameter runners: The factory that makes a runner for each attempt.
-    public init(runners: PenSyncRunnerFactory) {
+    /// - Parameters:
+    ///   - runners: The factory that makes a runner for each attempt.
+    ///   - library: The verified importer that stores a read and publishes it.
+    ///   - destination: The folder exports are written to.
+    public init(
+        runners: PenSyncRunnerFactory,
+        library: any PenImportCoordinator,
+        destination: any PenExportDestinationProviding
+    ) {
         self.runners = runners
+        self.library = library
+        self.destination = destination
     }
 
     /// Whether an attempt is running.
     public var isBusy: Bool {
         switch phase {
-        case .scanning, .connecting, .verifying, .syncing: return true
+        case .scanning, .connecting, .verifying, .syncing, .saving, .exporting: return true
         case .idle, .choosingPen, .complete, .failed: return false
         }
     }
@@ -99,15 +121,17 @@ public final class PenSyncController {
         case .connecting: return PenSyncStage.connecting.label
         case .verifying: return PenSyncStage.verifying.label
         case .syncing: return PenSyncStage.syncing.label
+        case .saving: return "Saving to the library"
+        case .exporting: return "Writing export files"
         case .choosingPen: return "Choose a pen"
         case .complete: return "Complete"
         case .failed: return "Failed"
         }
     }
 
-    /// The completed result, when the attempt succeeded.
-    public var result: PenSyncSummary? {
-        if case .complete(let result) = phase { return result }
+    /// The finished read, when the attempt succeeded.
+    public var outcome: PenReadOutcome? {
+        if case .complete(let outcome) = phase { return outcome }
         return nil
     }
 
@@ -121,6 +145,30 @@ public final class PenSyncController {
     public var errorDiagnostic: String? {
         if case .failed(_, let diagnostic) = phase { return diagnostic }
         return nil
+    }
+
+    /// The folder exports are written to, or `nil` when none has been chosen.
+    public var exportDirectoryPath: String? {
+        destination.exportDirectory()
+    }
+
+    /// Whether a stored read can have its files published again.
+    ///
+    /// The retry is offered only while the completed read is the one shown, so a
+    /// later failed attempt cannot leave a Retry action that republishes an older
+    /// read and reports it as the current result.
+    public var canRetryExport: Bool {
+        guard case .complete(let outcome) = phase else { return false }
+        return outcome.canRetryExport && outcome.exportFailed
+    }
+
+    /// Stores the folder the user chose.
+    ///
+    /// - Parameter url: The chosen folder.
+    /// - Throws: When the folder cannot be remembered, so the app never claims a
+    ///   destination it cannot reopen.
+    public func chooseExportDirectory(_ url: URL) throws {
+        try destination.setExportDirectory(url)
     }
 
     /// Starts a read attempt.
@@ -153,6 +201,36 @@ public final class PenSyncController {
         phase = .idle
     }
 
+    /// Publishes the last stored read's files again.
+    ///
+    /// The retry reads the committed rows, so it never imports the read twice and
+    /// never invents a result from data that was not stored.
+    public func retryExport() {
+        guard canRetryExport, case .complete(let outcome) = phase, let save = outcome.save,
+            let directory = outcome.destinationDirectory
+        else { return }
+
+        generation += 1
+        let generation = self.generation
+        phase = .exporting
+
+        let request = PenExportRequest(pages: save.pages, destinationDirectory: directory)
+        attempt = Task { [weak self] in
+            guard let controller = self else { return }
+            do {
+                let report = try await controller.library.retryExport(
+                    batchID: save.batchID,
+                    request: request
+                )
+                controller.finishRetry(with: report, for: generation, base: outcome)
+            } catch {
+                controller.fail(with: error, for: generation)
+            }
+        }
+    }
+
+    // MARK: - Attempt
+
     private func start(selection: CoreBluetoothPenTransport.Selection) {
         guard !isBusy else { return }
 
@@ -167,19 +245,52 @@ public final class PenSyncController {
             // The stages arrive from the runner's own context, so each report
             // hops back to the main actor. Reports are ordered because the
             // session reports its states in order.
-            let report: @Sendable (PenSyncStage) -> Void = { stage in
+            let report: @Sendable (PenSyncStage) -> Void = { [weak self] stage in
                 Task { @MainActor in
-                    controller.apply(stage, for: generation)
+                    self?.apply(stage, for: generation)
                 }
             }
 
             do {
-                let result = try await runner.run(report: report)
-                controller.complete(with: result, for: generation)
+                let read = try await runner.run(report: report)
+                try await controller.save(read, for: generation)
             } catch {
                 controller.fail(with: error, for: generation)
             }
         }
+    }
+
+    /// Commits the read and publishes its files.
+    private func save(_ read: PenReadResult, for generation: Int) async throws {
+        guard self.generation == generation else { return }
+
+        let directory = destination.exportDirectory()
+        let request = directory.map {
+            PenExportRequest(pages: read.transfer.pages, destinationDirectory: $0)
+        }
+
+        let reporting: @Sendable (PenImportStage) -> Void = { [weak self] stage in
+            Task { @MainActor in
+                self?.apply(stage, for: generation)
+            }
+        }
+
+        let outcome = try await library.importRead(
+            read.transfer,
+            export: request,
+            reporting: reporting
+        )
+
+        guard self.generation == generation else { return }
+        attempt = nil
+
+        let presented = PenReadOutcome(
+            summary: read.summary,
+            save: outcome.save,
+            export: outcome.export,
+            destinationDirectory: directory
+        )
+        phase = .complete(presented)
     }
 
     // MARK: - Attempt updates
@@ -189,10 +300,29 @@ public final class PenSyncController {
         phase = Phase(stage)
     }
 
-    private func complete(with result: PenSyncSummary, for generation: Int) {
+    private func apply(_ stage: PenImportStage, for generation: Int) {
+        guard self.generation == generation else { return }
+        switch stage {
+        case .saving: phase = .saving
+        case .exporting: phase = .exporting
+        }
+    }
+
+    private func finishRetry(
+        with report: PenExportReport,
+        for generation: Int,
+        base outcome: PenReadOutcome
+    ) {
         guard self.generation == generation else { return }
         attempt = nil
-        phase = .complete(result)
+
+        let updated = PenReadOutcome(
+            summary: outcome.summary,
+            save: outcome.save,
+            export: report,
+            destinationDirectory: outcome.destinationDirectory
+        )
+        phase = .complete(updated)
     }
 
     private func fail(with error: any Error, for generation: Int) {

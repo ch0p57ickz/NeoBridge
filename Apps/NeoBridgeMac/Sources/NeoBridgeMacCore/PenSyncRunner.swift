@@ -1,6 +1,7 @@
 import Foundation
 import NeoCore
 import NeoProtocol
+import NeoStorage
 
 /// One stage of a read attempt, in the order a successful attempt reports them.
 ///
@@ -52,10 +53,11 @@ public protocol PenSyncRunning: Sendable {
     ///
     /// - Parameter report: Called as each stage begins. The callbacks arrive in
     ///   stage order from the session's sequential transitions.
-    /// - Returns: The summary the shell presents.
+    /// - Returns: The summary the shell presents and the complete transfer the
+    ///   library commits.
     /// - Throws: A `PenBluetoothError` or `PenSessionError` describing the
     ///   failed step.
-    func run(report: @escaping @Sendable (PenSyncStage) -> Void) async throws -> PenSyncSummary
+    func run(report: @escaping @Sendable (PenSyncStage) -> Void) async throws -> PenReadResult
 }
 
 /// Makes a fresh runner for each attempt.
@@ -155,7 +157,7 @@ public struct BluetoothPenSyncRunner: PenSyncRunning {
 
     public func run(
         report: @escaping @Sendable (PenSyncStage) -> Void
-    ) async throws -> PenSyncSummary {
+    ) async throws -> PenReadResult {
         let base = CoreBluetoothPenTransport(
             central: central,
             advertisedName: advertisedName,
@@ -200,7 +202,9 @@ public struct BluetoothPenSyncRunner: PenSyncRunning {
             await transport.close()
             trace?.recordState("Disconnected")
             trace?.recordCompletion(result)
-            return PenSyncSummary(result)
+            // The complete transfer travels with the display summary, so the
+            // read can be stored rather than reduced to counts.
+            return PenReadResult(result)
         } catch {
             trace?.recordFailure(error)
             throw error
@@ -232,9 +236,10 @@ public struct BluetoothPenSyncRunner: PenSyncRunning {
 
 // MARK: - Error presentation
 
-/// A message for any error the Bluetooth layer or the session can raise.
+/// A message for any error the Bluetooth layer, the session, or the library can
+/// raise.
 ///
-/// The shell shows error strings, and both layers already phrase theirs for a
+/// The shell shows error strings, and every layer already phrases its errors for a
 /// reader, so this only decides which layer's phrasing to use.
 public func penSyncErrorMessage(for error: any Error) -> String {
     switch error {
@@ -242,6 +247,8 @@ public func penSyncErrorMessage(for error: any Error) -> String {
         return bluetoothError.message
     case let sessionError as PenSessionError:
         return sessionError.message
+    case let storageError as StorageError:
+        return storageError.message
     case is CancellationError:
         return PenSessionError.cancelled.message
     default:
