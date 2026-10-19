@@ -1,3 +1,4 @@
+import AppKit
 import NeoBridgeMacCore
 import SwiftUI
 
@@ -31,6 +32,7 @@ struct PenSyncView: View {
         }
         .padding(20)
         .frame(minWidth: 440, minHeight: 400, alignment: .topLeading)
+        .background(WindowRaiserView())
     }
 
     @ViewBuilder
@@ -136,5 +138,29 @@ struct PenSyncView: View {
 
             Button("Close") { dismissWindow(id: PenSyncScene.windowID) }
         }
+    }
+}
+
+/// An invisible view that makes the details window key and front within the app.
+///
+/// Bringing the app itself forward is `PenSyncActivation`'s job, from the menu
+/// command: the measurement recorded there shows a window cannot take activation
+/// from another app by itself. This view covers the other half, making the window
+/// key as soon as it joins a window, which is the first moment it exists.
+private struct WindowRaiserView: NSViewRepresentable {
+    func makeNSView(context: Context) -> WindowRaiser {
+        WindowRaiser()
+    }
+
+    func updateNSView(_ nsView: WindowRaiser, context: Context) {}
+}
+
+/// Makes its window key and front whenever the view joins a window.
+private final class WindowRaiser: NSView {
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        // Ordering is idempotent, so a reopened window is raised again without a
+        // flag tracking whether this view already raised one.
+        window?.makeKeyAndOrderFront(nil)
     }
 }

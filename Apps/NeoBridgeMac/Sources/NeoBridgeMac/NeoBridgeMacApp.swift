@@ -2,9 +2,12 @@ import AppKit
 import NeoBridgeMacCore
 import SwiftUI
 
-/// The scene identifier the menu and the window share.
+/// The scene identifier and title that name the details window.
 enum PenSyncScene {
     static let windowID = "pen-sync"
+
+    /// The title the details window shows.
+    static let windowTitle = "NeoBridge Pen Sync"
 }
 
 /// The process entry point.
@@ -52,14 +55,15 @@ enum PenSyncAppComposition {
 /// ``PenSyncController``; the menu and the window are two views of it.
 struct NeoBridgeMacApp: App {
     @State private var controller = PenSyncAppComposition.makeController()
+    @State private var activation = PenSyncActivation()
 
     var body: some Scene {
         MenuBarExtra("NeoBridge", systemImage: "pencil.tip") {
-            PenSyncMenu(controller: controller)
+            PenSyncMenu(controller: controller, activation: activation)
         }
         .menuBarExtraStyle(.menu)
 
-        Window("NeoBridge Pen Sync", id: PenSyncScene.windowID) {
+        Window(PenSyncScene.windowTitle, id: PenSyncScene.windowID) {
             PenSyncView(controller: controller)
         }
         .defaultSize(width: 480, height: 460)

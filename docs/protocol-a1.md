@@ -377,8 +377,10 @@ window covers the slower case, and neither observation shows the pen to be prese
 when the window has elapsed.
 
 The rows this run could not reach — a second pen, a Bluetooth toggle, a denied
-permission prompt, a mid-transfer interruption, and the user interface — are
-recorded as unverified in `Tests/Hardware/README.md`.
+permission prompt, a mid-transfer interruption, and the window behaviour of the user
+interface — are recorded as unverified in `Tests/Hardware/README.md`. The details-window
+command was reached on first use afterwards and is recorded as passing there, together
+with the accessory-app activation defect it exposed.
 
 The evidence still requires codec corrections, which are tracked separately in
 `openspec/changes/correct-a1-codec-from-hardware-evidence/`:

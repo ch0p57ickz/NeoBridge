@@ -145,7 +145,7 @@ Dock icon, and closing the window leaves the menu-bar item in place.
 | A numbered pen entry, such as `Neosmartpen_A1 (pen 1)` | Two or more pens matched | Reads the pen you pick |
 | Result line | A read completed | Shows strokes, dots, and distinct pages |
 | Failure line | A read failed | Shows the human-readable error |
-| **Connection Details…** | Always | Opens the details window |
+| **Connection Details…** | Always | Opens the details window, brings it forward, and takes keyboard focus from the app you were using |
 | **Quit NeoBridge** | Always | Quits the app |
 
 The action that retrieves strokes is labelled **Read Pen Data** because nothing

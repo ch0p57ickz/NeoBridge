@@ -8,8 +8,10 @@ Status of the last run: **run on 2026-10-19 against a physical A1.** The headles
 acceptance mode read the pen fourteen times, including four consecutive reads, three
 more after the fixes below landed, and two more with the pen switched off and on again
 mid-read, and the rows it exercises are ticked below. Rows
-that need a second pen, a Bluetooth toggle, a denied permission prompt, or the
-SwiftUI shell were not reached and are marked as unverified with the reason.
+that need a second pen, a Bluetooth toggle, a denied permission prompt, or the window
+behaviour of the SwiftUI shell were not reached during that run and are marked as
+unverified with the reason; the details-window command was reached on first use
+afterwards and is recorded in its row.
 
 The unit suites are not a substitute for this run: they use a fake transport and
 fixture frames, and nothing in them proves how the physical pen behaves. The run
@@ -154,7 +156,7 @@ drive. The values it does check are recorded in the rows where they appear.
 | Scenario | Automated coverage | The hardware run must confirm | Pass / Fail |
 | --- | --- | --- | --- |
 | Launch as a menu-bar app | The bundle carries `LSUIElement`, checked by `Scripts/remote-mac-build.sh` | The app has no Dock icon and its menu-bar item is present after launch | **Pass.** The assembled bundle launched as an accessory process with no Dock icon. |
-| Open the details window | The window scene is declared; the command is listed in `Apps/NeoBridgeMac/README.md` | Choosing **Connection Details…** opens the window, and closing it leaves the app running | **Unverified.** Needs the user interface. |
+| Open the details window | The window scene is declared; the command is listed in `Apps/NeoBridgeMac/README.md` | Choosing **Connection Details…** opens the window, and closing it leaves the app running | **Pass for the recorded cases.** First use on 2026-10-19 reported that the command appeared to do nothing. A window probe (`CGWindowListCopyWindowInfo`) showed the window existed on screen at layer 0, 480x460, with the app inactive: an accessory app is not activated by creating a window, so it was built behind the frontmost app. The command now takes activation instead of requesting it, and the window makes itself key. Verified by recording the window order across four commands: (1) window created, (2) minimized then restored from the Dock, (3) window open with another app frontmost, (4) minimized and restored again. Every command ended with the app active and its window the frontmost window; before the fix, the restore case never activated. An isolated probe app showed why: with another app frontmost, `activate()` is declined with the window visible, minimized, or mid-restore, while `activate(ignoringOtherApps:)` is granted in all three. A window left on another Space or display was not covered: neither activation nor ordering moves a window between Spaces. |
 | Show sync results | `PenSyncControllerTests` publishes the counts and the notes read | The counts match the mark, and the note list names the note that was read | **Unverified.** Needs the user interface. The headless run confirmed the same values: 6952 strokes, 70679 dots, 19 pages, and note 700 read. |
 | Show progress during sync | `PenSyncControllerTests` publishes each in-progress state | Counts from an earlier read disappear while a new read runs | **Unverified.** Needs the user interface. |
 | Failed transfer has partial data | `PenSyncControllerTests` presents the failure and no result | After a forced mid-transfer failure, no counts appear as a completed result | **Unverified.** Needs the user interface and a forced failure. |

@@ -9,6 +9,7 @@ import SwiftUI
 struct PenSyncMenu: View {
     @Environment(\.openWindow) private var openWindow
     let controller: PenSyncController
+    let activation: PenSyncActivation
 
     var body: some View {
         Text("NeoBridge — \(controller.statusLabel)")
@@ -38,9 +39,20 @@ struct PenSyncMenu: View {
         }
 
         Divider()
-        Button("Connection Details…") { openWindow(id: PenSyncScene.windowID) }
+        Button("Connection Details…") { openDetailsWindow() }
         Divider()
         Button("Quit NeoBridge") { NSApplication.shared.terminate(nil) }
+    }
+
+    /// Opens the details window and brings the app forward.
+    ///
+    /// Opening a window does not activate an accessory app, so without the
+    /// activation the window is created behind the frontmost app and the command
+    /// looks like it did nothing. The window makes itself key, and the activation
+    /// takes focus and is re-asked as the menu dismissal and any Dock restore settle.
+    private func openDetailsWindow() {
+        openWindow(id: PenSyncScene.windowID)
+        activation.activateForCommand()
     }
 
     /// Names a candidate without exposing its Bluetooth address.
