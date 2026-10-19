@@ -77,6 +77,52 @@ so run tests per package rather than from the repository root:
 (cd Packages/NeoProtocol && swift test)
 ```
 
+The app is its own SwiftPM package and only builds on macOS:
+
+```bash
+(cd Apps/NeoBridgeMac && swift build)
+(cd Apps/NeoBridgeMac && swift test)
+```
+
+## Mac build and packaging
+
+`Scripts/remote-mac-build.sh` is the single macOS entry point. It runs
+`Scripts/test-portable.sh`, builds the app with SwiftPM, gates on `xcodebuild`, and
+assembles an ad-hoc-signed `NeoBridgeMac.app` in
+`Apps/NeoBridgeMac/.build/bundle/`:
+
+```bash
+Scripts/remote-mac-build.sh                 # full verification, including the Xcode gate
+Scripts/remote-mac-build.sh --configuration debug
+SKIP_XCODE_GATE=1 Scripts/remote-mac-build.sh   # skips the gate and says so; not full verification
+```
+
+The bundle is assembled by the script, not by SwiftPM, because CoreBluetooth reads its
+usage description from `Info.plist`, which a bare `swift run` executable does not have.
+To run the built app:
+
+```bash
+open Apps/NeoBridgeMac/.build/bundle/NeoBridgeMac.app
+```
+
+`SKIP_XCODE_GATE=1` exists for a host whose Xcode installation cannot run
+`xcodebuild`. A run that uses it prints `INCOMPLETE` and must not be recorded as
+satisfying the Xcode gate.
+
+To run one headless read against a physical pen and keep a transcript — this is how
+the acceptance checklist in `Tests/Hardware/README.md` is filled in, since a menu-bar
+app cannot be scripted without an accessibility grant:
+
+```bash
+NEOBRIDGE_ACCEPTANCE_TRACE=/tmp/a1-run.txt \
+  Apps/NeoBridgeMac/.build/bundle/NeoBridgeMac.app/Contents/MacOS/NeoBridgeMac
+```
+
+Run it from inside the bundle, because CoreBluetooth reads its usage description from
+`Info.plist`. The exit status is 0 for a completed read and 1 for a failed one, and
+the transcript's last `outboundCommands` line is the deletion check. A pen that is
+powered down advertises nothing at all, which an independent scan confirms.
+
 ## Portability boundary
 
 Sources under `Packages/*/Sources` must not import any of these:
@@ -103,17 +149,21 @@ with grep, so a violation fails verification instead of surfacing in review.
 Present today:
 
 - `Packages/NeoCore`, `Packages/NeoProtocol` — portable packages.
-- `Tests/Fixtures` — six sanitized fixtures plus `generate-fixtures.py`, which
+- `Apps/NeoBridgeMac` — the macOS menu-bar app package: `NeoBridgeMacCore` (Bluetooth
+  adapter, transport, attempt runner, shell state machine) plus the `NeoBridgeMac`
+  executable. Its `README.md` records the BLE assumptions and the menu commands.
+- `Tests/Fixtures` — sanitized fixtures plus `generate-fixtures.py`, which
   reimplements the wire format independently of the Swift codec so the tests
   cross-check the implementation instead of restating it. Regenerate only when a
   fixture must change, then review the generated diff.
+- `Tests/Hardware/README.md` — the physical A1 connect-and-sync acceptance checklist.
 - `Scripts/test-portable.sh` — the portable verification entry point.
+- `Scripts/remote-mac-build.sh` — the Mac build, Xcode gate, and bundle assembly.
 - `docs/protocol-a1.md` — M0 protocol evidence and the hardware gate.
-- `docs/portable-verification.md` — the recorded Linux verification run.
+- `docs/portable-verification.md` — the recorded verification runs.
 
-Planned but not present yet: `Packages/NeoStorage`, `Packages/NeoExport`,
-`Apps/NeoBridgeMac`, `Scripts/remote-mac-build.sh`, `Tests/Integration`, and
-`Tests/Hardware`. `openspec/config.yaml` describes what each should contain.
+Planned but not present yet: `Packages/NeoStorage`, `Packages/NeoExport`, and
+`Tests/Integration`. `openspec/config.yaml` describes what each should contain.
 
 ## Conventions
 

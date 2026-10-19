@@ -86,6 +86,38 @@ enum FixtureSupport {
         try frames(fixture).filter(isOfflineData)
     }
 
+    /// The offline transfers a fixture carries, one packet group per transfer.
+    ///
+    /// A fixture can hold more than one transfer, because the pen restarts its
+    /// packet identifiers for each note and each transfer is assembled on its
+    /// own. A transfer opens at a `start` packet, at any packet when none is
+    /// open, and closes at an `end` packet.
+    static func offlineTransfers(_ fixture: ProtocolFixture) throws -> [[PenFrame]] {
+        var transfers: [[PenFrame]] = []
+        var current: [PenFrame] = []
+
+        for frame in try offlineDataFrames(fixture) {
+            guard case .strokes(let header, _) = OfflineDataParser.parse(payload: frame.payload) else {
+                continue
+            }
+
+            if header.transferPosition == .start, !current.isEmpty {
+                transfers.append(current)
+                current = []
+            }
+            current.append(frame)
+            if header.transferPosition == .end {
+                transfers.append(current)
+                current = []
+            }
+        }
+
+        if !current.isEmpty {
+            transfers.append(current)
+        }
+        return transfers
+    }
+
     /// The completed strokes a fixture yields.
     ///
     /// Offline data packets are assembled by `OfflineTransferAssembler`; every
@@ -96,25 +128,28 @@ enum FixtureSupport {
     ) throws -> [Stroke] {
         let frames = try frames(fixture)
 
-        let offlineFrames = frames.filter(isOfflineData)
-        if !offlineFrames.isEmpty {
-            var assembler = OfflineTransferAssembler()
+        if !frames.filter(isOfflineData).isEmpty {
             var offlineStrokes: [Stroke] = []
 
-            for frame in offlineFrames {
-                switch assembler.ingest(payload: frame.payload) {
-                case .packet(let progress):
-                    offlineStrokes.append(contentsOf: progress.records.map(\.stroke))
-                case .unsupported(let reason):
-                    throw XCTSkip("offline transfer shape is unsupported: \(reason)")
-                case .error(let error):
-                    throw error
+            // Each transfer is assembled on its own, because the pen restarts
+            // its packet identifiers per note.
+            for transfer in try offlineTransfers(fixture) {
+                var assembler = OfflineTransferAssembler()
+                for frame in transfer {
+                    switch assembler.ingest(payload: frame.payload) {
+                    case .packet(let progress):
+                        offlineStrokes.append(contentsOf: progress.records.map(\.stroke))
+                    case .unsupported(let reason):
+                        throw XCTSkip("offline transfer shape is unsupported: \(reason)")
+                    case .error(let error):
+                        throw error
+                    }
                 }
-            }
 
-            // A partial transfer must not be mistaken for a complete import.
-            if !assembler.isComplete {
-                throw XCTSkip("offline transfer never reached its end packet")
+                // A partial transfer must not be mistaken for a complete import.
+                if !assembler.isComplete {
+                    throw XCTSkip("offline transfer never reached its end packet")
+                }
             }
             return offlineStrokes
         }
@@ -134,6 +169,45 @@ enum FixtureSupport {
     static func fixture(_ id: String, in fixtures: [ProtocolFixture]) throws -> ProtocolFixture {
         try XCTUnwrap(fixtures.first { $0.id == id }, "missing fixture \(id)")
     }
+
+    /// The frames a transport sent, decoded rather than indexed.
+    ///
+    /// An outbound frame starts with the `0xC0` marker, so the first byte is
+    /// never the command. Decoding also undoes byte stuffing, which indexing
+    /// would not.
+    static func outboundFrames(_ chunks: [[UInt8]]) -> [PenFrame] {
+        chunks.compactMap { chunk in
+            var decoder = PenFrameDecoder()
+            guard case .frame(let frame)? = decoder.ingest(chunk).first else { return nil }
+            return frame
+        }
+    }
+
+    /// The command identifiers of the frames a transport sent, in order.
+    static func outboundCommands(_ chunks: [[UInt8]]) -> [PenCommand?] {
+        outboundFrames(chunks).map(\.command)
+    }
+
+    /// The acknowledgement bodies of the frames a transport sent, in order.
+    static func outboundAcknowledgements(_ chunks: [[UInt8]]) -> [SentAcknowledgement] {
+        outboundFrames(chunks)
+            .filter { $0.command == .responseOfflineData }
+            .map { frame in
+                SentAcknowledgement(
+                    packetID: PenWire.uint16(frame.payload, at: 0),
+                    operation: PenTransferAcknowledgement(rawValue: frame.payload[2])
+                )
+            }
+    }
+}
+
+/// One acknowledgement a session sent, as a test sees it.
+struct SentAcknowledgement: Hashable, Sendable {
+    /// The packet identifier the acknowledgement answers.
+    let packetID: UInt16
+
+    /// The acknowledgement operation, or `nil` when the byte is not a known one.
+    let operation: PenTransferAcknowledgement?
 }
 
 /// An in-memory store used to prove offline import and replay behavior.

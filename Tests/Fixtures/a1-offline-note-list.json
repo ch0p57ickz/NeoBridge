@@ -1,0 +1,33 @@
+{
+  "chunks": [
+    "c0a100120002001b000003bc0200001b000003bd020000c1"
+  ],
+  "comment": "Offline note list 0xA1 reporting two requestable notes, one of them the note 700 the physical A1 capture read.",
+  "evidenceLevel": "officialSDK",
+  "expected": [
+    {
+      "commandByte": "0xA1",
+      "errorCode": 0,
+      "kind": "packet",
+      "payloadHex": "02001b000003bc0200001b000003bd020000"
+    }
+  ],
+  "fixtureVersion": 1,
+  "id": "a1-offline-note-list",
+  "provenance": {
+    "captureDate": "2026-10-18",
+    "deviceModel": "A1 (F151)",
+    "firmware": "unverified",
+    "observedProtocolVersion": "2.18",
+    "source": "Neo iOS SDK 3.0 (github.com/NeoSmartpen/iOS-SDK3.0)"
+  },
+  "sanitization": {
+    "notes": "Bluetooth address bytes are zeroed. Connection codes, serial numbers, and password material are absent. Coordinates are synthetic and do not reproduce personal handwriting.",
+    "removed": [
+      "bluetoothAddress",
+      "serialNumber",
+      "authenticationMaterial",
+      "handwritingContent"
+    ]
+  }
+}

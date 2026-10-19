@@ -1,0 +1,33 @@
+{
+  "chunks": [
+    "c0a20012001b000003bc02000002000100000010000000c1"
+  ],
+  "comment": "Offline page list 0xA2 for the captured note 700, reporting pages 1 and 16.",
+  "evidenceLevel": "officialSDK",
+  "expected": [
+    {
+      "commandByte": "0xA2",
+      "errorCode": 0,
+      "kind": "packet",
+      "payloadHex": "1b000003bc02000002000100000010000000"
+    }
+  ],
+  "fixtureVersion": 1,
+  "id": "a1-offline-page-list",
+  "provenance": {
+    "captureDate": "2026-10-18",
+    "deviceModel": "A1 (F151)",
+    "firmware": "unverified",
+    "observedProtocolVersion": "2.18",
+    "source": "Neo iOS SDK 3.0 (github.com/NeoSmartpen/iOS-SDK3.0)"
+  },
+  "sanitization": {
+    "notes": "Bluetooth address bytes are zeroed. Connection codes, serial numbers, and password material are absent. Coordinates are synthetic and do not reproduce personal handwriting.",
+    "removed": [
+      "bluetoothAddress",
+      "serialNumber",
+      "authenticationMaterial",
+      "handwritingContent"
+    ]
+  }
+}

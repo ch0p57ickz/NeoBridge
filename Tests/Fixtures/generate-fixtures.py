@@ -58,6 +58,9 @@ def hexs(data):
 # list, plus 0xA4, which the capture shows the pen accepting with an error code.
 RESPONSE_COMMANDS = {
     0x81,  # RES_VERSION_INFO
+    0xA1,  # RES1_OFFLINE_NOTE_LIST
+    0xA2,  # RES2_OFFLINE_PAGE_LIST
+    0xA3,  # RES1_OFFLINE_DATA_INFO
     0xA4,  # RES2_OFFLINE_DATA (the host's acknowledgement; no fixture frames one)
 }
 EVENT_COMMANDS = {
@@ -119,6 +122,65 @@ def version_info_payload(protocol_version="2.18"):
     payload += b"\x00"  # FSR pressure sensor
     assert len(payload) == 65, len(payload)
     return bytes(payload)
+
+
+# The version response the physical A1 sent on 2026-10-18, with the Bluetooth
+# address field zeroed. It is the payload `a1-handshake-version-2.23` carries, so
+# a fixture that opens with a handshake reports the same device facts as the
+# capture rather than a reconstruction.
+CAPTURED_VERSION_PAYLOAD_HEX = (
+    "4e57502d463135310000000000000000"
+    "332e3030000000000000000000000000"
+    "322e323300000000"
+    "4e656f736d61727470656e5f41310000"
+    "0100"
+    "000000000000"
+    "04"
+    "0000000000"
+)
+
+
+def captured_version_payload():
+    payload = bytearray()
+    payload += text16("NWP-F151")
+    payload += text16("3.00")
+    payload += text8("2.23")
+    payload += text16("Neosmartpen_A1")
+    payload += struct.pack("<H", 0x0001)
+    payload += b"\x00" * 6  # sanitized Bluetooth address
+    payload += bytes([0x04])  # FSR pressure sensor
+    payload += b"\x00" * 5  # protocol 2.22+ compression capability byte is clear
+    assert len(payload) == 70, len(payload)
+    assert payload.hex() == CAPTURED_VERSION_PAYLOAD_HEX, payload.hex()
+    return bytes(payload)
+
+
+def note_list_payload(notes):
+    """One 0xA1 note list: a count, then a section-owner id and note id per entry."""
+    body = bytearray(struct.pack("<H", len(notes)))
+    for section, owner, note in notes:
+        body += struct.pack("<I", (section << 24) | owner)
+        body += struct.pack("<I", note)
+    assert len(body) == 2 + 8 * len(notes), len(body)
+    return bytes(body)
+
+
+def page_list_payload(section, owner, note, pages):
+    """One 0xA2 page list: section-owner id, note id, count, then page ids."""
+    body = bytearray(struct.pack("<I", (section << 24) | owner))
+    body += struct.pack("<I", note)
+    body += struct.pack("<H", len(pages))
+    for page in pages:
+        body += struct.pack("<I", page)
+    assert len(body) == 10 + 4 * len(pages), len(body)
+    return bytes(body)
+
+
+def offline_info_payload(stroke_count, size, is_zip=0):
+    """One 0xA3 offline data info summary: strokes, size, compression flag."""
+    body = struct.pack("<I", stroke_count) + struct.pack("<I", size) + bytes([is_zip])
+    assert len(body) == 9, len(body)
+    return bytes(body)
 
 
 def page_payload(section, owner, book, page, event_count=0):
@@ -221,6 +283,20 @@ SANITIZATION = {
         "and password material are absent. Coordinates are synthetic and do not "
         "reproduce personal handwriting."
     ),
+}
+
+# Provenance for the fixtures whose content comes from the physical A1 capture
+# rather than from a synthetic reading of the SDK layouts.
+CAPTURE_PROVENANCE = {
+    "source": (
+        "Physical A1 capture of 2026-10-18 (docs/protocol-a1.md) for the device "
+        "facts, note identity, and summary values, re-encoded with the Neo iOS SDK "
+        "3.0 offline list and info layouts"
+    ),
+    "deviceModel": "NWP-F151",
+    "firmware": "3.00",
+    "observedProtocolVersion": "2.23",
+    "captureDate": "2026-10-18",
 }
 
 SECTION, OWNER, BOOK, PAGE = 3, 0x000ABC, 7, 12
@@ -418,6 +494,154 @@ def build():
                 "book": BOOK,
                 "page": PAGE,
             },
+        )
+    )
+
+    # Offline discovery. The note identifiers come from the physical A1 capture
+    # recorded in docs/protocol-a1.md: note 700, section 3, owner 27.
+    SESSION_SECTION, SESSION_OWNER = 3, 27
+    SESSION_NOTE, SESSION_NOTE_2 = 700, 701
+    second_note = (SESSION_SECTION, SESSION_OWNER, SESSION_NOTE_2)
+
+    note_list = note_list_payload(
+        [
+            (SESSION_SECTION, SESSION_OWNER, SESSION_NOTE),
+            second_note,
+        ]
+    )
+    fixtures.append(
+        fixture(
+            "a1-offline-note-list",
+            "Offline note list 0xA1 reporting two requestable notes, one of them the note 700 the physical A1 capture read.",
+            [hexs(frame(0xA1, note_list))],
+            [packet_outcome(0xA1, note_list)],
+        )
+    )
+
+    empty_note_list = note_list_payload([])
+    fixtures.append(
+        fixture(
+            "a1-offline-note-list-empty",
+            "Offline note list 0xA1 reporting no notes, so retrieval completes with zero counts.",
+            [hexs(frame(0xA1, empty_note_list))],
+            [packet_outcome(0xA1, empty_note_list)],
+        )
+    )
+
+    # A list whose declared count exceeds the entries it carries. The frame's own
+    # length stays consistent, so this is a list-shape failure rather than a
+    # framing one: a decoder that trusted the count would read past the payload.
+    truncated_note_list = struct.pack("<H", 2) + struct.pack("<I", (SESSION_SECTION << 24) | SESSION_OWNER) + struct.pack("<I", SESSION_NOTE)
+    assert len(truncated_note_list) == 10, len(truncated_note_list)
+    fixtures.append(
+        fixture(
+            "a1-offline-note-list-malformed",
+            "Offline note list 0xA1 whose declared count exceeds the entries it carries, so no retrieval may follow.",
+            [hexs(frame(0xA1, truncated_note_list))],
+            [packet_outcome(0xA1, truncated_note_list)],
+        )
+    )
+
+    page_list = page_list_payload(SESSION_SECTION, SESSION_OWNER, SESSION_NOTE, [1, 16])
+    fixtures.append(
+        fixture(
+            "a1-offline-page-list",
+            "Offline page list 0xA2 for the captured note 700, reporting pages 1 and 16.",
+            [hexs(frame(0xA2, page_list))],
+            [packet_outcome(0xA2, page_list)],
+        )
+    )
+
+    data_info = offline_info_payload(6918, 1309538)
+    fixtures.append(
+        fixture(
+            "a1-offline-data-info",
+            "Offline data info 0xA3 carrying the lagging stroke and size summary the physical A1 reported.",
+            [hexs(frame(0xA3, data_info))],
+            [packet_outcome(0xA3, data_info)],
+            provenance=CAPTURE_PROVENANCE,
+        )
+    )
+
+    # The whole read path in the order the physical A1 trace used: handshake, note
+    # list, page list, info, then one data packet per acknowledgement. Each packet
+    # is its own chunk so a send-responsive transport can release them one at a
+    # time. The 0xA3 summary deliberately under-reports, which is the lagging
+    # index the capture recorded: the packet stream, not the summary, is
+    # authoritative.
+    session_pages = [1, 16, 17]
+    session_transfer = [
+        offline_payload(
+            SESSION_SECTION,
+            SESSION_OWNER,
+            SESSION_NOTE,
+            [
+                offline_stroke(
+                    page,
+                    DOWN_TIME + index * 1000,
+                    DOWN_TIME + index * 1000 + 25,
+                    [
+                        dot_payload(0, 500 + index * 20, 2000 + index, 10, 900 + index, 20, offline=True),
+                        dot_payload(14, 620 + index * 20, 2001 + index, 15, 901 + index, 25, offline=True),
+                    ],
+                )
+            ],
+            packet_id=index,
+            position=position,
+        )
+        for index, (position, page) in enumerate(
+            zip([TRANSFER_START, TRANSFER_MIDDLE, TRANSFER_END], session_pages),
+            start=1,
+        )
+    ]
+    second_transfer = [
+        offline_payload(
+            SESSION_SECTION,
+            SESSION_OWNER,
+            SESSION_NOTE_2,
+            [
+                offline_stroke(
+                    2,
+                    DOWN_TIME + 5000,
+                    DOWN_TIME + 5025,
+                    [
+                        dot_payload(0, 480, 2100, 40, 910, 60, offline=True),
+                        dot_payload(18, 560, 2101, 45, 911, 65, offline=True),
+                        dot_payload(18, 640, 2102, 50, 912, 70, offline=True),
+                    ],
+                )
+            ],
+            packet_id=1,
+            position=TRANSFER_END,
+        )
+    ]
+
+    session_frames = [
+        (0x81, captured_version_payload()),
+        (0xA1, note_list),
+        (0xA2, page_list_payload(SESSION_SECTION, SESSION_OWNER, SESSION_NOTE, session_pages)),
+        (0xA3, offline_info_payload(1, 964)),  # lags the three strokes that follow
+    ] + [(0x24, payload) for payload in session_transfer] + [
+        (0xA2, page_list_payload(SESSION_SECTION, SESSION_OWNER, SESSION_NOTE_2, [2])),
+        (0xA3, offline_info_payload(1, 300)),
+    ] + [(0x24, payload) for payload in second_transfer]
+    fixtures.append(
+        fixture(
+            "a1-offline-session",
+            "The whole offline read path in trace order: the captured 2.23 handshake, a "
+            "two-note list, each note's page list and info, and one 0x24 packet per "
+            "acknowledgement, with the 0xA3 summary lagging the packet stream.",
+            [hexs(frame(command, payload)) for command, payload in session_frames],
+            [packet_outcome(command, payload) for command, payload in session_frames],
+            provenance=CAPTURE_PROVENANCE,
+            expectedProtocolVersion="2.23",
+            expectedPage={
+                "section": SESSION_SECTION,
+                "owner": SESSION_OWNER,
+                "book": SESSION_NOTE,
+                "page": session_pages[0],
+            },
+            expectedStrokeCount=4,
         )
     )
 

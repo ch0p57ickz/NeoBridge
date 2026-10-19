@@ -39,6 +39,46 @@ enum PenWire {
         }
         return UInt8(sum & 0xFF)
     }
+
+    /// Little-endian bytes of an unsigned 16-bit value.
+    static func bytes(_ value: UInt16) -> [UInt8] {
+        [UInt8(value & 0xFF), UInt8((value >> 8) & 0xFF)]
+    }
+
+    /// Little-endian bytes of an unsigned 32-bit value.
+    static func bytes(_ value: UInt32) -> [UInt8] {
+        [
+            UInt8(value & 0xFF),
+            UInt8((value >> 8) & 0xFF),
+            UInt8((value >> 16) & 0xFF),
+            UInt8((value >> 24) & 0xFF)
+        ]
+    }
+
+    /// A fixed-width NUL-padded UTF-8 field, as `toUInt8Array8`/`16` produce.
+    ///
+    /// A value longer than `width` is truncated to `width` bytes so the fixed
+    /// request layout always holds.
+    static func paddedText(_ value: String, width: Int) -> [UInt8] {
+        var bytes = Array(value.utf8.prefix(width))
+        bytes.append(contentsOf: repeatElement(0, count: width - bytes.count))
+        return bytes
+    }
+
+    /// Packs a Ncode section and owner into the identifier the requests carry.
+    ///
+    /// Source: Neo iOS SDK 3.0 `FunctionUtil.toSectionOwner`. The section is the
+    /// high byte and the owner the low 24 bits.
+    static func sectionOwnerId(section: UInt8, owner: UInt32) -> UInt32 {
+        (UInt32(section) << 24) | (owner & 0x00FF_FFFF)
+    }
+
+    /// Unpacks a section-owner identifier into its two components.
+    ///
+    /// Source: Neo iOS SDK 3.0 `FunctionUtil.toSetionOwner`.
+    static func sectionAndOwner(_ sectionOwnerId: UInt32) -> (section: UInt8, owner: UInt32) {
+        (UInt8(sectionOwnerId >> 24), sectionOwnerId & 0x00FF_FFFF)
+    }
 }
 
 /// Version information reported by the pen (`RES_VERSION_INFO`, `0x81`).

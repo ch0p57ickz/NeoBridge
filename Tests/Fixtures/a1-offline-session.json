@@ -1,0 +1,100 @@
+{
+  "chunks": [
+    "c0810046004e57502d463135310000000000000000332e3030000000000000000000000000322e3233000000004e656f736d61727470656e5f413100000100000000000000040000000000c1",
+    "c0a100120002001b000003bc0200001b000003bd020000c1",
+    "c0a20016001b000003bc0200000300010000001000000011000000c1",
+    "c0a300090001000000c403000000c1",
+    "c0244d000100003b000000001b000003bc020000010001000000e86be5cf8b010000016ce5cf8b01000000000000000200000802d10785030a145a5a000000003c0e8002d20786030f195a5a00000000cec1",
+    "c0244d000200003b000000011b000003bc020000010010000000d06fe5cf8b010000e96fe5cf8b01000000000000000200001c02d20786030a145a5a00000000520e9402d30787030f195a5a00000000e4c1",
+    "c0244d000300003b000000021b000003bc020000010011000000b873e5cf8b010000d173e5cf8b01000000000000000200003002d30787030a145a5a00000000680ea802d40788030f195a5a00000000fac1",
+    "c0a2000e001b000003bd020000010002000000c1",
+    "c0a3000900010000002c01000000c1",
+    "c0245d000100004b000000021b000003bd020000010002000000887be5cf8b010000a17be5cf8b0100000000000000030000e00134088e03283c5a5a00000000c612300235088f032d415a5a00000000351280023608900332465a5a0000000091c1"
+  ],
+  "comment": "The whole offline read path in trace order: the captured 2.23 handshake, a two-note list, each note's page list and info, and one 0x24 packet per acknowledgement, with the 0xA3 summary lagging the packet stream.",
+  "evidenceLevel": "officialSDK",
+  "expected": [
+    {
+      "commandByte": "0x81",
+      "errorCode": 0,
+      "kind": "packet",
+      "payloadHex": "4e57502d463135310000000000000000332e3030000000000000000000000000322e3233000000004e656f736d61727470656e5f413100000100000000000000040000000000"
+    },
+    {
+      "commandByte": "0xA1",
+      "errorCode": 0,
+      "kind": "packet",
+      "payloadHex": "02001b000003bc0200001b000003bd020000"
+    },
+    {
+      "commandByte": "0xA2",
+      "errorCode": 0,
+      "kind": "packet",
+      "payloadHex": "1b000003bc0200000300010000001000000011000000"
+    },
+    {
+      "commandByte": "0xA3",
+      "errorCode": 0,
+      "kind": "packet",
+      "payloadHex": "01000000c403000000"
+    },
+    {
+      "commandByte": "0x24",
+      "kind": "packet",
+      "payloadHex": "0100003b000000001b000003bc020000010001000000e86be5cf8b010000016ce5cf8b01000000000000000200000802d10785030a145a5a000000003c0e8002d20786030f195a5a00000000ce"
+    },
+    {
+      "commandByte": "0x24",
+      "kind": "packet",
+      "payloadHex": "0200003b000000011b000003bc020000010010000000d06fe5cf8b010000e96fe5cf8b01000000000000000200001c02d20786030a145a5a00000000520e9402d30787030f195a5a00000000e4"
+    },
+    {
+      "commandByte": "0x24",
+      "kind": "packet",
+      "payloadHex": "0300003b000000021b000003bc020000010011000000b873e5cf8b010000d173e5cf8b01000000000000000200003002d30787030a145a5a00000000680ea802d40788030f195a5a00000000fa"
+    },
+    {
+      "commandByte": "0xA2",
+      "errorCode": 0,
+      "kind": "packet",
+      "payloadHex": "1b000003bd020000010002000000"
+    },
+    {
+      "commandByte": "0xA3",
+      "errorCode": 0,
+      "kind": "packet",
+      "payloadHex": "010000002c01000000"
+    },
+    {
+      "commandByte": "0x24",
+      "kind": "packet",
+      "payloadHex": "0100004b000000021b000003bd020000010002000000887be5cf8b010000a17be5cf8b0100000000000000030000e00134088e03283c5a5a00000000c612300235088f032d415a5a00000000351280023608900332465a5a0000000091"
+    }
+  ],
+  "expectedPage": {
+    "book": 700,
+    "owner": 27,
+    "page": 1,
+    "section": 3
+  },
+  "expectedProtocolVersion": "2.23",
+  "expectedStrokeCount": 4,
+  "fixtureVersion": 1,
+  "id": "a1-offline-session",
+  "provenance": {
+    "captureDate": "2026-10-18",
+    "deviceModel": "NWP-F151",
+    "firmware": "3.00",
+    "observedProtocolVersion": "2.23",
+    "source": "Physical A1 capture of 2026-10-18 (docs/protocol-a1.md) for the device facts, note identity, and summary values, re-encoded with the Neo iOS SDK 3.0 offline list and info layouts"
+  },
+  "sanitization": {
+    "notes": "Bluetooth address bytes are zeroed. Connection codes, serial numbers, and password material are absent. Coordinates are synthetic and do not reproduce personal handwriting.",
+    "removed": [
+      "bluetoothAddress",
+      "serialNumber",
+      "authenticationMaterial",
+      "handwritingContent"
+    ]
+  }
+}

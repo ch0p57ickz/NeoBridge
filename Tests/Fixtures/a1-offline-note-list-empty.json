@@ -1,0 +1,33 @@
+{
+  "chunks": [
+    "c0a10002000000c1"
+  ],
+  "comment": "Offline note list 0xA1 reporting no notes, so retrieval completes with zero counts.",
+  "evidenceLevel": "officialSDK",
+  "expected": [
+    {
+      "commandByte": "0xA1",
+      "errorCode": 0,
+      "kind": "packet",
+      "payloadHex": "0000"
+    }
+  ],
+  "fixtureVersion": 1,
+  "id": "a1-offline-note-list-empty",
+  "provenance": {
+    "captureDate": "2026-10-18",
+    "deviceModel": "A1 (F151)",
+    "firmware": "unverified",
+    "observedProtocolVersion": "2.18",
+    "source": "Neo iOS SDK 3.0 (github.com/NeoSmartpen/iOS-SDK3.0)"
+  },
+  "sanitization": {
+    "notes": "Bluetooth address bytes are zeroed. Connection codes, serial numbers, and password material are absent. Coordinates are synthetic and do not reproduce personal handwriting.",
+    "removed": [
+      "bluetoothAddress",
+      "serialNumber",
+      "authenticationMaterial",
+      "handwritingContent"
+    ]
+  }
+}

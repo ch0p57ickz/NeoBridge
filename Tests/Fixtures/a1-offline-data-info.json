@@ -1,0 +1,33 @@
+{
+  "chunks": [
+    "c0a3000900061b000062fb130000c1"
+  ],
+  "comment": "Offline data info 0xA3 carrying the lagging stroke and size summary the physical A1 reported.",
+  "evidenceLevel": "officialSDK",
+  "expected": [
+    {
+      "commandByte": "0xA3",
+      "errorCode": 0,
+      "kind": "packet",
+      "payloadHex": "061b000062fb130000"
+    }
+  ],
+  "fixtureVersion": 1,
+  "id": "a1-offline-data-info",
+  "provenance": {
+    "captureDate": "2026-10-18",
+    "deviceModel": "NWP-F151",
+    "firmware": "3.00",
+    "observedProtocolVersion": "2.23",
+    "source": "Physical A1 capture of 2026-10-18 (docs/protocol-a1.md) for the device facts, note identity, and summary values, re-encoded with the Neo iOS SDK 3.0 offline list and info layouts"
+  },
+  "sanitization": {
+    "notes": "Bluetooth address bytes are zeroed. Connection codes, serial numbers, and password material are absent. Coordinates are synthetic and do not reproduce personal handwriting.",
+    "removed": [
+      "bluetoothAddress",
+      "serialNumber",
+      "authenticationMaterial",
+      "handwritingContent"
+    ]
+  }
+}

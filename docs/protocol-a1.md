@@ -91,6 +91,35 @@ report compression support.
 The full command table is in `NISDK3/Classes/Model/CMD.swift` and is mirrored by
 `PenCommand` in `Packages/NeoProtocol`.
 
+### Offline discovery and list layouts
+
+The offline read path starts with a list request whose layout needs a starting
+`sectionOwnerId`. The capture summary does not record the value the spike harness
+supplied, so the official SDK settles it: `REQ.OfflineNoteList` initializes
+`sectionOwnerId` to `0xffffffff` and never changes it, so the SDK asks for every
+note rather than for one section and owner. `0x21` therefore has a documented
+wildcard, and no identifier has to be guessed.
+
+`FunctionUtil.toSectionOwner` packs the pair as `(UInt32(section) << 24) | owner`,
+with the owner in the low 24 bits. `toSetionOwner` is the inverse.
+
+| Frame | Payload |
+| --- | --- |
+| `0x21` request | `sectionOwnerId` (4), `0xffffffff` for every note |
+| `0xA1` response | count (2), then per note: `sectionOwnerId` (4), note id (4) |
+| `0x22` request | `sectionOwnerId` (4), note id (4) |
+| `0xA2` response | `sectionOwnerId` (4), note id (4), page count (2), page ids (4 each) |
+| `0xA3` response | stroke count (4), uncompressed size (4), compression flag (1) |
+
+Source: Neo iOS SDK 3.0 `RequestStruct.swift` (`REQ.OfflineNoteList`,
+`REQ.OfflinePageList`, `REQ.OfflineData`), `ResponseStruct.swift`
+(`OfflineNoteList`, `OfflinePageList`, `OfflineInfo`), and `FunctionUtil.swift`.
+
+The SDK reads these lists without bounds checks. NeoBridge validates the declared
+count against the payload first and reports a short list as malformed, because a
+partially decoded list would silently hide notes: retrieval stops before `0x23`
+rather than continuing with a subset.
+
 ### Page identity
 
 `PageInfo` (`0x64`, `0x6B`) carries owner (24 bits), section (1 byte), book
@@ -191,9 +220,52 @@ sensitive fields removed and stays git-ignored.
 | Pen cleanup mode | `keepOnPen` (enforced by `PenCleanupPolicy.deletionEnabled == false`) |
 | Evidence reviewed by | Jimmy, 2026-10-18 |
 
+## Pen session flow
+
+`Packages/NeoProtocol/Sources/NeoProtocol/PenSession.swift` drives the sequence.
+It exchanges bytes only through `PenTransport`, so the same flow runs against
+`FakePenTransport` on Linux and against the app's `CoreBluetoothPenTransport`.
+The documented order below is the order the session sends and reads, and
+`PenSessionTests` asserts each step against the sanitized fixtures.
+
+1. Send `0x01` with the SDK default connection code: sixteen zero bytes, app type
+   `0x1211`, the application version, and declared protocol `2.18`. Read `0x81`.
+   - A non-zero error code means the pen refused the default code. The session
+     reports the pen as protected or unsupported and stops. It never tries
+     another code.
+   - Otherwise compare the reported protocol version against
+     `ProtocolVersionPolicy`. An unvalidated minor stops the session before any
+     offline request.
+2. Send `0x21` with the documented `0xffffffff` wildcard. Read `0xA1` and decode
+   the note list.
+   - A malformed list stops the session before `0x23`.
+   - An empty list completes the session with zero counts, and no `0x23`.
+3. For each discovered note, in the order the pen returned them:
+   1. Send `0x22` with the discovered `sectionOwnerId` and note id. Read `0xA2`
+      and decode the page list.
+   2. Send `0x23` with `transOption` next-and-reserve, `zipOption` none, the
+      discovered identifiers, and a page count of zero, as in the trace.
+   3. Read `0xA3` and keep the summary for diagnostics only.
+   4. Read `0x24` packets, one per acknowledgement. Assemble them with a fresh
+      `OfflineTransferAssembler` per note, and after each accepted packet send
+      `0xA4` with that packet's identifier: Continue for every packet, Stop for
+      the end-position packet.
+      - A packet gap, a malformed packet, a non-zero response error, or an
+        unsupported compressed payload fails the session.
+      - A stream that ends before the end-position packet is an incomplete
+        transfer, even when it ends normally.
+4. Report stroke and dot counts from the accepted `0x24` packets and distinct
+   pages from their canonical page identities. The `0xA3` summary is never the
+   final result; see the lagging-index note above.
+
+Every wait is bounded. Cancellation, timeout, interruption, and failure close the
+transport, and a retry starts a new session with fresh framing and assembly
+state. The session sends no `0x25` or `0x27` command, and the evidence table
+classifies neither, so neither can even be encoded.
+
 ## Fixture coverage today
 
-`Tests/Fixtures` holds eight sanitized fixtures with recorded provenance,
+`Tests/Fixtures` holds fourteen sanitized fixtures with recorded provenance,
 sanitization, device model, observed protocol version, and expected output:
 
 | Fixture | Covers |
@@ -206,13 +278,23 @@ sanitization, device model, observed protocol version, and expected output:
 | `a1-truncated-frame` | truncated frame and recovery |
 | `a1-size-limit-recovery` | payload and buffer limits and recovery |
 | `a1-escaped-page-identity` | byte-stuffing round trip |
+| `a1-offline-note-list` | an `0xA1` note list reporting the captured note 700 and a second note |
+| `a1-offline-note-list-empty` | an `0xA1` list with no notes |
+| `a1-offline-note-list-malformed` | an `0xA1` list whose count exceeds its entries |
+| `a1-offline-page-list` | an `0xA2` page list for the captured note |
+| `a1-offline-data-info` | the `0xA3` summary the physical A1 reported |
+| `a1-offline-session` | the whole read path in trace order for two notes, with a lagging `0xA3` |
 
-Seven of these are synthetic reconstructions of the documented wire layout, built by
-`Tests/Fixtures/generate-fixtures.py`. The eighth, `a1-handshake-version-2.23`, is
-derived from the recorded handshake above, with the Bluetooth address field zeroed; it
-carries no serial number and no stroke content. The full capture is not committed,
-because its stroke coordinates are the user's own handwriting. Raw captures belong in
-`Tests/Fixtures/raw/`, which is git-ignored.
+Twelve of these are synthetic reconstructions of the documented wire layout, built by
+`Tests/Fixtures/generate-fixtures.py`, which implements the wire format independently
+of the Swift codec so the tests cross-check the implementation instead of restating it.
+The remaining two, `a1-handshake-version-2.23` and `a1-offline-session`, open with the
+version response derived from the recorded handshake above, with the Bluetooth address
+field zeroed; the session fixture also carries the captured note identity and the
+captured summary values. Neither carries a serial number, and no fixture carries stroke
+content from the pen. The full capture is not committed, because its stroke coordinates
+are the user's own handwriting. Raw captures belong in `Tests/Fixtures/raw/`, which is
+git-ignored.
 
 ## Gate
 
@@ -224,6 +306,79 @@ UI implementation may begin only when:
 - and the evidence has been reviewed — **done**, by the pen owner on 2026-10-18.
 
 All four conditions hold, so the gate is open and UI implementation may begin.
+
+## App acceptance run (2026-10-19)
+
+The macOS app's connect-and-sync path was run against a physical A1 from the built
+bundle, using the headless mode described in `Tests/Hardware/README.md`. The same
+binary, adapter, transport, runner, and portable session performed each read; only
+the user interface was skipped. Fourteen reads completed, including four consecutive
+reads of the same note, three more after the fixes below landed, and two with the pen
+switched off and on again while a scan was already running.
+
+| Field | Value |
+| --- | --- |
+| Date | 2026-10-19 |
+| Host | Jamess-MacBook-Pro-M4.local |
+| macOS version | 27.2 (26B5112a) |
+| Xcode version | 27.1 (27A9275) |
+| Pen model | `NWP-F151` |
+| Pen firmware | `3.00` |
+| Reported protocol version | `2.23` |
+| App build | `Scripts/remote-mac-build.sh`, release configuration |
+
+### Result
+
+| Check | Result |
+| --- | --- |
+| Handshake and version gate | Yes. `0x01` with the SDK's default connection code drew an `0x81` response carrying `2.23`, `NWP-F151`, firmware `3.00`, and error code zero |
+| Discovery and retrieval | Yes. The command order was `0x01`, `0x21` (wildcard `0xffffffff`), `0x22`, `0x23` with `pageCnt` zero, then one `0xA4` per `0x24` |
+| Decoded page matches the page written on | Yes. Note 700, section 3, owner 27, with 19 pages (1 and 16-33) |
+| Point sequence matches the known mark | Yes. Page 1's first 15 strokes carry 152 dots bounded by x 1468..3949 and y 698..892, which is the mark recorded above; the first 13 of them span 2.6 seconds of pen-origin time |
+| Decoded transfer | 608 packets, 6,953 strokes, 70,709 dots in one transfer. The note is still in use, so later reads in the same run carried slightly more (6,974 strokes) and the totals no longer match the 6,920 / 70,199 recorded on 2026-10-18 |
+| Every decoded dot passes the pen's own checksum | Yes, no checksum or framing error over 3,053 notification chunks and 1,335,753 inbound bytes |
+| Acknowledgement pacing | Yes. 608 `0xA4` frames, one per `0x24` packet, operation `1` (Continue) through packet 607 and `0` (Stop) on packet 608 |
+| No deletion request sent | Yes. The outbound command list of every run contains only `0x01`, `0x21`, `0x22`, `0x23`, and `0xA4` |
+| Pen cleanup mode | `keepOnPen` (enforced by `PenCleanupPolicy.deletionEnabled == false`) |
+| Link released after a read | Yes. Every completed read logged a Disconnected state, and each of four consecutive reads found the pen advertising again |
+
+The run's totals exceed the 6,920 strokes and 70,199 dots recorded on 2026-10-18
+because the note has been written to since. The mark itself is unchanged: it is
+checked stroke by stroke, not by a total.
+
+Three consecutive reads on the fixed build confirmed the fixes: each logged
+Disconnected and each found the pen advertising again. One attempt immediately after
+the pen was switched on found nothing, because the pen had not begun advertising
+yet; a later attempt in the same minute succeeded.
+
+Three defects were found only by this run and are fixed:
+
+- the scan window was two seconds, and the pen's first advertisement after a scan
+  started arrived as late as 2.5 seconds, so roughly half of all reads reported
+  that no pen was found while the pen was in range;
+- a completed read left the pen connected. A connected pen stops advertising, so
+  the app's own next read could not find it, and the pen stayed unavailable to
+  its other owners;
+- a read started right after the pen was switched on reported that no pen was
+  found, because the pen had not begun advertising yet. The wait-when-nothing-is-seen
+  window is now thirty seconds, and a matched pen still settles the scan after one
+  second.
+
+The third defect was measured afterwards, with the pen confirmed off by an on-screen
+prompt and switched on again while a read's scan was already running. An independent
+Bluetooth scanner saw no advertisement for the first 6.3 seconds of its own scan and
+then saw the pen, so the pen really was silent when the app started scanning; the read
+completed with 646 outbound frames, 7,344 strokes, and 74,659 dots, and its outbound
+command list contains only `0x01`, `0x21`, `0x22`, `0x23`, and `0xA4`. The pen became
+visible about three seconds into the read's scan, which the previous six-second window
+would have covered. The switch-on delay is therefore not consistent: it exceeded six
+seconds on the first occasion and was about three seconds here. The thirty-second
+window covers the slower case, and neither observation shows the pen to be present
+when the window has elapsed.
+
+The rows this run could not reach — a second pen, a Bluetooth toggle, a denied
+permission prompt, a mid-transfer interruption, and the user interface — are
+recorded as unverified in `Tests/Hardware/README.md`.
 
 The evidence still requires codec corrections, which are tracked separately in
 `openspec/changes/correct-a1-codec-from-hardware-evidence/`:
