@@ -2,7 +2,8 @@
 
 This record captures the Linux verification required by
 `openspec/changes/initialize-portable-neocore-neoprotocol-packages/tasks.md`
-tasks 1.1, 1.2, and 4.2.
+tasks 1.1, 1.2, and 4.2, and by
+`openspec/changes/correct-a1-codec-from-hardware-evidence/tasks.md` task 3.5.
 
 ## Command
 
@@ -38,12 +39,56 @@ ok: NeoProtocol imports no Apple-only framework
 -- swift test (NeoCore)
      Executed 31 tests, with 0 failures (0 unexpected)
 -- swift test (NeoProtocol)
-     Executed 67 tests, with 0 failures (0 unexpected)
+     Executed 100 tests, with 0 failures (0 unexpected)
 == Result
 PASSED: portable packages build with pinned dependencies, import no Apple-only framework, and pass their tests.
 ```
 
-Recorded on 2026-10-19 (UTC).
+Recorded on 2026-10-19 (UTC), 2026-10-18 (PDT).
+
+### Suite counts
+
+NeoCore, 31 tests:
+
+| Suite | Tests |
+| --- | --- |
+| `PageIdentityTests` | 4 |
+| `PenDomainInterfaceTests` | 7 |
+| `StrokeAssemblerTests` | 10 |
+| `StrokeIdentityTests` | 10 |
+
+NeoProtocol, 100 tests:
+
+| Suite | Tests |
+| --- | --- |
+| `CommandEvidenceTests` | 6 |
+| `CommandFrameKindTests` | 5 |
+| `FailedResponseTests` | 4 |
+| `FixtureReplayTests` | 17 |
+| `OfflineIntegrationTests` | 13 |
+| `PenEventDecoderTests` | 14 |
+| `PenFrameDecoderTests` | 28 |
+| `PenVersionInfoTests` | 6 |
+| `ProtocolVersionTests` | 7 |
+
+The codec change `correct-a1-codec-from-hardware-evidence` took NeoProtocol from
+67 tests to 100, covering response framing, the failed-response path, the version
+payload layout, and the capture-derived handshake fixture.
+
+## Fixture sanitization
+
+Verified when the capture-derived handshake fixture landed:
+
+- `Tests/Fixtures/raw/` is git-ignored (`.gitignore` line 64) and no raw capture
+  is tracked, so the unsanitized log stays out of the repository.
+- The handshake fixture zeroes the version response's Bluetooth address field.
+  `FixtureReplayTests.testNoFixtureCarriesADeviceAddressInAVersionPayload` reads
+  that field's content for every version response, both as each fixture declares it
+  and as its wire bytes decode, so it holds independently of the sanitization
+  metadata.
+- The advertised device address, the device serial, and any password material are
+  absent from the fixture files, and no fixture carries stroke content from the
+  pen. The request's connection code is the SDK default of sixteen zero bytes.
 
 ## What the script checks
 

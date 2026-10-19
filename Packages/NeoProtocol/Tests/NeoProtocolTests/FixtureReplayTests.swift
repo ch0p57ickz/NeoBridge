@@ -16,7 +16,11 @@ final class FixtureReplayTests: XCTestCase {
         let fixtures = try FixtureSupport.all()
         XCTAssertGreaterThanOrEqual(fixtures.count, 6)
         XCTAssertEqual(Set(fixtures.map(\.id)).count, fixtures.count, "fixture identifiers must be unique")
-        XCTAssertEqual(Set(fixtures.map(\.evidenceLevel)), [.officialSDK])
+        XCTAssertEqual(
+            Set(fixtures.map(\.evidenceLevel)),
+            [.officialSDK, .physicalDevice],
+            "the set holds SDK-derived fixtures and the capture-derived handshake"
+        )
     }
 
     func testFixtureReplayMatchesExpectedOutcomes() throws {
@@ -30,6 +34,11 @@ final class FixtureReplayTests: XCTestCase {
                 case (.frame(let frame), "packet"):
                     let expectedByte = try XCTUnwrap(expected.byte, "\(fixture.id): command byte")
                     XCTAssertEqual(frame.commandByte, expectedByte, "\(fixture.id): command byte")
+                    XCTAssertEqual(
+                        frame.errorCode.map(Int.init),
+                        expected.errorCode,
+                        "\(fixture.id): error code"
+                    )
                     XCTAssertEqual(
                         HexCoding.encode(frame.payload),
                         expected.payloadHex,
@@ -118,6 +127,81 @@ final class FixtureReplayTests: XCTestCase {
         XCTAssertEqual(PenWire.text(payload[32..<40]), "2.18")
     }
 
+    func testHandshakeFixtureMatchesTheCapturedDeviceFacts() throws {
+        let fixture = try FixtureSupport.fixture("a1-handshake-version-2.23", in: FixtureSupport.all())
+        XCTAssertEqual(fixture.evidenceLevel, .physicalDevice)
+
+        // The exchange decodes to the device facts `docs/protocol-a1.md` records,
+        // so the fixture is anchored to the real pen rather than to a
+        // reconstruction of what the pen should send.
+        let frames = try FixtureSupport.frames(fixture)
+        XCTAssertEqual(frames.map(\.command), [.versionInfo, .responseVersionInfo])
+        XCTAssertEqual(frames.map(\.errorCode), [nil, 0])
+
+        let responsePayload = try XCTUnwrap(frames.last?.payload)
+        let info = try XCTUnwrap(PenVersionInfo(payload: responsePayload))
+        XCTAssertEqual(info.deviceName, "NWP-F151")
+        XCTAssertEqual(info.firmwareVersion, "3.00")
+        XCTAssertEqual(info.protocolVersionText, "2.23")
+        XCTAssertEqual(info.protocolVersion, ProtocolVersion(major: 2, minor: 23))
+        XCTAssertEqual(info.subName, "Neosmartpen_A1")
+        XCTAssertEqual(info.deviceType, 0x0001)
+        XCTAssertEqual(info.pressureSensorType, 0x04)
+        XCTAssertFalse(info.supportsCompressedTransfer)
+
+        // The request matches the SDK's version request layout: the connection
+        // code is sixteen zero bytes and the declared protocol is 2.18. The
+        // capture was driven by a BLE spike harness rather than by the SDK, so
+        // this pins the layout, not the sender.
+        let requestPayload = try XCTUnwrap(frames.first?.payload)
+        XCTAssertEqual(requestPayload.count, 42)
+        XCTAssertEqual(Array(requestPayload[0..<16]), [UInt8](repeating: 0, count: 16))
+        XCTAssertEqual(PenWire.text(requestPayload[32..<40]), "2.18")
+    }
+
+    func testNoFixtureCarriesADeviceAddressInAVersionPayload() throws {
+        // A content check rather than a metadata check. Every version response is
+        // checked twice: once as the fixture declares it, and once as the wire
+        // bytes decode, so a version frame present in `chunks` but not declared
+        // as a packet expectation cannot slip past.
+        var declared = 0
+        var decoded = 0
+
+        for fixture in try FixtureSupport.all() {
+            for packet in try fixture.decodedExpectedPackets()
+            where PenCommand(rawValue: packet.commandByte) == .responseVersionInfo {
+                assertAddressFieldIsZeroed(packet.payload, in: fixture, what: "declared packet")
+                declared += 1
+            }
+
+            for frame in try FixtureSupport.frames(fixture)
+            where frame.command == .responseVersionInfo {
+                assertAddressFieldIsZeroed(frame.payload, in: fixture, what: "decoded frame")
+                decoded += 1
+            }
+        }
+
+        XCTAssertGreaterThan(declared, 0, "expected at least one declared version payload")
+        XCTAssertGreaterThan(decoded, 0, "expected at least one decoded version payload")
+    }
+
+    /// Asserts that a version payload's Bluetooth address field is zeroed.
+    private func assertAddressFieldIsZeroed(
+        _ payload: [UInt8],
+        in fixture: ProtocolFixture,
+        what: String
+    ) {
+        guard payload.count >= 64 else {
+            XCTFail("\(fixture.id): the \(what) is too short to reach the address field")
+            return
+        }
+        XCTAssertEqual(
+            Array(payload[58..<64]),
+            [0, 0, 0, 0, 0, 0],
+            "\(fixture.id): the \(what)'s Bluetooth address field must be zeroed"
+        )
+    }
+
     func testFixtureFilesContainNoSerialLikeFields() throws {
         let contents = try FileManager.default.contentsOfDirectory(
             at: FixtureSupport.directory,
@@ -164,6 +248,39 @@ final class FixtureReplayTests: XCTestCase {
             XCTAssertEqual(eventCount, 0, "\(fixture.id): malformed input must not invent pen events")
             XCTAssertEqual(try FixtureSupport.strokes(fixture).count, 0, "\(fixture.id): no strokes")
         }
+    }
+
+    func testFixturesCoverBothFrameKinds() throws {
+        var responsePackets = 0
+        var eventPackets = 0
+
+        for fixture in try FixtureSupport.all() {
+            for expected in fixture.expected where expected.kind == "packet" {
+                let byte = try XCTUnwrap(expected.byte, "\(fixture.id): command byte")
+                let command = try XCTUnwrap(PenCommand(rawValue: byte), "\(fixture.id): known command")
+                let kind = try XCTUnwrap(command.frameKind, "\(fixture.id): classified command")
+
+                // The fixture's own declaration must agree with the
+                // classification the decoder uses. Comparing the declared error
+                // code against the Swift table, rather than against a decoded
+                // frame, is what makes this a cross-check: it would catch the
+                // generator's framing table disagreeing with the decoder's.
+                XCTAssertEqual(
+                    expected.errorCode != nil,
+                    kind == .response,
+                    "\(fixture.id): \(command) declares the wrong body layout"
+                )
+
+                if kind == .response {
+                    responsePackets += 1
+                } else {
+                    eventPackets += 1
+                }
+            }
+        }
+
+        XCTAssertGreaterThan(responsePackets, 0, "at least one fixture must declare a response frame")
+        XCTAssertGreaterThan(eventPackets, 0, "at least one fixture must declare an event frame")
     }
 
     func testRealtimeFixtureAssemblesOneStrokeWithStableFingerprint() throws {

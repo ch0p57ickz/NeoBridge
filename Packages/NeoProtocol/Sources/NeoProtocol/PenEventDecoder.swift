@@ -26,6 +26,15 @@ public enum PenDecodeOutcome: Hashable, Sendable {
 /// commands can emit events, so a provisional mapping can never produce a
 /// completed domain stroke.
 ///
+/// A response that reports a non-zero error code fails before any of that, so a
+/// command the pen rejected never emits an event.
+///
+/// The checks run in a fixed order: an unknown identifier, then a response that
+/// reports a non-zero error code, then the version gate, then the evidence
+/// boundary. A failed response is therefore reported as `commandFailed` even
+/// when the session version is unsupported or the command is blocked, because
+/// the frame's own error code is what makes its payload untrustworthy.
+///
 /// A dot can only become an event once the pen has reported a page. Until then
 /// the frame is ignored rather than attributed to a fabricated page.
 public struct PenEventDecoder: Sendable {
@@ -63,6 +72,13 @@ public struct PenEventDecoder: Sendable {
     public mutating func decode(_ frame: PenFrame) -> PenDecodeOutcome {
         guard let command = frame.command else {
             return .error(.unknownCommand(byte: frame.commandByte))
+        }
+
+        if let code = frame.errorCode, code != 0 {
+            // The pen rejected the command this frame answers, so the payload is
+            // not data. The framing layer kept the bytes for diagnostics; the
+            // failure is reported here so no event is emitted for the frame.
+            return .error(.commandFailed(command: command, code: code))
         }
 
         if case .unsupported(let version) = versionSupport {

@@ -29,12 +29,12 @@ host-side acknowledgement `0xA4` (`RES2_OFFLINE_DATA`) is a response and carries
 #### Scenario: Failed response
 
 - **WHEN** a response frame carries a non-zero error code
-- **THEN** the decoder reports an explicit failure for that command and produces no packet payload
+- **THEN** the layer that turns frames into device tokens reports an explicit failure for that command and produces no events for that frame, while the framing layer still reports the packet with its error code so the failed exchange stays diagnosable
 
 #### Scenario: Unknown command
 
 - **WHEN** a frame carries a command identifier that the evidence table does not classify as a response or an event
-- **THEN** the decoder reports it as unsupported rather than guessing a body layout
+- **THEN** the decoder reports an unknown-command error rather than guessing a body layout
 
 ### Requirement: Pen-reported compression capability
 

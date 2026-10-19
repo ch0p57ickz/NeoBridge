@@ -31,8 +31,21 @@ def stuff(body):
     return bytes(out)
 
 
-def frame(command, payload):
-    body = [command] + list(struct.pack("<H", len(payload))) + list(payload)
+def frame(command, payload, kind=None, error_code=0):
+    """One byte-stuffed frame.
+
+    `kind` defaults to the framing recorded for the command, so a fixture cannot
+    silently use the wrong body layout. A response body is
+    `command, error code, length, payload`; every other body is
+    `command, length, payload`.
+    """
+    if kind is None:
+        kind = frame_kind(command)
+    body = [command]
+    if kind == "response":
+        body.append(error_code)
+    body += list(struct.pack("<H", len(payload)))
+    body += list(payload)
     return stuff(body)
 
 
@@ -40,12 +53,45 @@ def hexs(data):
     return data.hex()
 
 
-def packet_outcome(command, payload):
-    return {
+# The framing recorded for each command this generator uses, from the same
+# evidence the Swift classification records: the SDK's parsePenDataPacket case
+# list, plus 0xA4, which the capture shows the pen accepting with an error code.
+RESPONSE_COMMANDS = {
+    0x81,  # RES_VERSION_INFO
+    0xA4,  # RES2_OFFLINE_DATA (the host's acknowledgement; no fixture frames one)
+}
+EVENT_COMMANDS = {
+    0x24,  # REQ2_OFFLINE_DATA (the pen's data stream)
+    0x63,  # EVENT_PEN_UPDOWN
+    0x6B,  # EVENT_NEW_PEN_NEWID
+    0x6C,  # EVENT_NEW_PEN_DOT
+}
+
+
+def frame_kind(command):
+    """The framing recorded for a command."""
+    if command in RESPONSE_COMMANDS:
+        return "response"
+    assert command in EVENT_COMMANDS, "unclassified command 0x%02X" % command
+    return "event"
+
+
+def packet_outcome(command, payload, kind=None, error_code=0):
+    """An expected packet.
+
+    A response packet declares the error code the pen reported; an event packet
+    omits it, because an event body has no error-code position.
+    """
+    if kind is None:
+        kind = frame_kind(command)
+    outcome = {
         "kind": "packet",
         "commandByte": "0x%02X" % command,
         "payloadHex": hexs(bytes(payload)),
     }
+    if kind == "response":
+        outcome["errorCode"] = error_code
+    return outcome
 
 
 def error_outcome(kind):
@@ -251,11 +297,14 @@ def build():
         packet_id=1,
         position=TRANSFER_END,
     )
-    offline_frames = [(0x81, version_payload), (0xA4, offline)]
+    # A single-packet transfer in the shape the pen sends: the data rides on
+    # REQ2_OFFLINE_DATA (0x24). 0xA4 is the host's acknowledgement, never an
+    # inbound data frame.
+    offline_frames = [(0x81, version_payload), (0x24, offline)]
     fixtures.append(
         fixture(
             "a1-offline-stroke",
-            "Offline data packet 0xA4 carrying one stroke with three checksummed dots.",
+            "Offline data packet 0x24 carrying one stroke with three checksummed dots.",
             [hexs(frame(command, payload)) for command, payload in offline_frames],
             [packet_outcome(command, payload) for command, payload in offline_frames],
             expectedProtocolVersion="2.18",
@@ -329,11 +378,13 @@ def build():
         )
     )
 
-    oversized = stuff([0x81] + list(struct.pack("<H", 0x9000)) + [0, 0, 0, 0])
-    # The valid version frame below is 68 buffered bytes (1 command + 2 length +
-    # 65 payload), so the limit is set to that and the overflowing frame carries
-    # one more byte than the limit.
-    overflowing = stuff([0x81] + list(struct.pack("<H", 200)) + [0] * 70)
+    # A response body carries an error code between the command and the length,
+    # so these hand-built frames place one there too.
+    oversized = stuff([0x81, 0x00] + list(struct.pack("<H", 0x9000)) + [0, 0, 0, 0])
+    # The valid version frame below is 69 buffered bytes (1 command + 1 error code
+    # + 2 length + 65 payload), so the limit is set to that and the overflowing
+    # frame carries more bytes than the limit.
+    overflowing = stuff([0x81, 0x00] + list(struct.pack("<H", 200)) + [0] * 70)
     fixtures.append(
         fixture(
             "a1-size-limit-recovery",
@@ -347,7 +398,7 @@ def build():
                 error_outcome("bufferedInputExceedsLimit"),
                 packet_outcome(0x81, version_payload),
             ],
-            limits={"maxPayloadBytes": 32000, "maxBufferedBytes": 68},
+            limits={"maxPayloadBytes": 32000, "maxBufferedBytes": 69},
             expectedProtocolVersion="2.18",
         )
     )

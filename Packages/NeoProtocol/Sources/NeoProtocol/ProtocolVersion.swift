@@ -82,21 +82,35 @@ public enum ProtocolVersionSupport: Hashable, Sendable {
 ///
 /// The A1-capable SDKs use the Neo pen protocol 2.x family. A minor version is
 /// supported only when evidence names it: either official SDK wire evidence or a
-/// physical A1 capture recorded in `docs/protocol-a1.md`. The default evidence is
-/// the protocol version the official Neo iOS SDK 3.0 declares in its
-/// `VERSION_INFO` request (`"2.18"`). The A1's own reported version must be
-/// recorded in the M0 spike and added here once it is captured.
+/// physical A1 capture recorded in `docs/protocol-a1.md`.
 public struct ProtocolVersionPolicy: Hashable, Sendable {
     /// The protocol family this package targets.
     public static let familyMajor = 2
 
-    /// The default policy, backed by the Neo iOS SDK 3.0 declaration of `2.18`.
+    /// The default policy.
+    ///
+    /// The name follows the package's other `neoSDK3` defaults, which build on the
+    /// Neo iOS SDK 3.0 command table. This policy also carries the minor a
+    /// physical A1 reported, so it is not purely SDK-derived.
     public static let neoSDK3 = ProtocolVersionPolicy()
 
     /// Minor versions with wire evidence.
+    ///
+    /// Provenance, one line per minor:
+    ///
+    /// - `18`: the protocol version the official Neo iOS SDK 3.0 declares in its
+    ///   `VERSION_INFO` request. That is a host-declared value rather than one a
+    ///   pen reported, so it records what the SDK's wire format covers.
+    /// - `23`: the protocol version a physical A1 reported in its version
+    ///   response on 2026-10-18 (model `NWP-F151`, firmware `3.00`), recorded in
+    ///   `docs/protocol-a1.md` and carried by the `a1-handshake-version-2.23`
+    ///   fixture.
+    ///
+    /// A minor above the highest entry is not supported by being newer: a version
+    /// is supported only when the evidence names it.
     public let validatedMinors: Set<Int>
 
-    public init(validatedMinors: Set<Int> = [18]) {
+    public init(validatedMinors: Set<Int> = [18, 23]) {
         self.validatedMinors = validatedMinors
     }
 

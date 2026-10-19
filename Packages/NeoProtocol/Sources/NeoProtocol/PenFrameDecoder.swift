@@ -1,9 +1,11 @@
 /// The framing limits applied by `PenFrameDecoder`.
 ///
 /// The 16-bit length field caps a frame's payload at 65,535 bytes, so the largest
-/// well-formed frame body the decoder can buffer is `3 + 65,535 = 65,538` bytes.
-/// The decoder undoes byte stuffing as bytes arrive, so a frame's length on the
-/// wire does not count against `maxBufferedBytes`.
+/// well-formed frame body the decoder can buffer is `4 + 65,535 = 65,539` bytes.
+/// A response header is one byte longer than an event header, because it carries
+/// an error code between the command and the length. The decoder undoes byte
+/// stuffing as bytes arrive, so a frame's length on the wire does not count
+/// against `maxBufferedBytes`.
 ///
 /// The default `maxBufferedBytes` of 131,072 leaves headroom above the largest
 /// legal body, so with the default limits only a frame whose body outgrows what
@@ -38,10 +40,15 @@ public struct FrameLimits: Hashable, Sendable {
 
 /// Decodes the A1's byte-stuffed framing into packets.
 ///
-/// Framing evidence: Neo iOS SDK 3.0 `Global.swift` and `FunctionUtil.swift`.
-/// A frame starts with `0xC0`, ends with `0xC1`, and escapes a literal `0xC0`,
-/// `0xC1`, or `0x7D` as `0x7D` followed by the byte XOR `0x20`. The frame body is
-/// `command (1 byte) | length (UInt16 little-endian) | payload (length bytes)`.
+/// Framing evidence: Neo iOS SDK 3.0 `Global.swift`, `FunctionUtil.swift`, and
+/// `PenCommParser.parsePenDataPacket`. A frame starts with `0xC0`, ends with
+/// `0xC1`, and escapes a literal `0xC0`, `0xC1`, or `0x7D` as `0x7D` followed by
+/// the byte XOR `0x20`. The frame body is `command (1 byte) | optional error code
+/// (1 byte) | length (UInt16 little-endian) | payload (length bytes)`. A response
+/// carries the error code; an event, a request, and the pen's offline data stream
+/// do not. Which layout an identifier uses is a property of the identifier, taken
+/// from `PenCommand.frameKind`, so a command the evidence does not classify is
+/// rejected rather than parsed with a guessed layout.
 ///
 /// The decoder is a value type that keeps only framing state, so it can be
 /// copied or stored freely. After any error it discards the frame in progress
@@ -115,18 +122,36 @@ public struct PenFrameDecoder: Sendable {
     private mutating func decodeFrame() -> PenFrameDecodeOutcome {
         defer { buffer.removeAll(keepingCapacity: true) }
 
-        guard buffer.count >= 3 else {
+        guard let commandByte = buffer.first else {
+            return .error(.packetTooShortForHeader(byteCount: 0))
+        }
+        guard let command = PenCommand(rawValue: commandByte), let kind = command.frameKind else {
+            // The body layout is a property of the identifier, so an identifier
+            // with no classification leaves no way to find the length field.
+            return .error(.unknownCommand(byte: commandByte))
+        }
+
+        let headerByteCount = kind == .response ? 4 : 3
+        guard buffer.count >= headerByteCount else {
             return .error(.packetTooShortForHeader(byteCount: buffer.count))
         }
 
-        let commandByte = buffer[0]
-        let declared = Int(buffer[1]) | Int(buffer[2]) << 8
+        let errorCode: UInt8?
+        let declared: Int
+        switch kind {
+        case .response:
+            errorCode = buffer[1]
+            declared = Int(buffer[2]) | Int(buffer[3]) << 8
+        case .event:
+            errorCode = nil
+            declared = Int(buffer[1]) | Int(buffer[2]) << 8
+        }
 
         guard declared <= limits.maxPayloadBytes else {
             return .error(.payloadExceedsLimit(declared: declared, limit: limits.maxPayloadBytes))
         }
 
-        let available = buffer.count - 3
+        let available = buffer.count - headerByteCount
         guard available >= declared else {
             return .error(.truncatedPacket(declared: declared, available: available))
         }
@@ -137,8 +162,9 @@ public struct PenFrameDecoder: Sendable {
         return .frame(
             PenFrame(
                 commandByte: commandByte,
-                command: PenCommand(rawValue: commandByte),
-                payload: Array(buffer[3...])
+                command: command,
+                errorCode: errorCode,
+                payload: Array(buffer[headerByteCount...])
             )
         )
     }
@@ -161,14 +187,50 @@ public enum PenFraming {
 /// The encoder mirrors `makeWholePacket` in Neo iOS SDK 3.0 and exists so tests
 /// and fixture builders can produce the exact bytes a pen sends.
 public enum PenFrameEncoder {
-    /// Encodes one packet as a complete, byte-stuffed frame.
+    /// Encodes one packet using the framing its identifier implies.
     ///
     /// - Parameters:
     ///   - command: The command identifier.
     ///   - payload: The payload bytes.
+    ///   - errorCode: The error code to report for a response frame. An event
+    ///     frame has no error-code position, so the value is ignored.
+    /// - Returns: `0xC0`, the escaped body, and `0xC1`, or `nil` when the
+    ///   identifier has no framing evidence, so a caller cannot invent a layout
+    ///   for it.
+    public static func encode(
+        command: PenCommand,
+        payload: [UInt8],
+        errorCode: UInt8 = 0
+    ) -> [UInt8]? {
+        guard let kind = command.frameKind else {
+            return nil
+        }
+        return encode(command: command.rawValue, payload: payload, kind: kind, errorCode: errorCode)
+    }
+
+    /// Encodes one packet with an explicit framing.
+    ///
+    /// Use this for an identifier the evidence does not classify, such as the
+    /// body of a deliberately malformed frame. It is internal because it lets a
+    /// caller state a layout the evidence does not support; a production caller
+    /// goes through the classifying overload above instead.
+    ///
+    /// - Parameters:
+    ///   - command: The command identifier.
+    ///   - payload: The payload bytes.
+    ///   - kind: The framing to use.
+    ///   - errorCode: The error code to report for a response frame.
     /// - Returns: `0xC0`, the escaped body, and `0xC1`.
-    public static func encode(command: UInt8, payload: [UInt8]) -> [UInt8] {
+    static func encode(
+        command: UInt8,
+        payload: [UInt8],
+        kind: PenFrameKind,
+        errorCode: UInt8 = 0
+    ) -> [UInt8] {
         var body: [UInt8] = [command]
+        if kind == .response {
+            body.append(errorCode)
+        }
         let length = UInt16(payload.count)
         body.append(UInt8(length & 0xFF))
         body.append(UInt8((length >> 8) & 0xFF))
@@ -185,10 +247,5 @@ public enum PenFrameEncoder {
         }
         frame.append(PenFraming.end)
         return frame
-    }
-
-    /// Encodes one packet for a known command.
-    public static func encode(command: PenCommand, payload: [UInt8]) -> [UInt8] {
-        encode(command: command.rawValue, payload: payload)
     }
 }

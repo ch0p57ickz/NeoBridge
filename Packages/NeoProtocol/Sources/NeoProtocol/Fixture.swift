@@ -63,6 +63,14 @@ public struct ExpectedFrameOutcome: Hashable, Sendable, Decodable {
     /// The expected payload as a hexadecimal string, for packets.
     public let payloadHex: String?
 
+    /// The expected response error code, for a packet whose command is a
+    /// response.
+    ///
+    /// A response frame always carries a code, so a response packet declares
+    /// this field and an event packet, which has no error-code position, omits
+    /// it.
+    public let errorCode: Int?
+
     /// The expected error kind, for errors.
     public let error: String?
 
@@ -274,6 +282,7 @@ extension PenProtocolError {
         case .packetTooShortForHeader: return "packetTooShortForHeader"
         case .unknownCommand: return "unknownCommand"
         case .malformedPayload: return "malformedPayload"
+        case .commandFailed: return "commandFailed"
         case .unsupportedVersion: return "unsupportedVersion"
         case .unsupportedCommand: return "unsupportedCommand"
         case .blockedCommand: return "blockedCommand"

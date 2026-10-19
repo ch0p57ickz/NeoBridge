@@ -248,3 +248,124 @@ public struct CommandEvidenceRegistry: Hashable, Sendable {
         authorization(for: command).allowsCompletedStroke
     }
 }
+
+/// How a command's frame body is laid out on the wire.
+///
+/// The body is `command, optional error code, length, payload`. Which layout a
+/// command uses is a property of the identifier alone, not of the direction it
+/// travels in: the host's `0xA4` acknowledgement carries an error code like any
+/// other response, while the pen's `0x24` data frames and the host's requests do
+/// not.
+public enum PenFrameKind: Hashable, Sendable, Codable, CaseIterable {
+    /// The length field follows the command directly.
+    ///
+    /// This covers pen events and notifications, host requests, and the
+    /// firmware and offline data streams the pen sends.
+    case event
+
+    /// An error code sits between the command and the length field.
+    case response
+}
+
+extension PenCommand {
+    /// The framing this identifier uses, or `nil` when the evidence does not
+    /// classify it.
+    ///
+    /// Source: Neo iOS SDK 3.0 `PenCommParser.parsePenDataPacket`. It reads the
+    /// length from `data[1..2]` for every identifier it parses as an event and
+    /// from `data[2..3]` for every identifier it parses as a response, which is
+    /// how a response's error code is skipped. The split it makes within the
+    /// `SOUND_RES_*` family is why this is a table rather than a rule: `0x73`,
+    /// `0x76`, and `0x77` are parsed without an error code, while `0xF4` and
+    /// `0xF5` are parsed with one.
+    ///
+    /// The SDK parses only pen-to-host frames, so its case list cannot classify
+    /// a host-to-pen response or the requests. Two groups are settled from other
+    /// evidence:
+    ///
+    /// - `0xA4`, the host's offline data acknowledgement, is framed with an error
+    ///   code and the pen accepted all 604 of them, so it is a response even
+    ///   though the SDK never parses one.
+    /// - `0x01`, `0x21`, `0x22`, and `0x23` are requests the physical A1
+    ///   accepted without an error code, so they are events for framing
+    ///   purposes.
+    ///
+    /// Every other identifier stays unclassified. The decoder rejects such a
+    /// frame rather than guessing where its length field starts, so an
+    /// unvalidated command cannot be mis-parsed as data.
+    public var frameKind: PenFrameKind? {
+        switch self {
+        // Responses: the SDK parses each of these with an error code.
+        case .responseVersionInfo,
+             .responseComparePassword,
+             .responseChangePassword,
+             .responsePenState,
+             .responseSetPenState,
+             .responseSystemChange,
+             .responseSystemInfo,
+             .responseSetNoteList,
+             .responseOfflineNoteList,
+             .responseOfflinePageList,
+             .responseOfflineDataInfo,
+             .responseDeleteOfflineNote,
+             .responseDeleteOfflinePage,
+             .responseFirmwareFile1,
+             .responseFirmwareFile2,
+             .responseProfile,
+             .soundResponseLogInfo,
+             .soundResponseLogData:
+            return .response
+
+        // The host's offline data acknowledgement. Not in the SDK's case list,
+        // because the SDK only parses what the pen sends; settled by the capture.
+        case .responseOfflineData:
+            return .response
+
+        // Events and the pen-to-host streams, parsed by the SDK without an error
+        // code.
+        case .eventBatteryAlarm,
+             .eventPowerOff,
+             .eventPenUpDown,
+             .eventPenNewId,
+             .eventPenDotCode,
+             .eventPenDotCode2,
+             .eventPenDotCode3,
+             .eventDotError,
+             .eventNewPenDown,
+             .eventNewPenUp,
+             .eventNewPenNewId,
+             .eventNewPenDot,
+             .eventNewDotError,
+             .eventHoverDot,
+             .offlineDataRequest2,
+             .firmwareFileRequest2,
+             .soundResponsePds,
+             .soundResponseOid,
+             .soundResponseStatus:
+            return .event
+
+        // Requests the capture exercised, accepted without an error code.
+        case .versionInfo,
+             .offlineNoteListRequest,
+             .offlinePageListRequest,
+             .offlineDataRequest1:
+            return .event
+
+        // No framing evidence. Reject rather than guess.
+        case .comparePassword,
+             .changePassword,
+             .penState,
+             .setPenState,
+             .systemChange,
+             .systemInfo,
+             .setNoteList,
+             .deleteOfflineNoteRequest,
+             .deleteOfflinePageRequest,
+             .firmwareFileRequest1,
+             .profileRequest,
+             .soundRequestLogInfo,
+             .soundRequestLogData:
+            return nil
+        }
+    }
+}

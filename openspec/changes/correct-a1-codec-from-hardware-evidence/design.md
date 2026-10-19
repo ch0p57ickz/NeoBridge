@@ -11,8 +11,9 @@ See `proposal.md` for motivation. The constraints the design must respect:
   case (`REQ2_OFFLINE_DATA`), does not.
 - `PenFrameDecoder` is a portable, dependency-free value type. It cannot learn the layout
   from a platform transport.
-- All six existing fixtures were built on the wrong assumption, so none of them can act as
-  a regression anchor for this fix.
+- The fixtures that carried a response frame were built on the wrong assumption, and the
+  event-only ones cannot exercise the corrected layout, so none of the existing set could
+  act as a regression anchor for this fix.
 - The initializing change is still in progress and `openspec/specs/` is empty, so this
   change's delta is written as additions against the same capability path.
 
@@ -80,7 +81,7 @@ firmware, observed version, and capture date.
 
 Add one fixture built from the real handshake exchange, byte-exact apart from redaction,
 created by hand rather than by the generator so the generator cannot reproduce its own
-mistake. Regenerate the six existing fixtures through the generator, which gains a
+mistake. Regenerate every existing fixture through the generator, which gains a
 frame-kind parameter.
 
 Redaction for the new fixture: zero the Bluetooth address bytes in the version payload,

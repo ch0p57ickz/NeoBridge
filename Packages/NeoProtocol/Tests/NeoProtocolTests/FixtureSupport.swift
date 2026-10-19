@@ -74,12 +74,11 @@ enum FixtureSupport {
 
     /// Whether a frame carries offline stroke data.
     ///
-    /// A physical A1 sends offline data as `REQ2_OFFLINE_DATA` (`0x24`). The
-    /// `RES2_OFFLINE_DATA` (`0xA4`) label is the SDK's host-side acknowledgement,
-    /// but the earlier fixtures carried the payload on `0xA4`, so both are
-    /// accepted while those fixtures remain.
+    /// A physical A1 sends offline data as `REQ2_OFFLINE_DATA` (`0x24`).
+    /// `RES2_OFFLINE_DATA` (`0xA4`) is the host's acknowledgement of that data, so
+    /// an inbound `0xA4` is never data.
     static func isOfflineData(_ frame: PenFrame) -> Bool {
-        frame.command == .offlineDataRequest2 || frame.command == .responseOfflineData
+        frame.command == .offlineDataRequest2
     }
 
     /// The offline data packets of a fixture, in order.

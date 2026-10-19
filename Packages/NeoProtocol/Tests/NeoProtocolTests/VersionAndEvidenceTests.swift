@@ -26,20 +26,35 @@ final class ProtocolVersionTests: XCTestCase {
         XCTAssertLessThan(ProtocolVersion(major: 2, minor: 18), ProtocolVersion(major: 3, minor: 0))
     }
 
-    func testDefaultPolicySupportsTheSDKProtocolVersionOnly() {
+    func testDefaultPolicySupportsEveryValidatedMinor() {
         let policy = ProtocolVersionPolicy.neoSDK3
-        XCTAssertEqual(policy.validatedMinors, [18])
-        let support = policy.support(for: ProtocolVersion(major: 2, minor: 18))
-        XCTAssertTrue(support.isSupported)
-        XCTAssertEqual(support, .supported(ProtocolVersion(major: 2, minor: 18)))
-        XCTAssertEqual(support.version, ProtocolVersion(major: 2, minor: 18))
+        XCTAssertEqual(policy.validatedMinors, [18, 23])
+
+        // 2.18 is the version the SDK declares; 2.23 is what the physical A1
+        // reported.
+        for minor in [18, 23] {
+            let version = ProtocolVersion(major: 2, minor: minor)
+            let support = policy.support(for: version)
+            XCTAssertTrue(support.isSupported, "2.\(minor) has wire evidence")
+            XCTAssertEqual(support, .supported(version))
+            XCTAssertEqual(support.version, version)
+        }
     }
 
     func testUnvalidatedMinorIsUnsupported() {
         let policy = ProtocolVersionPolicy.neoSDK3
-        let support = policy.support(for: ProtocolVersion(major: 2, minor: 19))
-        XCTAssertFalse(support.isSupported)
-        XCTAssertEqual(support, .unsupported(ProtocolVersion(major: 2, minor: 19)))
+        // 2.25 is above the highest validated minor, but being newer is not
+        // evidence, so it stays unsupported.
+        for minor in [19, 25] {
+            XCTAssertFalse(
+                policy.support(for: ProtocolVersion(major: 2, minor: minor)).isSupported,
+                "2.\(minor) has no evidence"
+            )
+        }
+        XCTAssertEqual(
+            policy.support(for: ProtocolVersion(major: 2, minor: 19)),
+            .unsupported(ProtocolVersion(major: 2, minor: 19))
+        )
     }
 
     func testOtherFamiliesAreUnsupported() {
@@ -356,5 +371,308 @@ final class PenEventDecoderTests: XCTestCase {
         guard case .error(.malformedPayload) = decoder.decode(frame) else {
             return XCTFail("expected a malformed payload error")
         }
+    }
+}
+
+/// Pins the framing each command identifier uses.
+///
+/// Source: Neo iOS SDK 3.0 `NISDK3/Classes/PenController/PenCommParser.swift`.
+/// `parsePenDataPacket` reads the length from `data[1..2]` for every identifier
+/// it parses as an event, and from `data[2..3]` for every identifier it parses
+/// as a response, which is how a response's error code is skipped.
+final class CommandFrameKindTests: XCTestCase {
+    /// Identifiers the SDK parses with an error code between the command and the
+    /// length, plus the host acknowledgement the capture settled.
+    private let responses: [PenCommand] = [
+        .responseVersionInfo,
+        .responseComparePassword,
+        .responseChangePassword,
+        .responsePenState,
+        .responseSetPenState,
+        .responseSystemChange,
+        .responseSystemInfo,
+        .responseSetNoteList,
+        .responseOfflineNoteList,
+        .responseOfflinePageList,
+        .responseOfflineDataInfo,
+        .responseOfflineData,
+        .responseDeleteOfflineNote,
+        .responseDeleteOfflinePage,
+        .responseFirmwareFile1,
+        .responseFirmwareFile2,
+        .responseProfile,
+        .soundResponseLogInfo,
+        .soundResponseLogData,
+    ]
+
+    /// Identifiers the SDK parses with the length immediately after the command,
+    /// plus the requests the capture exercised the same way.
+    private let events: [PenCommand] = [
+        .eventBatteryAlarm,
+        .eventPowerOff,
+        .eventPenUpDown,
+        .eventPenNewId,
+        .eventPenDotCode,
+        .eventPenDotCode2,
+        .eventPenDotCode3,
+        .eventDotError,
+        .eventNewPenDown,
+        .eventNewPenUp,
+        .eventNewPenNewId,
+        .eventNewPenDot,
+        .eventNewDotError,
+        .eventHoverDot,
+        .offlineDataRequest2,
+        .firmwareFileRequest2,
+        .soundResponsePds,
+        .soundResponseOid,
+        .soundResponseStatus,
+        .versionInfo,
+        .offlineNoteListRequest,
+        .offlinePageListRequest,
+        .offlineDataRequest1,
+    ]
+
+    func testFramingMatchesTheSDKCaseList() {
+        for command in responses {
+            XCTAssertEqual(command.frameKind, .response, "\(command) carries an error code")
+        }
+        for command in events {
+            XCTAssertEqual(command.frameKind, .event, "\(command) has no error code")
+        }
+    }
+
+    func testTheSoundFamilyIsNotASinglePattern() {
+        // A rule based on the identifier ranges or the SDK's naming would classify
+        // these five together. The parser splits them, so a table is required.
+        XCTAssertEqual(PenCommand.soundResponsePds.frameKind, .event)
+        XCTAssertEqual(PenCommand.soundResponseOid.frameKind, .event)
+        XCTAssertEqual(PenCommand.soundResponseStatus.frameKind, .event)
+        XCTAssertEqual(PenCommand.soundResponseLogInfo.frameKind, .response)
+        XCTAssertEqual(PenCommand.soundResponseLogData.frameKind, .response)
+    }
+
+    func testOfflineDataFramingIsTheHardwareObservedSplit() {
+        // The pen sends the stroke data without an error code; the host's
+        // acknowledgement of that same data carries one.
+        XCTAssertEqual(PenCommand.offlineDataRequest2.rawValue, 0x24)
+        XCTAssertEqual(PenCommand.offlineDataRequest2.frameKind, .event)
+        XCTAssertEqual(PenCommand.responseOfflineData.rawValue, 0xA4)
+        XCTAssertEqual(PenCommand.responseOfflineData.frameKind, .response)
+    }
+
+    func testUnvalidatedIdentifiersStayUnclassified() {
+        // No framing evidence means no layout, so the decoder must reject the
+        // frame rather than guess where its length field starts.
+        let unclassified: [PenCommand] = [
+            .comparePassword,
+            .changePassword,
+            .penState,
+            .setPenState,
+            .systemChange,
+            .systemInfo,
+            .setNoteList,
+            .deleteOfflineNoteRequest,
+            .deleteOfflinePageRequest,
+            .firmwareFileRequest1,
+            .profileRequest,
+            .soundRequestLogInfo,
+            .soundRequestLogData,
+        ]
+        for command in unclassified {
+            XCTAssertNil(command.frameKind, "\(command) has no framing evidence")
+        }
+    }
+
+    func testTheListsCoverEveryClassifiedIdentifier() {
+        let listed = responses + events
+        XCTAssertEqual(Set(listed).count, listed.count, "no identifier may be listed twice")
+        XCTAssertEqual(
+            listed.count,
+            PenCommand.allCases.filter { $0.frameKind != nil }.count,
+            "the lists must account for every classified identifier, so a new "
+                + "classification cannot land without its source being recorded"
+        )
+    }
+}
+
+/// A response that reports a non-zero error code must fail rather than have its
+/// payload decoded as data.
+final class FailedResponseTests: XCTestCase {
+    func testNonZeroErrorCodeProducesTheFailureAndNoEvents() {
+        var decoder = PenEventDecoder()
+        let frame = PenFrame(
+            commandByte: PenCommand.responseVersionInfo.rawValue,
+            command: .responseVersionInfo,
+            errorCode: 0x05,
+            payload: [0x00]
+        )
+
+        XCTAssertEqual(
+            decoder.decode(frame),
+            .error(.commandFailed(command: .responseVersionInfo, code: 0x05))
+        )
+        XCTAssertNil(decoder.observedVersion, "a failed response must not be decoded as data")
+    }
+
+    func testAZeroErrorCodeIsNotAFailure() {
+        var decoder = PenEventDecoder()
+        // A zero code means the pen accepted the command, so the payload is
+        // decoded normally. An empty version payload is malformed, which proves
+        // the frame reached the payload decoder.
+        let frame = PenFrame(
+            commandByte: PenCommand.responseVersionInfo.rawValue,
+            command: .responseVersionInfo,
+            errorCode: 0x00,
+            payload: []
+        )
+
+        guard case .error(.malformedPayload) = decoder.decode(frame) else {
+            return XCTFail("an empty version payload is malformed, not a command failure")
+        }
+    }
+
+    func testAFailedResponseReachesTheTokenLayerFromRawBytes() throws {
+        // `81 05 01 00 00`: a version response carrying error code 5 and a
+        // one-byte payload, so the failure is proved from the wire bytes rather
+        // than from a hand-built frame.
+        let bytes: [UInt8] = [PenFraming.start, 0x81, 0x05, 0x01, 0x00, 0x00, PenFraming.end]
+
+        var frameDecoder = PenFrameDecoder()
+        let frames = frameDecoder.ingest(bytes).compactMap { outcome -> PenFrame? in
+            if case .frame(let frame) = outcome {
+                return frame
+            }
+            return nil
+        }
+        let frame = try XCTUnwrap(frames.first)
+        XCTAssertEqual(frame.errorCode, 0x05)
+        XCTAssertEqual(frame.payload, [0x00], "the payload starts after the error byte and the length")
+
+        var tokenDecoder = PenEventDecoder()
+        XCTAssertEqual(
+            tokenDecoder.decode(frame),
+            .error(.commandFailed(command: .responseVersionInfo, code: 0x05))
+        )
+        XCTAssertNil(tokenDecoder.observedVersion)
+    }
+
+    func testAFailedResponseOutranksAnUnsupportedVersion() {
+        var decoder = PenEventDecoder()
+
+        // Make the session unsupported: the pen reports protocol 9.99.
+        let unsupported = PenFrame(
+            commandByte: PenCommand.responseVersionInfo.rawValue,
+            command: .responseVersionInfo,
+            errorCode: 0,
+            payload: versionPayload("9.99")
+        )
+        XCTAssertEqual(
+            decoder.decode(unsupported),
+            .error(.unsupportedVersion(ProtocolVersion(major: 9, minor: 99)))
+        )
+
+        // The next frame carries its own failure, so it is diagnosed as such
+        // rather than as a version problem.
+        let failed = PenFrame(
+            commandByte: PenCommand.responseVersionInfo.rawValue,
+            command: .responseVersionInfo,
+            errorCode: 0x03,
+            payload: versionPayload("9.99")
+        )
+        XCTAssertEqual(
+            decoder.decode(failed),
+            .error(.commandFailed(command: .responseVersionInfo, code: 0x03))
+        )
+    }
+
+    /// A 65-byte version payload reporting `version`.
+    private func versionPayload(_ version: String) -> [UInt8] {
+        var payload = [UInt8](repeating: 0, count: 65)
+        let text = Array(version.utf8)
+        payload.replaceSubrange(32..<(32 + text.count), with: text)
+        return payload
+    }
+}
+
+/// The version payload layout.
+///
+/// Offsets come from the SDK's own `PenVersionInfo`: device name `0..<16`,
+/// firmware `16..<32`, protocol version text `32..<40`, sub-name `40..<56`,
+/// device type `56..<58`, Bluetooth address `58..<64`, pressure sensor type `64`,
+/// and the compression capability byte at `69`. The SDK reads the capability byte
+/// only when the payload is at least 70 bytes and the reported version is at least
+/// 2.22.
+final class PenVersionInfoTests: XCTestCase {
+    private func payload(
+        protocolVersion: String,
+        compressionCapability: UInt8? = nil,
+        length: Int
+    ) -> [UInt8] {
+        var bytes = [UInt8](repeating: 0, count: length)
+        let text = Array(protocolVersion.utf8)
+        if 32 + text.count <= length {
+            bytes.replaceSubrange(32..<(32 + text.count), with: text)
+        }
+        if let compressionCapability, length > 69 {
+            bytes[69] = compressionCapability
+        }
+        return bytes
+    }
+
+    func testCompressionCapabilityReportedAsClear() throws {
+        let info = try XCTUnwrap(
+            PenVersionInfo(payload: payload(protocolVersion: "2.23", compressionCapability: 0, length: 70))
+        )
+        XCTAssertFalse(info.supportsCompressedTransfer)
+    }
+
+    func testCompressionCapabilityReportedAsSet() throws {
+        let info = try XCTUnwrap(
+            PenVersionInfo(payload: payload(protocolVersion: "2.23", compressionCapability: 1, length: 70))
+        )
+        XCTAssertTrue(info.supportsCompressedTransfer)
+    }
+
+    func testCompressionCapabilityBelowTheSupportingMinorIsIgnored() throws {
+        // The SDK reports the capability only from protocol 2.22, so a set byte
+        // on an older version is not evidence of support.
+        let info = try XCTUnwrap(
+            PenVersionInfo(payload: payload(protocolVersion: "2.18", compressionCapability: 1, length: 70))
+        )
+        XCTAssertFalse(info.supportsCompressedTransfer)
+    }
+
+    func testCompressionCapabilityBoundaryIsExact() throws {
+        // 2.22 is the minor the SDK starts reporting the capability from, so the
+        // boundary itself is honoured and one minor below it is not.
+        let atBoundary = try XCTUnwrap(
+            PenVersionInfo(payload: payload(protocolVersion: "2.22", compressionCapability: 1, length: 70))
+        )
+        XCTAssertTrue(atBoundary.supportsCompressedTransfer)
+
+        let belowBoundary = try XCTUnwrap(
+            PenVersionInfo(payload: payload(protocolVersion: "2.21", compressionCapability: 1, length: 70))
+        )
+        XCTAssertFalse(belowBoundary.supportsCompressedTransfer)
+    }
+
+    func testAbsentCompressionCapabilityIsUnsupportedWithoutFailingThePayload() throws {
+        // A payload that stops before the capability byte still parses, so a
+        // shorter layout never fails the whole version response.
+        for length in [64, 65, 69] {
+            let info = try XCTUnwrap(
+                PenVersionInfo(payload: payload(protocolVersion: "2.23", length: length)),
+                "a \(length)-byte payload must still parse"
+            )
+            XCTAssertFalse(
+                info.supportsCompressedTransfer,
+                "a \(length)-byte payload has no capability byte"
+            )
+        }
+    }
+
+    func testPayloadShorterThanTheBaseLayoutIsRejected() {
+        XCTAssertNil(PenVersionInfo(payload: [UInt8](repeating: 0, count: 63)))
     }
 }

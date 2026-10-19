@@ -1,0 +1,40 @@
+{
+  "chunks": [
+    "c0012a00000000000000000000000000000000001112312e302e300000000000000000000000322e313800000000c1",
+    "c0810046004e57502d463135310000000000000000332e3030000000000000000000000000322e3233000000004e656f736d61727470656e5f413100000100000000000000040000000000c1"
+  ],
+  "comment": "The real A1 handshake: the host's REQ_VERSION_INFO 0x01 request and the pen's RES_VERSION_INFO 0x81 response reporting protocol 2.23, with the Bluetooth address zeroed.",
+  "evidenceLevel": "physicalDevice",
+  "expected": [
+    {
+      "commandByte": "0x01",
+      "kind": "packet",
+      "payloadHex": "000000000000000000000000000000001112312e302e300000000000000000000000322e313800000000"
+    },
+    {
+      "commandByte": "0x81",
+      "errorCode": 0,
+      "kind": "packet",
+      "payloadHex": "4e57502d463135310000000000000000332e3030000000000000000000000000322e3233000000004e656f736d61727470656e5f413100000100000000000000040000000000"
+    }
+  ],
+  "expectedProtocolVersion": "2.23",
+  "fixtureVersion": 1,
+  "id": "a1-handshake-version-2.23",
+  "provenance": {
+    "captureDate": "2026-10-18",
+    "deviceModel": "NWP-F151",
+    "firmware": "3.00",
+    "observedProtocolVersion": "2.23",
+    "source": "Physical A1 capture on a Linux BLE host, recorded in docs/protocol-a1.md"
+  },
+  "sanitization": {
+    "notes": "The version response's Bluetooth address field is zeroed. The advertised device address, the device serial, and any password material are absent. The connection code the request carries is the SDK's default of sixteen zero bytes. The exchange carries no stroke content, so no handwriting is reproduced.",
+    "removed": [
+      "bluetoothAddress",
+      "serialNumber",
+      "authenticationMaterial",
+      "handwritingContent"
+    ]
+  }
+}

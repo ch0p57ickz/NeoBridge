@@ -193,11 +193,12 @@ sensitive fields removed and stays git-ignored.
 
 ## Fixture coverage today
 
-`Tests/Fixtures` holds seven sanitized fixtures with recorded provenance,
+`Tests/Fixtures` holds eight sanitized fixtures with recorded provenance,
 sanitization, device model, observed protocol version, and expected output:
 
 | Fixture | Covers |
 | --- | --- |
+| `a1-handshake-version-2.23` | the real handshake: the host's `0x01` request and the pen's `0x81` response reporting `2.23`, Bluetooth address zeroed |
 | `a1-version-info-2.18` | version handshake, zeroed Bluetooth address |
 | `a1-realtime-stroke` | live down, four dots, up |
 | `a1-offline-stroke` | single offline data packet with checksummed dots |
@@ -206,11 +207,12 @@ sanitization, device model, observed protocol version, and expected output:
 | `a1-size-limit-recovery` | payload and buffer limits and recovery |
 | `a1-escaped-page-identity` | byte-stuffing round trip |
 
-These fixtures are synthetic reconstructions of the documented wire layout, built by
-`Tests/Fixtures/generate-fixtures.py` rather than recorded from the pen above. A
-recorded capture is not committed as a fixture, because it carries the pen's serial
-number and Bluetooth address and its stroke coordinates are the user's own
-handwriting. Raw captures belong in `Tests/Fixtures/raw/`, which is git-ignored.
+Seven of these are synthetic reconstructions of the documented wire layout, built by
+`Tests/Fixtures/generate-fixtures.py`. The eighth, `a1-handshake-version-2.23`, is
+derived from the recorded handshake above, with the Bluetooth address field zeroed; it
+carries no serial number and no stroke content. The full capture is not committed,
+because its stroke coordinates are the user's own handwriting. Raw captures belong in
+`Tests/Fixtures/raw/`, which is git-ignored.
 
 ## Gate
 

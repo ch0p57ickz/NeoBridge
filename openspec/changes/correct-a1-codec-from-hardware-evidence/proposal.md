@@ -14,9 +14,9 @@ gate can be closed on evidence rather than on fixtures that agree with the code.
 ## What Changes
 
 - **BREAKING** (internal API): the packet body becomes `command, optional error code,
-  length, payload`. Response frames (`RES*`) carry an error code byte between the command
-  and the length field; event frames (`EVENT*`, and the `0xA4` offline data stream) do
-  not.
+  length, payload`. Response frames (`RES*`, including the host's `0xA4` acknowledgement)
+  carry an error code byte between the command and the length field; event frames, host
+  requests, and the pen's `0x24` offline data stream do not.
 - `PenFrameDecoder` reports the error code alongside the decoded packet instead of
   treating those bytes as part of the length, and rejects a frame whose declared length
   does not fit the buffered body.
@@ -24,9 +24,10 @@ gate can be closed on evidence rather than on fixtures that agree with the code.
   layout a command uses, and so an unknown command is still reported as unsupported.
 - An explicit protocol error is returned when a response carries a non-zero error code,
   instead of the payload being parsed as data.
-- `PenVersionInfo` reads compression support from the pen's reported flag byte at index
-  69 for protocol 2.22 and later, instead of inferring it from the payload length and
-  version. This pen reports the flag as clear while running protocol 2.23.
+- `PenVersionInfo` already reads compression support from the pen's reported flag byte at
+  index 69 for protocol 2.22 and later, matching the SDK's own parser, so this part needed
+  no source change; the change adds the tests that pin the clear, set, absent, and boundary
+  cases. This pen reports the flag as clear while running protocol 2.23.
 - The validated protocol minor range records the minor observed on real hardware (`2.23`)
   and keeps the SDK-declared minor (`2.18`), with the provenance of each recorded in the
   documentation and the M0 evidence rather than encoded in the type system, so the range
@@ -54,10 +55,13 @@ None. Every requirement change lands in the existing capability below.
 
 ### Modified Capabilities
 
-- `protocol-fixture-testing`: gains two requirements. One defines the frame body structure
-  and the response/event error-code rule, including that a non-zero response error code is
-  reported as an explicit failure. The other defines compression support as coming from the
-  pen's reported capability byte, and records the hardware-observed valid minor.
+- `protocol-fixture-testing`: gains three requirements. One defines the frame body
+  structure and the response/event error-code rule, including that a non-zero response
+  error code is reported as an explicit failure. One defines compression support as coming
+  from the pen's reported capability byte. One defines multi-packet offline transfer
+  assembly. The validated-minor rule itself already lives in the initializing change's
+  delta for the same capability, so this change extends the policy with the
+  hardware-observed minor rather than restating the rule.
 
 ## Impact
 
@@ -74,13 +78,15 @@ Affected code:
 - `Packages/NeoProtocol/Sources/NeoProtocol/OfflineData.swift`: the per-packet decoder and
   the new transfer assembler, plus the error labels, which named the host's `0xA4`
   acknowledgement for a payload the pen sends as `0x24`.
-- `Packages/NeoProtocol/Sources/NeoProtocol/PenWire.swift`: `PenVersionInfo` compression
-  support.
+- `Packages/NeoProtocol/Sources/NeoProtocol/PenWire.swift`: `PenVersionInfo` already
+  derived compression support from the pen's capability byte and already matched the SDK's
+  parser, so this change adds the tests that pin it rather than editing the parser.
 - `Packages/NeoProtocol/Sources/NeoProtocol/ProtocolVersion.swift` and the version policy:
   the validated minor range and its evidence source.
-- `Tests/Fixtures/`: all six fixtures, plus `generate-fixtures.py`, plus a new sanitized
-  capture fixture. The raw capture stays git-ignored; the committed fixture must have the
-  serial number, Bluetooth addresses, connection code, and handwriting content removed.
+- `Tests/Fixtures/`: the seven generated fixtures, `generate-fixtures.py`, and a new
+  capture-derived handshake fixture, eight in total. The raw capture stays git-ignored; the
+  committed fixtures must have the serial number, Bluetooth addresses, connection code, and
+  handwriting content removed.
 
 Affected behaviour and systems:
 
