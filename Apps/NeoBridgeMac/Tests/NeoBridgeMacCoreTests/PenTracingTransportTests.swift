@@ -87,7 +87,11 @@ final class PenTracingTransportTests: XCTestCase {
         for try await _ in transport.receive() {}
 
         let contents = log.contents()
-        XCTAssertTrue(contents.contains("totals outboundFrames=1 inboundChunks=1 inboundBytes=2"))
+        XCTAssertTrue(
+            contents.contains(
+                "totals outboundFrames=1 outboundBytes=9 inboundChunks=1 inboundBytes=2"
+            )
+        )
         XCTAssertTrue(contents.contains("outboundCommands 0x21"), "the deletion check reads this line")
     }
 

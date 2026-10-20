@@ -124,6 +124,153 @@ final class BluetoothPenSyncRunnerTests: XCTestCase {
         )
     }
 
+    // MARK: - Transfer option
+
+    /// The frames one complete read of a pen holding a single stroke needs.
+    private func oneStrokeRead() -> [[UInt8]] {
+        [
+            FakePenFrames.versionInfo(),
+            FakePenFrames.penState(),
+            FakePenFrames.noteList(notes: [(FakePenFrames.sectionOwnerId, FakePenFrames.note)]),
+            FakePenFrames.pageList(
+                sectionOwnerId: FakePenFrames.sectionOwnerId,
+                note: FakePenFrames.note,
+                pages: [1]
+            ),
+            FakePenFrames.offlineInfo(strokeCount: 1, uncompressedSize: 0),
+            FakePenFrames.offlineStrokePacket(),
+        ]
+    }
+
+    /// The payloads of every `0x23` request the connection received.
+    private func dataRequestPayloads(
+        _ connection: FakePenBluetoothConnection
+    ) -> [[UInt8]] {
+        var decoder = PenFrameDecoder()
+        return decoder.ingest(connection.writtenBytes).compactMap { outcome -> [UInt8]? in
+            guard case .frame(let frame) = outcome, frame.command == .offlineDataRequest1 else {
+                return nil
+            }
+            return frame.payload
+        }
+    }
+
+    /// The runner sends the `0x23` option it was configured with. The acceptance
+    /// run varies it while the incremental-transfer experiment runs, and the app's
+    /// own default stays the established non-destructive option.
+    func testSendsTheTransferOptionItWasConfiguredWith() async throws {
+        let cases: [(configured: OfflineReadTransferOption?, byte: UInt8)] = [
+            (nil, 0x02),
+            (.notNextTransfer, 0x00),
+            (.nextAndReserve, 0x02),
+        ]
+
+        for (configured, byte) in cases {
+            let connection = FakePenBluetoothConnection(inbound: oneStrokeRead())
+            let central = FakePenBluetoothCentral(
+                advertisedPeripherals: [pen()],
+                connection: connection
+            )
+            let runner = BluetoothPenSyncRunner(
+                central: central,
+                selectionWindow: quickWindow,
+                transferOption: configured ?? .nextAndReserve
+            )
+
+            _ = try await runner.run { _ in }
+
+            let payloads = dataRequestPayloads(connection)
+            XCTAssertEqual(payloads.count, 1, "one 0x23 for the discovered note")
+            XCTAssertEqual(
+                payloads.first?.first,
+                byte,
+                "\(String(describing: configured)) must travel as its own option byte"
+            )
+        }
+    }
+
+    // MARK: - Interrupted transfer
+
+    /// The configured packet drops the link, and the read fails as an interrupted
+    /// transfer rather than reporting a result. The experiment needs exactly that:
+    /// a read that stops part way with strokes the host never imported.
+    func testDropsTheLinkWhenTheConfiguredPacketArrives() async throws {
+        let connection = FakePenBluetoothConnection(
+            inbound: FakePenFrames.discoveryOnly()
+                + [FakePenFrames.offlineStrokePacket(packetID: 1, transferPosition: .start)],
+            endsAfterScript: false
+        )
+        let central = FakePenBluetoothCentral(
+            advertisedPeripherals: [pen()],
+            connection: connection
+        )
+        let trace = PenTrafficLog()
+        let runner = BluetoothPenSyncRunner(
+            central: central,
+            selectionWindow: quickWindow,
+            abortAtPacket: 1,
+            trace: trace
+        )
+
+        await assertSessionError(.incompleteTransfer(assembledPacketCount: 0)) {
+            try await runner.run { _ in }
+        }
+
+        XCTAssertTrue(connection.isClosed, "the abort has to drop the pen link")
+        let contents = trace.contents()
+        XCTAssertTrue(
+            contents.contains("abort stopped the transfer when 0x24 packet 1 arrived"),
+            "the transcript records the abort"
+        )
+        XCTAssertFalse(contents.contains("result strokes="), "an interrupted transfer is not a result")
+    }
+
+    /// The number counts the packets that arrive, so a number the transfer never
+    /// reaches leaves the read complete. Without this the experiment could not tell
+    /// an aborted transfer from a finished one.
+    func testLeavesTheReadCompleteWhenTheConfiguredPacketNeverArrives() async throws {
+        let connection = FakePenBluetoothConnection(inbound: oneStrokeRead())
+        let central = FakePenBluetoothCentral(
+            advertisedPeripherals: [pen()],
+            connection: connection
+        )
+        let runner = BluetoothPenSyncRunner(
+            central: central,
+            selectionWindow: quickWindow,
+            abortAtPacket: 2
+        )
+
+        let read = try await runner.run { _ in }
+
+        XCTAssertEqual(read.summary.strokeCount, 1)
+        XCTAssertTrue(connection.isClosed, "a completed read releases the pen")
+    }
+
+    /// The transcript carries the stroke identity the experiment compares two runs
+    /// and the library by.
+    func testRecordsTheStrokeIdentityTheExperimentComparesBy() async throws {
+        let connection = FakePenBluetoothConnection(inbound: oneStrokeRead())
+        let central = FakePenBluetoothCentral(
+            advertisedPeripherals: [pen()],
+            connection: connection
+        )
+        let trace = PenTrafficLog()
+        let runner = BluetoothPenSyncRunner(
+            central: central,
+            selectionWindow: quickWindow,
+            trace: trace
+        )
+
+        let read = try await runner.run { _ in }
+        let stroke = try XCTUnwrap(read.transfer.strokes.first)
+        let fingerprint = StrokeIdentity.fingerprint(of: stroke)
+
+        XCTAssertTrue(
+            trace.contents().contains("fp=\(fingerprint.hexDigest.prefix(16))"),
+            "a stroke line must carry the identity two runs are compared by"
+        )
+    }
+
     // MARK: - Failures
 
     func testSetupDeadlineOutlastsTheScanWindow() throws {

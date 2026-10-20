@@ -153,11 +153,37 @@ A headless run cannot open a folder picker, so the export folder comes from
 `NEOBRIDGE_EXPORT_DIRECTORY`. The interface stores a security-scoped bookmark
 instead.
 
+Three more variables vary the attempt, so one binary can run the whole physical-A1
+checklist, including the experiment that decides which `0x23` transfer option is
+incremental:
+
+| Variable | Effect | Default |
+| --- | --- | --- |
+| `NEOBRIDGE_ACCEPTANCE_TRANSFER_OPTION` | The `0x23` transfer option the read sends: `notNextTransfer`, `nextAndReserve`, or the option byte in decimal or hexadecimal. | `nextAndReserve`, the established non-destructive option |
+| `NEOBRIDGE_ACCEPTANCE_CLEANUP` | The cleanup intent the run starts with: `keepOnPen` or `deleteAfterAcknowledge`, also as `keep` and `cleanup`. The intent is set through the same method the menu calls. | the policy default, cleanup |
+| `NEOBRIDGE_ACCEPTANCE_ABORT_AT_PACKET` | Drops the pen link when that `0x24` packet arrives, so the transfer fails part way on purpose. The packet is not delivered, so the read assembles one fewer packet than the number. | unset, the transfer runs to its end |
+
+A value that cannot be understood is refused: the process prints the accepted
+values and exits 2 rather than running a different experiment than the one asked
+for. `nextAndDelete` (`0x01`) is refused, because the read path may not ask the pen
+to delete during a transfer.
+
 ```bash
 NEOBRIDGE_ACCEPTANCE_TRACE=/tmp/a1-run.txt \
 NEOBRIDGE_EXPORT_DIRECTORY=/tmp/a1-exports \
   .build/bundle/NeoBridgeMac.app/Contents/MacOS/NeoBridgeMac
+
+NEOBRIDGE_ACCEPTANCE_TRACE=/tmp/a1-option-00.txt \
+NEOBRIDGE_ACCEPTANCE_TRANSFER_OPTION=notNextTransfer \
+  .build/bundle/NeoBridgeMac.app/Contents/MacOS/NeoBridgeMac
+
+NEOBRIDGE_ACCEPTANCE_TRACE=/tmp/a1-aborted.txt \
+NEOBRIDGE_ACCEPTANCE_ABORT_AT_PACKET=100 \
+  .build/bundle/NeoBridgeMac.app/Contents/MacOS/NeoBridgeMac
 ```
+
+The transcript opens with a `run` line naming the option, the cleanup intent, and
+the abort, so a recorded run states the experiment it belonged to.
 
 Run it from inside the bundle, because CoreBluetooth reads its usage description
 from `Info.plist`. On an ordinary launch, with the variable unset, the app is the

@@ -97,6 +97,8 @@ public struct BluetoothPenSyncRunner: PenSyncRunning {
     private let ambiguityConfirmation: Duration
     private let setupTimeout: Duration
     private let timeouts: PenSessionTimeouts
+    private let transferOption: OfflineReadTransferOption
+    private let abortAtPacket: Int?
     private let trace: PenTrafficLog?
 
     /// How much time the setup phase gets beyond the scan window.
@@ -133,6 +135,12 @@ public struct BluetoothPenSyncRunner: PenSyncRunning {
     ///     no timeout of its own and a callback that never arrives would
     ///     otherwise leave a read attempt waiting with no way out but Cancel Read.
     ///   - timeouts: The bounded waits the session applies.
+    ///   - transferOption: The `0x23` transfer option the session sends. It
+    ///     defaults to the established non-destructive option; the acceptance run
+    ///     varies it while the incremental-transfer experiment runs.
+    ///   - abortAtPacket: When set, the attempt drops the link as that `0x24`
+    ///     packet arrives, so the transfer fails part way on purpose. Only the
+    ///     acceptance run sets it.
     ///   - trace: An optional transcript of the attempt's traffic. An acceptance
     ///     run supplies one so the framed bytes the host sent can be checked.
     public init(
@@ -143,6 +151,8 @@ public struct BluetoothPenSyncRunner: PenSyncRunning {
         ambiguityConfirmation: Duration = CoreBluetoothPenTransport.defaultAmbiguityConfirmation,
         setupTimeout: Duration? = nil,
         timeouts: PenSessionTimeouts = .default,
+        transferOption: OfflineReadTransferOption = .nextAndReserve,
+        abortAtPacket: Int? = nil,
         trace: PenTrafficLog? = nil
     ) {
         self.central = central
@@ -152,6 +162,8 @@ public struct BluetoothPenSyncRunner: PenSyncRunning {
         self.ambiguityConfirmation = ambiguityConfirmation
         self.setupTimeout = setupTimeout ?? Self.setupDeadline(for: selectionWindow)
         self.timeouts = timeouts
+        self.transferOption = transferOption
+        self.abortAtPacket = abortAtPacket
         self.trace = trace
     }
 
@@ -165,9 +177,15 @@ public struct BluetoothPenSyncRunner: PenSyncRunning {
             selectionWindow: selectionWindow,
             ambiguityConfirmation: ambiguityConfirmation
         )
-        let transport: any PenTransport = trace.map {
-            PenTracingTransport(wrapping: base, log: $0)
+        // The abort sits under the transcript, so the transcript records the chunks
+        // the session actually received: the packet whose arrival drops the link is
+        // never one of them.
+        let delivered: any PenTransport = abortAtPacket.map {
+            PenAbortingTransport(wrapping: base, abortAtPacket: $0, log: trace)
         } ?? base
+        let transport: any PenTransport = trace.map {
+            PenTracingTransport(wrapping: delivered, log: $0)
+        } ?? delivered
 
         report(.scanning)
         trace?.recordState(PenSyncStage.scanning.label)
@@ -184,6 +202,7 @@ public struct BluetoothPenSyncRunner: PenSyncRunning {
         let session = PenSession(
             transport: transport,
             timeouts: timeouts,
+            transferOption: transferOption,
             queryPenState: true,
             onStateChange: { state in
                 trace?.recordState(state.label)
@@ -198,8 +217,8 @@ public struct BluetoothPenSyncRunner: PenSyncRunning {
             // releases it on success. A connected pen stops advertising, so a
             // reader that kept the link would make its own next read report "no
             // pen found" and would keep the pen from its other owners. Nothing is
-            // deleted from the pen by disconnecting: the request used the
-            // next-and-reserve option, so the strokes stay on it.
+            // deleted from the pen by disconnecting: the read path can only send a
+            // non-destructive transfer option, so the strokes stay on it.
             await transport.close()
             trace?.recordState("Disconnected")
             trace?.recordCompletion(result)

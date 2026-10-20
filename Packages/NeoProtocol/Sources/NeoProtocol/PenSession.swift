@@ -326,6 +326,11 @@ public struct PenSessionResult: Hashable, Sendable {
 /// so a retry is a new session over a new transport; the failed session closes
 /// the transport it was given.
 ///
+/// The session sends the `0x23` transfer option it was built with, which defaults
+/// to the non-destructive ``OfflineReadTransferOption/nextAndReserve``. The option
+/// is a parameter so the acceptance run can vary it while establishing which value
+/// is incremental; no trace has settled that yet.
+///
 /// Deletion is not part of a read: the session sends no `0x25` or `0x27` command,
 /// and the evidence table gates both behind the deletion evidence, which no
 /// physical A1 trace has opened yet. Cleanup travels on the acknowledged path
@@ -342,6 +347,7 @@ public final class PenSession: Sendable {
     private let registry: CommandEvidenceRegistry
     private let timeouts: PenSessionTimeouts
     private let bootstrap: PenOfflineDiscoveryBootstrap
+    private let transferOption: OfflineReadTransferOption
     private let connectionCode: [UInt8]
     private let appVersion: String
     private let declaredProtocolVersion: String
@@ -360,6 +366,12 @@ public final class PenSession: Sendable {
     ///     authorize is never sent.
     ///   - timeouts: The bounded waits.
     ///   - bootstrap: The evidence behind the initial `0x21` `sectionOwnerId`.
+    ///   - transferOption: The `0x23` transfer option the read sends. It defaults
+    ///     to ``OfflineReadTransferOption/nextAndReserve``, the option two physical
+    ///     reads established as non-destructive. The parameter exists because
+    ///     establishing which option is incremental is an experiment: the
+    ///     acceptance run varies it, and the default is what the app sends until a
+    ///     trace says otherwise.
     ///   - connectionCode: The `0x01` connection code. The SDK default of
     ///     sixteen zero bytes is the only value with evidence.
     ///   - appVersion: The application version the `0x01` request reports.
@@ -375,6 +387,7 @@ public final class PenSession: Sendable {
         registry: CommandEvidenceRegistry = .neoSDK3,
         timeouts: PenSessionTimeouts = .default,
         bootstrap: PenOfflineDiscoveryBootstrap = .neoSDK3,
+        transferOption: OfflineReadTransferOption = .nextAndReserve,
         connectionCode: [UInt8] = PenRequest.defaultConnectionCode,
         appVersion: String = "1.0.0",
         declaredProtocolVersion: String = PenRequest.sdkDeclaredProtocolVersion,
@@ -387,6 +400,7 @@ public final class PenSession: Sendable {
         self.registry = registry
         self.timeouts = timeouts
         self.bootstrap = bootstrap
+        self.transferOption = transferOption
         self.connectionCode = connectionCode
         self.appVersion = appVersion
         self.declaredProtocolVersion = declaredProtocolVersion
@@ -592,7 +606,7 @@ public final class PenSession: Sendable {
         }
 
         try await send(
-            PenRequest.offlineData(for: note),
+            PenRequest.offlineData(for: note, transferOption: transferOption),
             command: .offlineDataRequest1
         )
 

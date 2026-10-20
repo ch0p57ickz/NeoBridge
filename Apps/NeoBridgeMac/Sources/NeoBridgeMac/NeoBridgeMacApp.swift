@@ -22,8 +22,19 @@ enum PenSyncScene {
 @main
 enum NeoBridgeMacMain {
     static func main() {
-        if let traceURL = NeoBridgeAcceptance.traceURL {
-            NeoBridgeAcceptance.run(traceURL: traceURL)
+        do {
+            if let options = try PenAcceptanceOptions(
+                environment: ProcessInfo.processInfo.environment
+            ) {
+                NeoBridgeAcceptance.run(options: options)
+            }
+        } catch {
+            let message = (error as? PenAcceptanceOptions.ParseError)?.message
+                ?? String(describing: error)
+            FileHandle.standardError.write(
+                Data("acceptance: \(message)\n".utf8)
+            )
+            exit(2)
         }
         NeoBridgeMacApp.main()
     }
@@ -45,9 +56,12 @@ enum PenSyncAppComposition {
     ///     supplies one.
     ///   - exportDirectory: A folder fixed at launch, or `nil` to use the folder
     ///     the user chose.
+    ///   - acceptance: The options a headless run varies the attempt with, or
+    ///     `nil` for the app's own behaviour. The interface never supplies them.
     static func makeController(
         trace: PenTrafficLog? = nil,
-        exportDirectory: String? = nil
+        exportDirectory: String? = nil,
+        acceptance: PenAcceptanceOptions? = nil
     ) -> PenSyncController {
         let central = CoreBluetoothPenCentral()
         let destination: any PenExportDestinationProviding = exportDirectory.map {
@@ -56,7 +70,13 @@ enum PenSyncAppComposition {
 
         return PenSyncController(
             runners: PenSyncRunnerFactory { selection in
-                BluetoothPenSyncRunner(central: central, selection: selection, trace: trace)
+                BluetoothPenSyncRunner(
+                    central: central,
+                    selection: selection,
+                    transferOption: acceptance?.transferOption ?? .nextAndReserve,
+                    abortAtPacket: acceptance?.abortAtPacket,
+                    trace: trace
+                )
             },
             library: makeLibrary(),
             destination: destination

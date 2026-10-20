@@ -1,4 +1,5 @@
 import Foundation
+import NeoCore
 import NeoProtocol
 import Synchronization
 
@@ -18,6 +19,7 @@ public final class PenTrafficLog: Sendable {
         var lines: [String] = []
         var outboundCommands: [PenCommand?] = []
         var outboundFrameCount = 0
+        var outboundByteCount = 0
         var inboundChunkCount = 0
         var inboundByteCount = 0
     }
@@ -44,6 +46,7 @@ public final class PenTrafficLog: Sendable {
             state.lines.append("outbound \(hex) command=\(Self.label(command))")
             state.outboundCommands.append(command)
             state.outboundFrameCount += 1
+            state.outboundByteCount += frame.count
         }
     }
 
@@ -95,16 +98,24 @@ public final class PenTrafficLog: Sendable {
                 // page can be found in the transfer by shape and time even after
                 // the pen has been used again. The pen's offline data only grows,
                 // so a page written after the mark cannot be checked by totals.
+                //
+                // `fp` is the stroke's replay fingerprint, which is the identity a
+                // comparison between two runs and the library uses. It is recorded
+                // truncated to its first 16 hexadecimal characters: that is
+                // plenty to tell two of these strokes apart, and the library holds
+                // the full digest.
                 for (index, stroke) in strokes.enumerated() {
                     let offsets = stroke.points.map(\.penTimeOffsetMilliseconds)
                     let xs = stroke.points.map(\.x)
                     let ys = stroke.points.map(\.y)
+                    let fingerprint = StrokeIdentity.fingerprint(of: stroke)
                     record(
                         "stroke page=\(page.page) index=\(index) dots=\(stroke.points.count)"
                             + " x=\(xs.min() ?? 0)..\(xs.max() ?? 0)"
                             + " y=\(ys.min() ?? 0)..\(ys.max() ?? 0)"
                             + " origin=\(stroke.originTime.reportedMilliseconds.map(String.init) ?? "none")"
                             + " t=\(offsets.min() ?? 0)..\(offsets.max() ?? 0)"
+                            + " fp=\(fingerprint.hexDigest.prefix(16))"
                     )
                 }
             }
@@ -133,12 +144,22 @@ public final class PenTrafficLog: Sendable {
     /// The final line lists every outbound command identifier in order, so a
     /// single grep proves the run sent no `0x25` or `0x27`.
     public func contents() -> String {
-        let (lines, commands, frames, chunks, bytes) = state.withLock { state in
-            (state.lines, state.outboundCommands, state.outboundFrameCount, state.inboundChunkCount, state.inboundByteCount)
+        let (lines, commands, frames, outboundBytes, chunks, bytes) = state.withLock { state in
+            (
+                state.lines,
+                state.outboundCommands,
+                state.outboundFrameCount,
+                state.outboundByteCount,
+                state.inboundChunkCount,
+                state.inboundByteCount
+            )
         }
 
         var all = lines
-        all.append("totals outboundFrames=\(frames) inboundChunks=\(chunks) inboundBytes=\(bytes)")
+        all.append(
+            "totals outboundFrames=\(frames) outboundBytes=\(outboundBytes)"
+                + " inboundChunks=\(chunks) inboundBytes=\(bytes)"
+        )
         all.append(
             "outboundCommands \(commands.map { $0.map(Self.label) ?? "unknown" }.joined(separator: ","))"
         )

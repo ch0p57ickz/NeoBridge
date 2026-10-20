@@ -295,24 +295,73 @@ values, two of which leave the note's data in place:
 | `nextAndDelete` | `0x01` | Delete the transferred data as part of the transfer |
 
 This build sends `nextAndReserve` (`0x02`) with `zipOption` none and a page count
-of zero, which is the option both physical reads above used.
+of zero, which is the option every completed physical read used.
 
 `PenRequest.offlineData(for:)` accepts only `OfflineReadTransferOption`, whose
 members are `notNextTransfer` and `nextAndReserve`. The deleting option is not a
 member of that type, so the read path has no route to it. `PenSessionTests` pins
-both bytes and asserts that the session sends the established non-destructive
-option.
+both bytes and asserts that the session sends the option it was built with.
 
-**Pending.** Whether either non-destructive option yields an incremental read is
-not established. Both physical reads so far returned everything: the 2026-10-19
-save-and-export read returned all 8,062 already-stored strokes and added 2, so
-`nextAndReserve` did not advance a cursor. The known-old/known-new experiment
-(tasks 1.1-1.3: a known set of existing strokes, known new strokes, and a read with
-each option, including a disconnect before the final `0x24` packet) has not been
-run, so no option is recorded as incremental and no option is recorded as
-retaining every unimported stroke across an interruption. Until it is run,
-`nextAndReserve` is kept only because its non-destructive behavior is what the two
-completed reads observed; the transfer option question stays open.
+### Incremental transfer experiment, 2026-10-19
+
+Tasks 1.1-1.3 ran the known-old/known-new experiment against the physical A1. The
+pen held 8,087 strokes across 22 pages of note 700, section 3, owner 27, and the
+library held those same 8,087 identities, so the whole pen was the known-old set.
+Five strokes were then written on page 1 by hand as the known-new set, and the runs
+below re-read the pen. Each attempt was a headless acceptance run
+(`NEOBRIDGE_ACCEPTANCE_TRACE`) with the option varied by
+`NEOBRIDGE_ACCEPTANCE_TRANSFER_OPTION`; each transcript states its own option on its
+first line, and the archived transcripts are in
+`Tests/Fixtures/raw/acceptance-2026-10-19-transfer-option/`.
+
+| Field | Value |
+| --- | --- |
+| Date | 2026-10-19 |
+| Host | Jamess-MacBook-Pro-M4.local |
+| macOS version | 27.2 (26B5112a) |
+| Xcode version | 27.1 (27A9275) |
+| Pen model | `NWP-F151` |
+| Pen firmware | `3.00` |
+| Reported protocol version | `2.23`, from the device record |
+| App build | `Scripts/remote-mac-build.sh`, release configuration |
+| Known-old set | 8,087 fingerprints, from the library snapshot `library-before-mark.sqlite` |
+| Known-new set | 5 strokes written on page 1 |
+| Transcripts | sanitized packet logs, no Bluetooth address, serial number, or authentication material |
+
+| Run | Option | Observed |
+| --- | --- | --- |
+| `opt02-a` | `0x02` | 8,092 strokes, 718 `0x24` packets, 718 acknowledgements, final packet 718 with operation Stop; the 5 new strokes are in the returned set |
+| `opt02-b` | `0x02`, repeated | identical to `opt02-a`: same counts, same final packet, and a byte-for-byte identical fingerprint set |
+| `opt00-a` | `0x00` | the `0xA3` summary arrives (15 bytes) and then no `0x24` packet ever does; the read fails as a timeout with 0 strokes |
+| `opt00-abort` | `0x00`, abort armed | identical to `opt00-a`: the interrupt is unreachable because no packet arrives |
+| `opt02-abort` | `0x02`, abort when packet 100 arrives | fails after 99 assembled packets: "the transfer ended after 99 packet(s) without an end packet" |
+| `opt02-abort-recovery` | `0x02` | 8,092 strokes, 0 duplicates, 8,092 identities identical to `opt02-a` |
+| `opt00-abort-recovery` | `0x02` | 8,092 strokes, 0 duplicates, 8,092 identities identical to `opt02-a` |
+
+Conclusions:
+
+- **Neither option is incremental.** Both completed reads returned every stroke,
+  including the 5 the library already held, and the repeat returned the identical
+  identity set, so `nextAndReserve` does not advance a cursor. Incremental
+  behaviour has to come from the host, which is what the library's fingerprint
+  deduplication provides.
+- **`notNextTransfer` does not transfer at all on this pen.** It answers the `0xA3`
+  request and then sends nothing, so it is not a slower or page-scoped read. It has
+  a second effect: after the abandoned attempt the pen answered no further `0x23`
+  request, for either option, until it was switched off and on again. An abandoned
+  `nextAndReserve` transfer did not do that, which is how the two options were told
+  apart beyond the packet count.
+- **An interrupted `nextAndReserve` transfer loses nothing.** The run that stopped
+  after 99 packets was followed by a read that returned every stroke, including the
+  5 that no read had imported yet, with identities identical to a completed read.
+  This is what the `interruptedTransferRetention` gate condition asks for, for this
+  option on this pen; recording it as a verdict belongs to the deletion tasks, and
+  the gate stays closed until all four conditions and a command scope are settled.
+- **`nextAndReserve` remains the only option this build may send**, and the only
+  one with completed-transfer evidence.
+
+The experiment read the pen twice with each option, so the cursor question is
+settled by repetition rather than by one read.
 
 ## Deletion evidence gate
 
@@ -331,7 +380,7 @@ than an edit to a boolean. Four conditions must each be `safe`:
 | `payloadFraming` | the request payload layout and the response framing that answers it | pending — no A1 trace |
 | `deletionScope` | that the command removes exactly the verified data, including when newer strokes exist on the same page or note | pending — no A1 trace |
 | `responseMeaning` | whether `0xA5`/`0xA7` means acceptance of the command or completed removal of the requested scope | pending — no A1 trace |
-| `interruptedTransferRetention` | that an interrupted transfer leaves every not-yet-imported stroke retrievable | pending — no A1 trace |
+| `interruptedTransferRetention` | that an interrupted transfer leaves every not-yet-imported stroke retrievable | trace exists, verdict not recorded — the 2026-10-19 transfer-option experiment (`opt02-abort`, `opt02-abort-recovery`) shows a `nextAndReserve` read interrupted after 99 packets leaves all 8,092 identities, including the 5 no read had imported, retrievable by the next read. Recording it as a verdict is a deliberate step, and it would not open the gate while the other three conditions stand |
 
 The proven command scope is also unset: no trace has settled whether `0x25` is
 note-scoped and `0x27` page-scoped, or whether both take a page range. A trace's

@@ -7,24 +7,17 @@ import NeoCore
 /// The physical-A1 acceptance in `Tests/Hardware/README.md` needs the app to read
 /// the pen, save it, write its files, and record the framed bytes it sent, and a
 /// menu-bar app cannot be driven into that from a script without an accessibility
-/// grant. The same binary therefore takes this path when
-/// `NEOBRIDGE_ACCEPTANCE_TRACE` names a file: it builds the same controller the UI
-/// uses, starts one read, waits for it to finish, writes the transcript, and exits
+/// grant. The same binary therefore takes this path when the acceptance
+/// environment names a transcript: it builds the same controller the UI uses,
+/// starts one read, waits for it to finish, writes the transcript, and exits
 /// non-zero when the read did not complete.
 ///
 /// The run is the real thing: the same adapter, transport, runner, portable
 /// session, library, and publisher, over the real radio. Only the presentation is
-/// skipped.
+/// skipped. ``PenAcceptanceOptions`` owns the environment, and it also carries the
+/// few settings the checklist varies, so one binary can run every row: the
+/// transfer option, the cleanup intent, and an interrupted transfer.
 enum NeoBridgeAcceptance {
-    /// The environment variable that selects this mode and names the transcript.
-    static let traceEnvironmentKey = "NEOBRIDGE_ACCEPTANCE_TRACE"
-
-    /// The environment variable that names the export folder.
-    ///
-    /// A headless run cannot open a folder picker, so the folder comes from the
-    /// environment. The interface stores a security-scoped bookmark instead.
-    static let exportDirectoryEnvironmentKey = "NEOBRIDGE_EXPORT_DIRECTORY"
-
     /// How long the whole attempt may take before the run is abandoned.
     static let timeout: TimeInterval = 180
 
@@ -35,32 +28,33 @@ enum NeoBridgeAcceptance {
     /// keeps it from advertising for the next run.
     static let disconnectSettle: TimeInterval = 1.5
 
-    /// The transcript path, or `nil` for a normal UI launch.
-    static var traceURL: URL? {
-        guard let path = ProcessInfo.processInfo.environment[traceEnvironmentKey],
-            !path.isEmpty
-        else { return nil }
-        return URL(fileURLWithPath: path)
-    }
-
-    /// The export folder for this run, or `nil` to store without exporting.
-    static var exportDirectory: String? {
-        guard let path = ProcessInfo.processInfo.environment[exportDirectoryEnvironmentKey],
-            !path.isEmpty
-        else { return nil }
-        return path
-    }
-
     /// Runs one attempt and exits. Never returns.
     ///
-    /// - Parameter traceURL: Where to write the transcript.
+    /// - Parameter options: The acceptance options this process was started with.
     @MainActor
-    static func run(traceURL: URL) -> Never {
+    static func run(options: PenAcceptanceOptions) -> Never {
+        let traceURL = options.traceURL
         let trace = PenTrafficLog()
+        trace.record(
+            "run transferOption=\(options.transferOption.argumentName)"
+                + "(0x\(String(format: "%02X", options.transferOption.rawValue)))"
+                + " cleanup=\(options.cleanupMode.argumentName)"
+                + " abortAtPacket=\(options.abortAtPacket.map(String.init) ?? "none")"
+        )
         let controller = PenSyncAppComposition.makeController(
             trace: trace,
-            exportDirectory: exportDirectory
+            exportDirectory: options.exportDirectory,
+            acceptance: options
         )
+
+        // The intent is set through the same API the menu uses, so a run that asks
+        // for retention takes the same path a person choosing it takes.
+        switch options.cleanupMode {
+        case .keepOnPen:
+            controller.retainPenDataForThisSync()
+        case .deleteAfterAcknowledge:
+            controller.intendCleanupForThisSync()
+        }
 
         controller.readPenData()
 

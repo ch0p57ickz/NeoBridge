@@ -90,6 +90,7 @@ final class PenSessionTests: XCTestCase {
         bootstrap: PenOfflineDiscoveryBootstrap = .neoSDK3,
         timeouts: PenSessionTimeouts = .default,
         versionPolicy: ProtocolVersionPolicy = .neoSDK3,
+        transferOption: OfflineReadTransferOption = .nextAndReserve,
         recorder: StateRecorder? = nil
     ) -> PenSession {
         var onStateChange: (@Sendable (PenSessionState) -> Void)?
@@ -101,6 +102,7 @@ final class PenSessionTests: XCTestCase {
             versionPolicy: versionPolicy,
             timeouts: timeouts,
             bootstrap: bootstrap,
+            transferOption: transferOption,
             onStateChange: onStateChange
         )
     }
@@ -349,6 +351,33 @@ final class PenSessionTests: XCTestCase {
         for payload in dataRequestPayloads {
             XCTAssertEqual(payload[0], OfflineReadTransferOption.nextAndReserve.rawValue)
             XCTAssertEqual(payload[1], OfflineCompressionOption.none.rawValue)
+        }
+    }
+
+    /// The session sends the option it was built with, so the acceptance run can
+    /// vary it while the experiment establishing an incremental option runs.
+    func testSessionSendsTheTransferOptionItWasBuiltWith() async throws {
+        let chunks = try sessionChunks()
+        let transport = FakePenTransport(chunks: chunks.all)
+        let session = makeSession(transport: transport, transferOption: .notNextTransfer)
+
+        _ = try await session.run()
+
+        let dataRequestPayloads = transport.sentChunks.compactMap { chunk -> [UInt8]? in
+            var decoder = PenFrameDecoder()
+            guard case .frame(let frame)? = decoder.ingest(chunk).first,
+                frame.command == .offlineDataRequest1
+            else { return nil }
+            return frame.payload
+        }
+
+        XCTAssertEqual(dataRequestPayloads.count, 2, "one 0x23 per discovered note")
+        for payload in dataRequestPayloads {
+            XCTAssertEqual(
+                payload[0],
+                OfflineReadTransferOption.notNextTransfer.rawValue,
+                "the option the session was built with is the one it sends"
+            )
         }
     }
 

@@ -24,6 +24,12 @@ A later run on the same day, recorded under [Save-and-export
 acceptance](#save-and-export-acceptance-add-persistence-and-deterministic-export),
 exercised the durable save and deterministic export path against the same pen.
 
+A third run on the same day, recorded under [Transfer-option
+acceptance](#transfer-option-acceptance-add-incremental-sync-and-pen-cleanup),
+established which `0x23` transfer option the pen supports by reading with each
+candidate, interrupting a transfer, and re-reading. A fourth, single read made
+retention the intent and confirmed that no deletion command is sent.
+
 The unit suites are not a substitute for this run: they use a fake transport and
 fixture frames, and nothing in them proves how the physical pen behaves. The run
 also found three defects that the unit suites could not have found, all now fixed: a
@@ -70,6 +76,8 @@ completed read and 1 for a failed one.
 
 The transcript is the packet log. It holds, in order:
 
+- `run` first, naming the transfer option, cleanup intent, and any abort the run was
+  started with, so a transcript states which experiment it belonged to.
 - `outbound <hex> command=<id>` for every frame the host sent. Frames are small,
   and no outbound frame carries a device identifier: the `0x01` connection code
   is the SDK's sixteen zero bytes.
@@ -80,13 +88,64 @@ The transcript is the packet log. It holds, in order:
   `docs/protocol-a1.md`.
 - `version`, `note`, `page`, and `stroke` lines for a completed read, so the
   assembled counts can be checked against a mark and the `0xA3` summary can be
-  compared with the transfer.
+  compared with the transfer. Each `stroke` line ends with `fp=<hex>`, the first
+  16 characters of the stroke's replay fingerprint: that is the identity two runs
+  and the library are compared by.
 - `totals` and `outboundCommands`, which list every outbound command identifier
   in the order first sent. The deletion check reads the last line.
 
 No Bluetooth addresses, serial numbers, or authentication material reach the
 transcript, so it can be kept. Raw captures still belong in
 `Tests/Fixtures/raw/`, which is git-ignored.
+
+### Varying the attempt
+
+Three more environment variables vary how the headless run reads the pen, so one
+built binary runs the transfer-option experiment and the interrupted-transfer case
+as well as an ordinary read:
+
+| Variable | Effect | Default |
+| --- | --- | --- |
+| `NEOBRIDGE_ACCEPTANCE_TRANSFER_OPTION` | The `0x23` transfer option: `notNextTransfer`, `nextAndReserve`, or the option byte in decimal or hexadecimal. | `nextAndReserve` |
+| `NEOBRIDGE_ACCEPTANCE_CLEANUP` | The cleanup intent: `keepOnPen` or `deleteAfterAcknowledge`, also as `keep` and `cleanup`. | the policy default, cleanup |
+| `NEOBRIDGE_ACCEPTANCE_ABORT_AT_PACKET` | Drops the pen link when that `0x24` packet arrives, so the transfer fails part way. The packet is not delivered, and the transcript's abort line reports exactly how many packets were dropped, so the read's assembled count is never left to be inferred. | unset |
+
+A value that cannot be understood exits 2 with the accepted values rather than
+running a different experiment than the one asked for.
+
+> **Careful with `notNextTransfer`.** It is kept in the checklist because tasks 1.1
+> and 1.3 need it, but the 2026-10-19 run recorded it as transferring nothing: the
+> pen answers the summary request and then sends no packet at all, and afterwards it
+> answers no further `0x23` request, for either option, until it is switched off and
+> on again. Expect to power-cycle the pen after a `notNextTransfer` run, and expect
+> its transcript to contain no strokes.
+
+The transfer-option experiment (tasks 1.1 to 1.3) uses these like this, with a
+known mark written before the first read:
+
+```bash
+BUNDLE=Apps/NeoBridgeMac/.build/bundle/NeoBridgeMac.app/Contents/MacOS/NeoBridgeMac
+
+# A read with each option, twice each, to see whether either advances a cursor.
+NEOBRIDGE_ACCEPTANCE_TRACE=/tmp/a1-opt00-a.txt \
+NEOBRIDGE_ACCEPTANCE_TRANSFER_OPTION=notNextTransfer "$BUNDLE"; echo "exit=$?"
+NEOBRIDGE_ACCEPTANCE_TRACE=/tmp/a1-opt00-b.txt \
+NEOBRIDGE_ACCEPTANCE_TRANSFER_OPTION=notNextTransfer "$BUNDLE"; echo "exit=$?"
+NEOBRIDGE_ACCEPTANCE_TRACE=/tmp/a1-opt02-a.txt \
+NEOBRIDGE_ACCEPTANCE_TRANSFER_OPTION=nextAndReserve "$BUNDLE"; echo "exit=$?"
+NEOBRIDGE_ACCEPTANCE_TRACE=/tmp/a1-opt02-b.txt \
+NEOBRIDGE_ACCEPTANCE_TRANSFER_OPTION=nextAndReserve "$BUNDLE"; echo "exit=$?"
+
+# An interrupted transfer with each option, then a re-read with the safe option.
+NEOBRIDGE_ACCEPTANCE_TRACE=/tmp/a1-opt00-abort.txt \
+NEOBRIDGE_ACCEPTANCE_TRANSFER_OPTION=notNextTransfer \
+NEOBRIDGE_ACCEPTANCE_ABORT_AT_PACKET=100 "$BUNDLE"; echo "exit=$?"
+NEOBRIDGE_ACCEPTANCE_TRACE=/tmp/a1-opt00-abort-recovery.txt "$BUNDLE"; echo "exit=$?"
+```
+
+The interrupted run is expected to exit 1: its transfer did not complete. The
+re-read after it must exit 0 and carry every stroke, which is what proves an
+interrupted transfer loses nothing.
 
 ## Before the run
 
@@ -247,6 +306,24 @@ status was 0.
 | Export content is inspected for device secrets | `NeoExportTests`, `Tests/Integration` | No exported file contains a Bluetooth address, serial number, or authentication material | **Pass.** A scan of all 66 files found no pen model, firmware, serial number, Bluetooth address, or `NWP-F151` string. |
 | Successful import | `PenSessionTests`, `BluetoothPenSyncRunnerTests` | The pen's strokes remain on the pen and no deletion request is sent | **Pass.** The transcript's `outboundCommands` line lists only `0x01`, `0x21`, `0x22`, `0x23`, and `0xA4` (707 acknowledgements); no `0x25` or `0x27` appears anywhere in the transcript. |
 
+## Transfer-option acceptance (add-incremental-sync-and-pen-cleanup)
+
+The transfer-option requirement needs a known-old and a known-new stroke set, a read
+with each candidate option, an interrupted transfer, and the read that follows it.
+The run below did exactly that on 2026-10-19, varying the option with
+`NEOBRIDGE_ACCEPTANCE_TRANSFER_OPTION` and interrupting a transfer with
+`NEOBRIDGE_ACCEPTANCE_ABORT_AT_PACKET`. The run record, the per-run options, and the
+conclusions are in the "Incremental transfer experiment" section of
+`docs/protocol-a1.md`; the transcripts and the pre-experiment library snapshot are
+archived under `Tests/Fixtures/raw/acceptance-2026-10-19-transfer-option/`.
+
+| Scenario | Automated coverage | The hardware run must confirm | Pass / Fail |
+| --- | --- | --- | --- |
+| `notNextTransfer` transfers nothing | `PenSessionTests` pins the option byte | The `0xA3` summary arrives and no `0x24` packet follows, so the option cannot be mistaken for a slower read | **Pass.** `opt00-a` and `opt00-abort` each received the 15-byte summary and then timed out with zero strokes. The pen then answered no further `0x23` request, for either option, until it was switched off and on again. |
+| `nextAndReserve` re-transfers every stroke | `PenSessionTests`, `PenLibraryImporterTests` | A repeated read returns every stroke, including the ones already stored | **Pass.** `opt02-a` and `opt02-b` each returned 8,092 strokes in 718 packets; the import added 5 then 0, and the two fingerprint sets are identical. |
+| An interrupted transfer loses nothing | `PenSessionTests`, `BluetoothPenSyncRunnerTests` | A read that stops before the end packet is followed by a read that returns every stroke, including any no read has imported yet | **Pass.** `opt02-abort` failed after 99 assembled packets; `opt02-abort-recovery` returned all 8,092 identities, including the 5 that no read had imported. |
+| Neither option deletes | `PenSessionTests` | No `0x25` or `0x27` appears in any transcript of the experiment | **Pass.** Every transcript's `outboundCommands` line lists only `0x01`, `0x04`, `0x21`, `0x22`, `0x23`, and `0xA4`. |
+
 ## pen cleanup
 
 These rows need a real A1 **and** the deletion evidence gate open. The gate is
@@ -259,7 +336,7 @@ them can be reached yet. They stay unchecked until a trace opens the gate.
 | Default cleanup after a verified import and export | `OfflineSessionIntegrationTests`, `PenLibraryImporterTests` | The pen receives exactly one deletion command for the read's own pages, and its response is proven to mean that scope was removed | **Unverified.** The gate is closed, so no deletion command is reachable. |
 | Library and published copies survive deletion | `OfflineSessionIntegrationTests`, `FilePublicationTests` | Every deleted page is still readable in the library and can be published again | **Unverified.** Requires a completed deletion. |
 | Newer unverified strokes are untouched | `PenLibraryImporterTests`, `OfflineSessionIntegrationTests` | Strokes written after the read, on the same page or note, remain on the pen | **Unverified.** Requires a completed deletion. |
-| Retaining mode sends no deletion through the whole stack | `PenSessionTests`, `PenLibraryImporterTests`, `NeoBridgeMacCoreTests` | A headless retaining run's `outboundCommands` line contains no `0x25` or `0x27` | **Unverified.** The headless retaining path has not been run. |
+| Retaining mode sends no deletion through the whole stack | `PenSessionTests`, `PenLibraryImporterTests`, `NeoBridgeMacCoreTests` | A headless retaining run's `outboundCommands` line contains no `0x25` or `0x27` | **Pass.** The retaining run recorded `cleanup=keepOnPen` on its `run` line, completed with 8,092 strokes and 0 duplicates, and its `outboundCommands` line lists only `0x01`, `0x04`, `0x21`, `0x22`, `0x23`, and `0xA4`. |
 
 ## After the run
 
