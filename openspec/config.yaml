@@ -41,7 +41,7 @@ operations:
   apply:
     guidance:
       - "Never claim a BLE feature or protocol command works without official SDK evidence or physical hardware validation."
-      - "Keep destructive pen cleanup disabled (keepOnPen mode) until hardware acceptance tests pass on real A1 hardware."
+      - "Keep destructive pen cleanup unreachable until the deletion evidence gate records a safe verdict for payload framing, deletion scope, response meaning, and interrupted-transfer retention, backed by physical A1 traces. Cleanup is the default intent, but the intent alone never sends a deletion; the gate is data, not a boolean."
       - "Never import Apple-only frameworks into portable packages."
       - "Verify SQLite commits and file exports before confirming any sync batch."
       - "Never copy Apple signing secrets or credentials to the Linux host."

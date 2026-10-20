@@ -19,6 +19,7 @@ final class BluetoothPenSyncRunnerTests: XCTestCase {
     func testReadsACompleteSessionAndReportsEveryStage() async throws {
         let connection = FakePenBluetoothConnection(inbound: [
             FakePenFrames.versionInfo(),
+            FakePenFrames.penState(),
             FakePenFrames.noteList(notes: []),
         ])
         let central = FakePenBluetoothCentral(
@@ -37,6 +38,9 @@ final class BluetoothPenSyncRunnerTests: XCTestCase {
         XCTAssertEqual(summary.strokeCount, 0)
         XCTAssertEqual(summary.dotCount, 0)
         XCTAssertEqual(summary.distinctPageCount, 0)
+        XCTAssertEqual(read.penState?.batteryLevel, 94)
+        XCTAssertEqual(read.penState?.isCharging, false)
+        XCTAssertEqual(read.penState?.memoryUsed, 10)
         // A connected pen stops advertising, so a completed read has to release
         // the link or the next read could not find the pen.
         XCTAssertTrue(connection.isClosed, "a completed read leaves the pen disconnected")
@@ -45,6 +49,7 @@ final class BluetoothPenSyncRunnerTests: XCTestCase {
     func testNeverSendsADeletionCommand() async throws {
         let connection = FakePenBluetoothConnection(inbound: [
             FakePenFrames.versionInfo(),
+            FakePenFrames.penState(),
             FakePenFrames.noteList(notes: []),
         ])
         let central = FakePenBluetoothCentral(
@@ -73,6 +78,7 @@ final class BluetoothPenSyncRunnerTests: XCTestCase {
         // request, and sends one packet that completes the transfer.
         let connection = FakePenBluetoothConnection(inbound: [
             FakePenFrames.versionInfo(),
+            FakePenFrames.penState(),
             FakePenFrames.noteList(notes: [(FakePenFrames.sectionOwnerId, FakePenFrames.note)]),
             FakePenFrames.pageList(
                 sectionOwnerId: FakePenFrames.sectionOwnerId,
@@ -139,6 +145,7 @@ final class BluetoothPenSyncRunnerTests: XCTestCase {
     func testRecordsACompletedReadInTheTranscript() async throws {
         let connection = FakePenBluetoothConnection(inbound: [
             FakePenFrames.versionInfo(),
+            FakePenFrames.penState(),
             FakePenFrames.noteList(notes: []),
         ])
         let central = FakePenBluetoothCentral(
@@ -158,7 +165,7 @@ final class BluetoothPenSyncRunnerTests: XCTestCase {
         XCTAssertTrue(contents.contains("state Scanning for a pen"))
         XCTAssertTrue(contents.contains("version text="), "the run record needs the reported version")
         XCTAssertTrue(contents.contains("result strokes=0 dots=0 pages=0 notes=0"))
-        XCTAssertTrue(contents.contains("outboundCommands 0x01,0x21"))
+        XCTAssertTrue(contents.contains("outboundCommands 0x01,0x04,0x21"))
         XCTAssertTrue(contents.contains("state Disconnected"), "the transcript shows the link was released")
         XCTAssertTrue(connection.writtenBytes.isEmpty == false, "the handshake must still be sent")
     }

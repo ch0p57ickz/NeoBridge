@@ -133,6 +133,65 @@ final class PenSessionTests: XCTestCase {
         XCTAssertFalse(result.isEmpty)
     }
 
+    func testPenStateQueryFollowsHandshakeAndPrecedesDiscovery() async throws {
+        let version = try sessionChunks().version
+        var payload = [UInt8](repeating: 0, count: 64)
+        payload[15] = 10
+        payload[20] = 94
+        let state = try XCTUnwrap(PenFrameEncoder.encode(
+            command: .responsePenState, payload: payload, errorCode: 0
+        ))
+        let notes = try XCTUnwrap(PenFrameEncoder.encode(
+            command: .responseOfflineNoteList, payload: [0, 0], errorCode: 0
+        ))
+        let transport = FakePenTransport(chunks: [version, state, notes])
+        let session = PenSession(transport: transport, queryPenState: true)
+
+        let result = try await session.run()
+
+        XCTAssertEqual(result.penState?.batteryLevel, 94)
+        XCTAssertEqual(result.penState?.isCharging, false)
+        XCTAssertEqual(result.penState?.memoryUsed, 10)
+        XCTAssertEqual(transport.sentChunks, [
+            try XCTUnwrap(PenRequest.versionInfo()),
+            try XCTUnwrap(PenRequest.penState()),
+            try XCTUnwrap(PenRequest.noteList())
+        ])
+    }
+
+    func testRejectedPenStateStopsBeforeOfflineDiscovery() async throws {
+        let version = try sessionChunks().version
+        let rejection = try XCTUnwrap(PenFrameEncoder.encode(
+            command: .responsePenState, payload: [], errorCode: 1
+        ))
+        let transport = FakePenTransport(chunks: [version, rejection])
+        let session = PenSession(transport: transport, queryPenState: true)
+
+        do {
+            _ = try await session.run()
+            XCTFail("expected pen state rejection")
+        } catch let error as PenSessionError {
+            XCTAssertEqual(error, .protocolFailure(.commandFailed(command: .responsePenState, code: 1)))
+        }
+        XCTAssertEqual(transport.sentChunks.count, 2)
+    }
+
+    func testPenStateDecoderChecksFlagsAndBounds() {
+        XCTAssertEqual(PenRequest.penState(), [0xC0, 0x04, 0x00, 0x00, 0xC1])
+        var payload = [UInt8](repeating: 0, count: 64)
+        payload[15] = 100
+        payload[20] = 0x80 | 42
+        XCTAssertEqual(PenState(payload: payload)?.batteryLevel, 42)
+        XCTAssertEqual(PenState(payload: payload)?.isCharging, true)
+        XCTAssertEqual(PenState(payload: payload)?.memoryUsed, 100)
+        XCTAssertNil(PenState(payload: Array(payload.dropLast())))
+        payload[15] = 101
+        XCTAssertNil(PenState(payload: payload))
+        payload[15] = 0
+        payload[20] = 0x80 | 101
+        XCTAssertNil(PenState(payload: payload))
+    }
+
     func testCountsComeFromThePacketsNotTheLaggingSummary() async throws {
         let fixture = try sessionFixture()
         let session = makeSession(transport: FakePenTransport(chunks: try fixture.decodedChunks()))
@@ -189,21 +248,115 @@ final class PenSessionTests: XCTestCase {
         XCTAssertEqual(chunks.version, capturedResponse)
     }
 
-    func testDeletionCommandsStayBlockedAndUnencodable() throws {
+    func testDeletionCommandsStayGatedAndUnencodable() throws {
         // The keep-on-pen guarantee asserted at the evidence layer: neither
-        // deletion command may be sent, and neither has a recorded framing, so
-        // neither can even be encoded.
+        // deletion command may be sent while the evidence gate is closed, and
+        // neither has a recorded framing, so neither can even be encoded.
         for command in [PenCommand.deleteOfflineNoteRequest, .deleteOfflinePageRequest] {
+            let authorization = CommandEvidenceRegistry.neoSDK3.authorization(for: command)
+            guard case .gated(let reason) = authorization else {
+                return XCTFail("expected \(command) to be gated, got \(authorization)")
+            }
+            XCTAssertTrue(reason.contains("deletion evidence gate"), reason)
             XCTAssertFalse(
-                CommandEvidenceRegistry.neoSDK3.maySendProductionRequest(command),
-                "\(command) must not be sendable while cleanup stays on the pen"
-            )
-            XCTAssertFalse(
-                CommandEvidenceRegistry.neoSDK3.authorization(for: command).allowsCompletedStroke
+                authorization.allowsCompletedStroke,
+                "\(command) must not produce a stroke"
             )
             XCTAssertNil(command.frameKind, "\(command) has no recorded framing")
             XCTAssertNil(PenFrameEncoder.encode(command: command, payload: [0, 0, 0, 0]))
         }
+    }
+
+    // MARK: - Transfer option
+
+    /// The two read-path `0x23` option bytes, pinned as sanitized bytes rather
+    /// than as a captured transcript.
+    func testBothReadTransferOptionBytesArePinned() throws {
+        let notNext = try XCTUnwrap(
+            PenRequest.offlineData(for: firstNote, transferOption: .notNextTransfer)
+        )
+        let reserve = try XCTUnwrap(
+            PenRequest.offlineData(for: firstNote, transferOption: .nextAndReserve)
+        )
+
+        XCTAssertEqual(OfflineReadTransferOption.notNextTransfer.rawValue, 0x00)
+        XCTAssertEqual(OfflineReadTransferOption.nextAndReserve.rawValue, 0x02)
+
+        let notNextPayload = try XCTUnwrap(Self.payload(of: notNext))
+        let reservePayload = try XCTUnwrap(Self.payload(of: reserve))
+        XCTAssertEqual(notNextPayload[0], 0x00, "notNextTransfer is option 0")
+        XCTAssertEqual(reservePayload[0], 0x02, "nextAndReserve is option 2")
+        XCTAssertEqual(notNextPayload[1], 0x00, "no compression")
+        XCTAssertEqual(reservePayload[1], 0x00, "no compression")
+
+        // Only the option byte differs, so the rest of the request is unchanged by
+        // the choice.
+        XCTAssertEqual(Array(notNextPayload.dropFirst()), Array(reservePayload.dropFirst()))
+    }
+
+    /// The deleting option is not the default, and the read path has no route to
+    /// it: `PenRequest.offlineData(for:)` takes a type without that member.
+    func testTheDeletingOptionIsNotTheDefaultAndIsUnreachableFromTheReadPath() throws {
+        let defaultFrame = try XCTUnwrap(PenRequest.offlineData(for: firstNote))
+        let deletingFrame = try XCTUnwrap(
+            PenRequest.offlineData(
+                sectionOwnerId: firstNote.sectionOwnerId,
+                noteId: firstNote.note,
+                transferOption: .nextAndDelete,
+                compressionOption: .none
+            )
+        )
+
+        XCTAssertEqual(OfflineTransferOption.nextAndDelete.rawValue, 0x01)
+        let deletingPayload = try XCTUnwrap(Self.payload(of: deletingFrame))
+        XCTAssertEqual(deletingPayload[0], 0x01, "the deleting option is wire value 1")
+        XCTAssertNotEqual(
+            defaultFrame,
+            deletingFrame,
+            "the default request must not be the deleting option"
+        )
+
+        let defaultPayload = try XCTUnwrap(Self.payload(of: defaultFrame))
+        XCTAssertEqual(defaultPayload[0], OfflineReadTransferOption.nextAndReserve.rawValue)
+
+        // Every option the read path can send leaves the pen's data in place.
+        for option in OfflineReadTransferOption.allCases {
+            XCTAssertNotEqual(
+                option.option,
+                .nextAndDelete,
+                "\(option) must not delete during a transfer"
+            )
+        }
+    }
+
+    /// The session's `0x23` frames carry the established non-destructive option.
+    func testSessionSendsTheEstablishedNonDestructiveTransferOption() async throws {
+        let chunks = try sessionChunks()
+        let transport = FakePenTransport(chunks: chunks.all)
+        let session = makeSession(transport: transport)
+
+        _ = try await session.run()
+
+        let dataRequestPayloads = transport.sentChunks.compactMap { chunk -> [UInt8]? in
+            var decoder = PenFrameDecoder()
+            guard case .frame(let frame)? = decoder.ingest(chunk).first,
+                frame.command == .offlineDataRequest1
+            else { return nil }
+            return frame.payload
+        }
+
+        XCTAssertEqual(dataRequestPayloads.count, 2, "one 0x23 per discovered note")
+        for payload in dataRequestPayloads {
+            XCTAssertEqual(payload[0], OfflineReadTransferOption.nextAndReserve.rawValue)
+            XCTAssertEqual(payload[1], OfflineCompressionOption.none.rawValue)
+        }
+    }
+
+    /// The payload of one framed request, or `nil` when it is not one frame.
+    private static func payload(of frame: [UInt8]) -> [UInt8]? {
+        var decoder = PenFrameDecoder()
+        guard case .frame(let decoded)? = decoder.ingest(frame).first else { return nil }
+        return decoded.payload
     }
 
     func testCompletedSyncSendsNoDeletionCommand() async throws {

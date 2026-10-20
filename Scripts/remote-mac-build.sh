@@ -38,7 +38,7 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     --help|-h)
-      sed -n '2,25p' "${BASH_SOURCE[0]}"
+      sed -n '2,21p' "${BASH_SOURCE[0]}"
       exit 0
       ;;
     *)
@@ -84,6 +84,10 @@ section "App build (SwiftPM)"
 
 # ---------------------------------------------------------------------------
 section "App build (Xcode)"
+# The verdict below keys on whether the gate actually ran, not on the skip
+# variable alone: a host without xcodebuild skips the gate without anyone
+# setting that variable, and a skipped gate is never full verification.
+XCODE_GATE_RAN=0
 XCODE_LOG="$BUILD_DIR/xcodebuild.log"
 if [[ "$SKIP_XCODE_GATE" == "1" ]]; then
   printf 'SKIPPED: SKIP_XCODE_GATE=1.\n'
@@ -111,6 +115,7 @@ else
     exit 1
   fi
   printf 'ok: the Xcode build succeeded.\n'
+  XCODE_GATE_RAN=1
 fi
 
 # ---------------------------------------------------------------------------
@@ -198,7 +203,7 @@ fi
 # ---------------------------------------------------------------------------
 section "Result"
 printf 'Built %s\n' "$BUNDLE"
-if [[ "$SKIP_XCODE_GATE" == "1" ]]; then
+if [[ "$XCODE_GATE_RAN" != "1" ]]; then
   printf 'INCOMPLETE: the Xcode build gate was skipped, so this run is not full verification.\n'
 else
   printf 'PASSED: portable packages verified, app built under SwiftPM and Xcode, bundle assembled.\n'

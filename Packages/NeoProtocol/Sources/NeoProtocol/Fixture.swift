@@ -285,7 +285,7 @@ extension PenProtocolError {
         case .commandFailed: return "commandFailed"
         case .unsupportedVersion: return "unsupportedVersion"
         case .unsupportedCommand: return "unsupportedCommand"
-        case .blockedCommand: return "blockedCommand"
+        case .gatedCommand: return "gatedCommand"
         }
     }
 }

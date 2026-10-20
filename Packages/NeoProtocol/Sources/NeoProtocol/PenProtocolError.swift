@@ -48,9 +48,9 @@ public enum PenProtocolError: Error, Hashable, Sendable {
     /// The command has no official SDK or physical-device evidence.
     case unsupportedCommand(command: PenCommand)
 
-    /// The command is wire-documented but must not be sent until a later gate
-    /// passes.
-    case blockedCommand(command: PenCommand, reason: String)
+    /// The command is wire-documented but gated behind an evidence gate that is
+    /// not yet open.
+    case gatedCommand(command: PenCommand, reason: String)
 }
 
 /// A decoded protocol frame.

@@ -105,6 +105,22 @@ To run the built app:
 open Apps/NeoBridgeMac/.build/bundle/NeoBridgeMac.app
 ```
 
+`Scripts/package-app.sh` turns that bundle into something that can travel. It builds
+through `remote-mac-build.sh` (or reuses the last bundle with `--skip-build`), signs
+with a Developer ID when `DEVELOPER_ID_APPLICATION` is set, notarizes when
+`NOTARY_PROFILE` and that identity are both set — a profile without an identity exits
+2 instead of shipping an unnotarized archive — and writes
+`Apps/NeoBridgeMac/.build/packages/NeoBridgeMac-<version>.zip`. With neither variable
+set it packages the ad-hoc bundle, which is refused by Gatekeeper on another Mac until
+its quarantine attribute is cleared. It repeats the build's own `PASSED`/`INCOMPLETE`
+verdict for a full run instead of computing one, and reports `INCOMPLETE` itself for
+`--skip-build`.
+
+```bash
+Scripts/package-app.sh
+Scripts/package-app.sh --skip-build --output ~/Desktop
+```
+
 `SKIP_XCODE_GATE=1` exists for a host whose Xcode installation cannot run
 `xcodebuild`. A run that uses it prints `INCOMPLETE` and must not be recorded as
 satisfying the Xcode gate.
@@ -138,8 +154,9 @@ with grep, so a violation fails verification instead of surfacing in review.
 - Do not claim that a protocol command or BLE feature works without official SDK
   evidence or a physical A1 trace. Leave unverified fields in `docs/protocol-a1.md`
   marked as pending.
-- Keep destructive pen cleanup in `keepOnPen` mode until hardware acceptance tests pass
-  on a real A1.
+- Keep destructive pen cleanup unreachable until the deletion evidence gate records
+  safe verdicts from physical A1 traces. Cleanup is the default intent, but the intent
+  alone never sends a deletion: the gate is data, not a boolean.
 - Sanitize any captured pen traffic: no Bluetooth addresses, serial numbers, or
   authentication material. Raw captures belong in `Tests/Fixtures/raw/`, which is
   git-ignored.

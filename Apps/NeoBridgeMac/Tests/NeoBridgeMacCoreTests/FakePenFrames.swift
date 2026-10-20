@@ -28,6 +28,18 @@ enum FakePenFrames {
         return frame(.responseVersionInfo, payload)
     }
 
+    /// The physical A1's 64-byte `0x84` response layout.
+    static func penState(
+        batteryLevel: UInt8 = 94,
+        isCharging: Bool = false,
+        memoryUsed: UInt8 = 10
+    ) -> [UInt8] {
+        var payload = [UInt8](repeating: 0, count: 64)
+        payload[15] = memoryUsed
+        payload[20] = batteryLevel | (isCharging ? 0x80 : 0)
+        return frame(.responsePenState, payload)
+    }
+
     /// An `0xA1` note list.
     ///
     /// - Parameter notes: One `(sectionOwnerId, note)` pair per entry.
@@ -71,6 +83,7 @@ enum FakePenFrames {
     ) -> [[UInt8]] {
         [
             versionInfo(),
+            penState(),
             noteList(notes: [(sectionOwnerId, note)]),
             pageList(sectionOwnerId: sectionOwnerId, note: note, pages: [1, 16]),
             offlineInfo(strokeCount: 0, uncompressedSize: 0),

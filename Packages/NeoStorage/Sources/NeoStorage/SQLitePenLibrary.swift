@@ -181,6 +181,19 @@ public actor SQLitePenLibrary: PenStrokeStore, PenImportBatchStore, PenCleanupJo
             """
         )
 
+        // The scope is separate from the state history so the journal can hold
+        // every state a request passed through while the scope is recorded once,
+        // before anything can be sent.
+        try connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS cleanup_requests (
+                batch_id TEXT PRIMARY KEY,
+                target TEXT NOT NULL,
+                pages TEXT NOT NULL
+            )
+            """
+        )
+
         if recorded == nil {
             let insert = try connection.prepare(
                 "INSERT INTO metadata (key, value) VALUES ('schema_version', ?)"
@@ -330,12 +343,32 @@ public actor SQLitePenLibrary: PenStrokeStore, PenImportBatchStore, PenCleanupJo
 
     // MARK: - PenCleanupJournal
 
-    public func record(_ state: PenCleanupState, batchID: UUID) async throws {
+    /// Records one cleanup state and, for the first record, the exact scope.
+    ///
+    /// The scope is written before the state, so a process that stops between the
+    /// two has a durable scope and a request that is not yet `requested`: a fresh
+    /// read can be compared with the recorded scope instead of a deletion being
+    /// repeated blindly.
+    public func record(_ state: PenCleanupState, scope: PenDeletionScope) async throws {
+        let encodedPages = try Self.encode(scope.pages)
+
         try connection.withTransaction {
+            let request = try connection.prepare(
+                """
+                INSERT INTO cleanup_requests (batch_id, target, pages)
+                VALUES (?, ?, ?)
+                ON CONFLICT(batch_id) DO NOTHING
+                """
+            )
+            try request.bind(1, scope.batchID.uuidString)
+            try request.bind(2, scope.target.rawValue)
+            try request.bind(3, encodedPages)
+            try request.run()
+
             let statement = try connection.prepare(
                 "INSERT INTO cleanup_journal (batch_id, state) VALUES (?, ?)"
             )
-            try statement.bind(1, batchID.uuidString)
+            try statement.bind(1, scope.batchID.uuidString)
             try statement.bind(2, state.rawValue)
             try statement.run()
         }
@@ -347,13 +380,58 @@ public actor SQLitePenLibrary: PenStrokeStore, PenImportBatchStore, PenCleanupJo
         )
         try statement.bind(1, batchID.uuidString)
         guard try statement.step() else { return nil }
-        return statement.text(0).flatMap(PenCleanupState.init(rawValue:))
+        return try Self.state(batchID: batchID, raw: statement.text(0))
+    }
+
+    public func recordedScope(batchID: UUID) async throws -> PenDeletionScope? {
+        let statement = try connection.prepare(
+            "SELECT target, pages FROM cleanup_requests WHERE batch_id = ?"
+        )
+        try statement.bind(1, batchID.uuidString)
+        guard try statement.step() else { return nil }
+        return try Self.scope(
+            batchID: batchID,
+            target: statement.text(0),
+            encodedPages: statement.text(1)
+        )
+    }
+
+    /// Every scope whose latest recorded state is `requested`, oldest first.
+    public func outstandingScopes() async throws -> [PenDeletionScope] {
+        let statement = try connection.prepare(
+            """
+            SELECT requests.batch_id, requests.target, requests.pages
+            FROM cleanup_requests AS requests
+            JOIN (
+                SELECT batch_id, state, MAX(id) AS latest
+                FROM cleanup_journal
+                GROUP BY batch_id
+            ) AS journal ON journal.batch_id = requests.batch_id
+            WHERE journal.state = ?
+            ORDER BY journal.latest
+            """
+        )
+        try statement.bind(1, PenCleanupState.requested.rawValue)
+
+        var scopes: [PenDeletionScope] = []
+        while try statement.step() {
+            guard let batchID = statement.text(0).flatMap(UUID.init(uuidString:)) else { continue }
+            scopes.append(
+                try Self.scope(
+                    batchID: batchID,
+                    target: statement.text(1),
+                    encodedPages: statement.text(2)
+                )
+            )
+        }
+        return scopes
     }
 
     /// Every cleanup state recorded for a batch, oldest first.
     ///
-    /// The whole history is what proves the journal is dormant: this change never
-    /// records `requested`, so no deletion was ever asked for.
+    /// The whole history is what shows the ordering the journal enforces: a
+    /// request reaches `requested` before any byte is sent, and `confirmed` only
+    /// when the pen proved removal of the recorded scope.
     public func recordedStates(batchID: UUID) async throws -> [PenCleanupState] {
         let statement = try connection.prepare(
             "SELECT state FROM cleanup_journal WHERE batch_id = ? ORDER BY id"
@@ -362,11 +440,52 @@ public actor SQLitePenLibrary: PenStrokeStore, PenImportBatchStore, PenCleanupJo
 
         var states: [PenCleanupState] = []
         while try statement.step() {
-            if let state = statement.text(0).flatMap(PenCleanupState.init(rawValue:)) {
-                states.append(state)
-            }
+            states.append(try Self.state(batchID: batchID, raw: statement.text(0)))
         }
         return states
+    }
+
+    /// Decodes a recorded cleanup state row.
+    ///
+    /// A row this build cannot read is refused rather than treated as no request:
+    /// "never requested" is the one answer that could let the same deletion be
+    /// sent a second time.
+    private static func state(batchID: UUID, raw: String?) throws -> PenCleanupState {
+        guard let raw, let state = PenCleanupState(rawValue: raw) else {
+            throw StorageError.unreadableCleanupState(batchID: batchID)
+        }
+        return state
+    }
+
+    /// Decodes a recorded scope row.
+    ///
+    /// A row this build cannot read is refused rather than treated as an empty
+    /// scope: an empty page list would read as "the pen no longer holds these
+    /// pages", which is exactly the claim a deletion outcome must not invent.
+    private static func scope(
+        batchID: UUID,
+        target: String?,
+        encodedPages: String?
+    ) throws -> PenDeletionScope {
+        guard let target = target.flatMap(PenDeletionTarget.init(rawValue:)) else {
+            throw StorageError.unreadableCleanupScope(batchID: batchID)
+        }
+        guard let encodedPages, let data = encodedPages.data(using: .utf8) else {
+            throw StorageError.unreadableCleanupScope(batchID: batchID)
+        }
+        let pages: [PageIdentity]
+        do {
+            pages = try JSONDecoder().decode([PageIdentity].self, from: data)
+        } catch {
+            throw StorageError.unreadableCleanupScope(batchID: batchID)
+        }
+        return PenDeletionScope(batchID: batchID, target: target, pages: pages)
+    }
+
+    /// Encodes the pages of a scope for storage.
+    private static func encode(_ pages: [PageIdentity]) throws -> String {
+        let data = try JSONEncoder().encode(pages)
+        return String(decoding: data, as: UTF8.self)
     }
 
     // MARK: - Stroke writes

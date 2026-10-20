@@ -21,7 +21,7 @@ public enum PenDecodeOutcome: Hashable, Sendable {
 /// Turns decoded protocol frames into normalized NeoCore events.
 ///
 /// The decoder enforces the evidence boundary: a command whose evidence is
-/// provisional is ignored, a blocked command fails, and an unsupported command
+/// provisional is ignored, a gated command fails, and an unsupported command
 /// or version returns an explicit unsupported result. Only production-authorized
 /// commands can emit events, so a provisional mapping can never produce a
 /// completed domain stroke.
@@ -32,7 +32,7 @@ public enum PenDecodeOutcome: Hashable, Sendable {
 /// The checks run in a fixed order: an unknown identifier, then a response that
 /// reports a non-zero error code, then the version gate, then the evidence
 /// boundary. A failed response is therefore reported as `commandFailed` even
-/// when the session version is unsupported or the command is blocked, because
+/// when the session version is unsupported or the command is gated, because
 /// the frame's own error code is what makes its payload untrustworthy.
 ///
 /// A dot can only become an event once the pen has reported a page. Until then
@@ -88,8 +88,8 @@ public struct PenEventDecoder: Sendable {
         switch registry.authorization(for: command) {
         case .unsupported:
             return .error(.unsupportedCommand(command: command))
-        case .blocked(let reason):
-            return .error(.blockedCommand(command: command, reason: reason))
+        case .gated(let reason):
+            return .error(.gatedCommand(command: command, reason: reason))
         case .inspectionOnly(let reason):
             return .ignored(reason: "provisional mapping is inspection only: \(reason)")
         case .production:

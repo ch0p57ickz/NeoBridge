@@ -91,6 +91,26 @@ report compression support.
 The full command table is in `NISDK3/Classes/Model/CMD.swift` and is mirrored by
 `PenCommand` in `Packages/NeoProtocol`.
 
+### Pen battery and storage state
+
+A separate physical NWP-F151 probe on 2026-10-19 established this exchange after
+the accepted `0x01` handshake. The A1 does not expose the standard BLE Battery
+Service (`0x180F`); these values come from the pen protocol. The host sent the
+zero-payload request `c0 04 00 00 c1` and the pen returned `0x84` with error
+code zero and a 64-byte payload. Neo iOS SDK 3.0 names this pair
+`REQ_PEN_STATE` / `RES_PEN_STATE`.
+
+| Payload offset | Meaning | Physical probe |
+| --- | --- | --- |
+| 15 | `memoryUsed`, percent of onboard storage in use | 10% |
+| 20, bits 0–6 | `battLevel`, battery percent | 94% |
+| 20, bit 7 | Charging flag | Clear (not charging) |
+
+The payload offsets exclude the frame's command, error code, and length.
+Production decoding requires exactly 64 payload bytes and percentages no greater
+than 100. This probe verifies the query and layout; the macOS app's end-to-end
+display still requires a Mac runner build and physical acceptance run.
+
 ### Offline discovery and list layouts
 
 The offline read path starts with a list request whose layout needs a starting
@@ -176,7 +196,7 @@ authoritative table. Summary:
 | Handshake | `VERSION_INFO` `0x01`, `RES_VERSION_INFO` `0x81` | official SDK + fixture | allowed |
 | Pen events | `0x63`, `0x69`, `0x6A`, `0x64`, `0x6B`, `0x65`, `0x6C` | official SDK + fixture | allowed |
 | Offline read | `0x21`, `0x22`, `0x23`, `0x24`, `0xA3`, `0xA4` | official SDK + fixture | allowed |
-| Offline deletion | `0x25`, `0x27` | official SDK | blocked until A1 acceptance |
+| Offline deletion | `0x25`, `0x27` | official SDK | gated on the deletion evidence; refused while any verdict is pending |
 | SoundPen and log | `0x73`, `0x74`, `0x75`, `0x76`, `0x77`, `0xF4`, `0xF5` | provisional | inspection only |
 | Authentication | `0x02`, `0x03` | none | unsupported |
 | Everything else | — | none | unsupported |
@@ -217,7 +237,7 @@ sensitive fields removed and stays git-ignored.
 | Every decoded dot passes the pen's own checksum | Yes, 70,199 of 70,199 dots |
 | Decoded transfer | 604 packets, 6,920 strokes, 70,199 dots, in a single transfer that ended at transfer position `2` |
 | No deletion request sent | Yes, `0x25` and `0x27` were never sent |
-| Pen cleanup mode | `keepOnPen` (enforced by `PenCleanupPolicy.deletionEnabled == false`) |
+| Pen cleanup mode | That build requested no cleanup, so the pen kept its copy. Deletion is unreachable in every build: `PenCleanupPolicy.deletionEnabled` derives from the deletion evidence gate, and the gate has no safe verdict |
 | Evidence reviewed by | Jimmy, 2026-10-18 |
 
 ## Pen session flow
@@ -260,8 +280,69 @@ The documented order below is the order the session sends and reads, and
 
 Every wait is bounded. Cancellation, timeout, interruption, and failure close the
 transport, and a retry starts a new session with fresh framing and assembly
-state. The session sends no `0x25` or `0x27` command, and the evidence table
-classifies neither, so neither can even be encoded.
+state. The session sends no `0x25` or `0x27` command, and the evidence table gates
+both behind the deletion evidence, so neither can even be encoded.
+
+## Offline transfer option
+
+`0x23` (`REQ_OFFLINE_DATA`) carries a `transOption` byte. The SDK documents three
+values, two of which leave the note's data in place:
+
+| Option | Value | Documented meaning |
+| --- | --- | --- |
+| `notNextTransfer` | `0x00` | Leave the note's data untouched |
+| `nextAndReserve` | `0x02` | Keep the note's data so a later read still finds it |
+| `nextAndDelete` | `0x01` | Delete the transferred data as part of the transfer |
+
+This build sends `nextAndReserve` (`0x02`) with `zipOption` none and a page count
+of zero, which is the option both physical reads above used.
+
+`PenRequest.offlineData(for:)` accepts only `OfflineReadTransferOption`, whose
+members are `notNextTransfer` and `nextAndReserve`. The deleting option is not a
+member of that type, so the read path has no route to it. `PenSessionTests` pins
+both bytes and asserts that the session sends the established non-destructive
+option.
+
+**Pending.** Whether either non-destructive option yields an incremental read is
+not established. Both physical reads so far returned everything: the 2026-10-19
+save-and-export read returned all 8,062 already-stored strokes and added 2, so
+`nextAndReserve` did not advance a cursor. The known-old/known-new experiment
+(tasks 1.1-1.3: a known set of existing strokes, known new strokes, and a read with
+each option, including a disconnect before the final `0x24` packet) has not been
+run, so no option is recorded as incremental and no option is recorded as
+retaining every unimported stroke across an interruption. Until it is run,
+`nextAndReserve` is kept only because its non-destructive behavior is what the two
+completed reads observed; the transfer option question stays open.
+
+## Deletion evidence gate
+
+The A1 has two offline deletion commands, `0x25` and `0x27`, answered by `0xA5`
+and `0xA7`. The SDK documents their identifiers, and this build records them at
+`officialSDK` level for that reason. No physical A1 trace has established their
+payload framing, what their answer means, or what they remove, so neither may be
+sent.
+
+`PenDeletionEvidence` turns that into data: `PenCleanupPolicy.deletionEnabled`
+derives from it, so opening the gate is a change to the recorded verdicts rather
+than an edit to a boolean. Four conditions must each be `safe`:
+
+| Condition | What a trace must establish | Verdict today |
+| --- | --- | --- |
+| `payloadFraming` | the request payload layout and the response framing that answers it | pending — no A1 trace |
+| `deletionScope` | that the command removes exactly the verified data, including when newer strokes exist on the same page or note | pending — no A1 trace |
+| `responseMeaning` | whether `0xA5`/`0xA7` means acceptance of the command or completed removal of the requested scope | pending — no A1 trace |
+| `interruptedTransferRetention` | that an interrupted transfer leaves every not-yet-imported stroke retrievable | pending — no A1 trace |
+
+The proven command scope is also unset: no trace has settled whether `0x25` is
+note-scoped and `0x27` page-scoped, or whether both take a page range. A trace's
+mere existence would not open the gate, and a trace showing unsafe behavior would
+close it.
+
+While the gate is closed, `CommandEvidenceRegistry.authorization(for:)` reports
+both commands as `.gated` and names the conditions that are not established, so no
+deletion frame can be encoded or sent. `VersionAndEvidenceTests` pins the gate: a
+proven `note` scope opens `0x25` and leaves `0x27` gated, and an `unsafe` verdict
+keeps both closed even when a scope is proven.
 
 ## Fixture coverage today
 
@@ -339,7 +420,7 @@ switched off and on again while a scan was already running.
 | Every decoded dot passes the pen's own checksum | Yes, no checksum or framing error over 3,053 notification chunks and 1,335,753 inbound bytes |
 | Acknowledgement pacing | Yes. 608 `0xA4` frames, one per `0x24` packet, operation `1` (Continue) through packet 607 and `0` (Stop) on packet 608 |
 | No deletion request sent | Yes. The outbound command list of every run contains only `0x01`, `0x21`, `0x22`, `0x23`, and `0xA4` |
-| Pen cleanup mode | `keepOnPen` (enforced by `PenCleanupPolicy.deletionEnabled == false`) |
+| Pen cleanup mode | That build requested no cleanup, so the pen kept its copy. Deletion is unreachable in every build: `PenCleanupPolicy.deletionEnabled` derives from the deletion evidence gate, and the gate has no safe verdict |
 | Link released after a read | Yes. Every completed read logged a Disconnected state, and each of four consecutive reads found the pen advertising again |
 
 The run's totals exceed the 6,920 strokes and 70,199 dots recorded on 2026-10-18
@@ -417,7 +498,7 @@ SVG, and Markdown), and exited zero.
 | Deterministic export | Yes, for the files written. All 66 targets published, none failed; every JSON file parsed and every SVG file was well-formed, and all 22 pages declared the same `viewBox="0 0 54.84 88.58"` canvas at `130.0mm x 210.0mm` |
 | No device identity in output | Yes. No exported file carries a pen model, firmware, serial number, or Bluetooth address |
 | No deletion request sent | Yes. The outbound command list contains only `0x01`, `0x21`, `0x22`, `0x23`, and `0xA4` |
-| Pen cleanup mode | `keepOnPen` (enforced by `PenCleanupPolicy.deletionEnabled == false`) |
+| Pen cleanup mode | That build requested no cleanup, so the pen kept its copy. Deletion is unreachable in every build: `PenCleanupPolicy.deletionEnabled` derives from the deletion evidence gate, and the gate has no safe verdict |
 
 The per-scenario rows are recorded under "Save-and-export acceptance" in
 `Tests/Hardware/README.md`. The byte counts match the files on disk, and the sanitized

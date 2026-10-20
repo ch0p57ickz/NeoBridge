@@ -14,14 +14,19 @@ public struct PenReadResult: Hashable, Sendable {
     /// The complete transfer, ready to commit.
     public let transfer: PenReadTransfer
 
-    public init(summary: PenSyncSummary, transfer: PenReadTransfer) {
+    /// The pen's battery and storage reading for this attempt.
+    public let penState: PenState?
+
+    public init(summary: PenSyncSummary, transfer: PenReadTransfer, penState: PenState? = nil) {
         self.summary = summary
         self.transfer = transfer
+        self.penState = penState
     }
 
     /// Splits an assembled session result into the summary and the transfer.
     public init(_ result: PenSessionResult) {
         self.summary = PenSyncSummary(result)
+        self.penState = result.penState
         self.transfer = PenReadTransfer(
             strokes: result.strokes,
             noteCount: result.notes.count
@@ -33,16 +38,24 @@ public struct PenReadResult: Hashable, Sendable {
 ///
 /// Storage and export are separate outcomes on purpose: a read that committed is
 /// saved even when a file could not be written, and export success is claimed only
-/// when every requested file is in place.
+/// when every requested file is in place. Cleanup is a third outcome for the same
+/// reason: whether the pen's copy was reclaimed says nothing about whether the
+/// library copy is safe.
 public struct PenReadOutcome: Hashable, Sendable {
     /// The counts and notes the read found.
     public let summary: PenSyncSummary
+
+    /// The pen's battery and storage reading for this completed attempt.
+    public let penState: PenState?
 
     /// The committed library result, or `nil` when the read stored nothing.
     public let save: PenLibrarySave?
 
     /// The publication result, or `nil` when no export was requested.
     public let export: PenExportReport?
+
+    /// What happened to the pen's copy of the verified data.
+    public let cleanup: PenCleanupOutcome
 
     /// The folder files were published into, when one was chosen.
     public let destinationDirectory: String?
@@ -51,11 +64,15 @@ public struct PenReadOutcome: Hashable, Sendable {
         summary: PenSyncSummary,
         save: PenLibrarySave?,
         export: PenExportReport?,
-        destinationDirectory: String?
+        cleanup: PenCleanupOutcome,
+        destinationDirectory: String?,
+        penState: PenState? = nil
     ) {
         self.summary = summary
+        self.penState = penState
         self.save = save
         self.export = export
+        self.cleanup = cleanup
         self.destinationDirectory = destinationDirectory
     }
 
@@ -76,6 +93,16 @@ public struct PenReadOutcome: Hashable, Sendable {
 
     /// Whether publication can be attempted again from the stored rows.
     public var canRetryExport: Bool { save != nil && destinationDirectory != nil }
+
+    /// Whether the pen's copy was reclaimed.
+    public var reclaimedPenCopy: Bool { cleanup.isReclaimed }
+
+    /// A one-line statement of what happened to the pen's copy.
+    ///
+    /// It is kept separate from ``notice`` because the two are independent: a read
+    /// can be saved and exported while the pen keeps its copy, and a reclaimed pen
+    /// copy says nothing about whether a file was written.
+    public var cleanupNotice: String { cleanup.summary }
 
     /// A one-line statement of what happened, for the menu and the window.
     public var notice: String {

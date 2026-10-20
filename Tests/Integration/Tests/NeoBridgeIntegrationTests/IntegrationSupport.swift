@@ -71,22 +71,47 @@ struct IntegrationWorkspace {
     /// The export folder.
     let exportDirectory: URL
 
+    /// The cleanup policy every importer over this library is built with.
+    let policy: PenCleanupPolicy
+
     /// Creates a workspace.
     ///
-    /// - Parameter publisher: The export publisher. The default writes files.
-    init(publisher: any PenExportPublisher = FilePenExportPublisher()) throws {
+    /// - Parameters:
+    ///   - publisher: The export publisher. The default writes files.
+    ///   - policy: The pen cleanup policy, so a scenario can open the evidence
+    ///     gate. The default is the closed gate.
+    init(
+        publisher: any PenExportPublisher = FilePenExportPublisher(),
+        policy: PenCleanupPolicy = PenCleanupPolicy()
+    ) throws {
         root = FileManager.default.temporaryDirectory
             .appendingPathComponent("neobridge-integration", isDirectory: true)
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
         exportDirectory = root.appendingPathComponent("exports", isDirectory: true)
         try FileManager.default.createDirectory(at: exportDirectory, withIntermediateDirectories: true)
 
+        self.policy = policy
         library = try SQLitePenLibrary(url: root.appendingPathComponent("library.sqlite"))
         importer = PenLibraryImporter(
             store: library,
             batches: library,
             journal: library,
-            publisher: publisher
+            publisher: publisher,
+            policy: policy
+        )
+    }
+
+    /// Another importer over the same library, with a different publisher.
+    ///
+    /// A scenario uses this to make one note publish and a later one fail without
+    /// giving the two notes different libraries.
+    func importer(publisher: any PenExportPublisher) -> PenLibraryImporter {
+        PenLibraryImporter(
+            store: library,
+            batches: library,
+            journal: library,
+            publisher: publisher,
+            policy: policy
         )
     }
 
@@ -119,4 +144,70 @@ struct IntegrationWorkspace {
 /// A failure raised by the integration harness.
 enum IntegrationError: Error, Hashable {
     case missingFixture(String)
+}
+
+/// A deletion channel that records every request and confirms it.
+///
+/// It stands in for a pen whose `0xA5`/`0xA7` response is proven to mean that
+/// exactly the recorded scope was removed.
+struct RecordingDeletionSender: PenDeletionSender {
+    /// Every deletion the sender was asked for.
+    let calls: IntegrationDeletionCalls
+
+    init(calls: IntegrationDeletionCalls = IntegrationDeletionCalls()) {
+        self.calls = calls
+    }
+
+    func delete(_ scope: PenDeletionScope) async throws -> PenDeletionOutcome {
+        await calls.record(scope)
+        return .confirmed(scope)
+    }
+}
+
+/// Records the deletion scopes a recording sender was asked for.
+actor IntegrationDeletionCalls {
+    private var scopes: [PenDeletionScope] = []
+
+    /// Records one deletion request.
+    func record(_ scope: PenDeletionScope) {
+        scopes.append(scope)
+    }
+
+    /// Every deletion scope, in order.
+    var allScopes: [PenDeletionScope] { scopes }
+}
+
+/// A publisher that fails every target, so no export ever publishes.
+struct FailingExportPublisher: PenExportPublisher {
+    /// Why every target fails.
+    var reason = "the destination is unavailable"
+
+    func publish(_ request: PenExportRequest, content: [PenPageContent]) async -> PenExportReport {
+        PenExportReport(
+            artifacts: request.formats.map { format in
+                PenExportArtifact(
+                    format: format,
+                    path: "\(request.destinationDirectory)/page.\(format.rawValue)",
+                    byteCount: 0,
+                    status: .failed(reason: reason)
+                )
+            }
+        )
+    }
+}
+
+/// The evidence record that opens the deletion gate for one scope.
+///
+/// The verdicts stand in for the physical A1 traces the gate requires; the
+/// integration scenarios use them to exercise the deletion path end to end.
+///
+/// - Parameter target: The deletion command the traces proved.
+/// - Returns: A record whose every condition is `safe`.
+func openDeletionGate(target: PenDeletionTarget = .note) -> PenDeletionEvidence {
+    PenDeletionEvidence(
+        target: target,
+        verdicts: Dictionary(
+            uniqueKeysWithValues: PenDeletionCondition.allCases.map { ($0, .safe) }
+        )
+    )
 }

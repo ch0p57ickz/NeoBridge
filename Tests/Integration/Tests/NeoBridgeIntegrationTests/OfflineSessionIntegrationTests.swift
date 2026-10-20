@@ -139,6 +139,207 @@ final class OfflineSessionIntegrationTests: XCTestCase {
         XCTAssertEqual(recovered.outcome.save?.strokeCount, fixture.expectedStrokeCount)
     }
 
+    // MARK: - Cleanup and retention
+
+    func testCleanupReclaimsThePenCopyOnlyAfterAVerifiedImportAndExport() async throws {
+        let fixture = try IntegrationFixtures.offlineSession()
+        let workspace = try IntegrationWorkspace(policy: PenCleanupPolicy(evidence: openDeletionGate()))
+        defer { workspace.remove() }
+        let sender = RecordingDeletionSender()
+
+        let session = try await OfflineSessionImport(importer: workspace.importer).run(
+            transport: FakePenTransport(chunks: try fixture.decodedChunks()),
+            export: workspace.exportRequest(pages: []),
+            cleanup: PenCleanupRequest(mode: .deleteAfterAcknowledge, sender: sender)
+        )
+
+        let save = try XCTUnwrap(session.outcome.save)
+        let cleanup = try XCTUnwrap(session.cleanup)
+        guard case .reclaimed(let pageCount) = cleanup else {
+            return XCTFail("expected the pen's copy to be reclaimed, got \(cleanup)")
+        }
+        XCTAssertEqual(pageCount, save.pages.count)
+
+        // The deletion targeted exactly the batch's own committed pages.
+        let sent = await sender.calls.allScopes
+        XCTAssertEqual(sent.map(\.batchID), [save.batchID])
+        XCTAssertEqual(sent.first?.pages, save.pages)
+
+        // The library copy survives the deletion and can be published again.
+        let stored = try await workspace.library.pages()
+        XCTAssertEqual(Set(stored), Set(save.pages), "the library copy must remain readable")
+        let report = try await workspace.importer.retryExport(
+            batchID: save.batchID,
+            request: workspace.exportRequest(pages: save.pages)
+        )
+        XCTAssertTrue(report.succeeded, "a deleted pen page must still be exportable from the library")
+        XCTAssertFalse(try workspace.exportedFiles().isEmpty)
+    }
+
+    func testTheClosedGateRetainsThePenCopyAndReportsWhyCleanupWasSkipped() async throws {
+        let fixture = try IntegrationFixtures.offlineSession()
+        let workspace = try IntegrationWorkspace()
+        defer { workspace.remove() }
+        let sender = RecordingDeletionSender()
+
+        let session = try await OfflineSessionImport(importer: workspace.importer).run(
+            transport: FakePenTransport(chunks: try fixture.decodedChunks()),
+            export: workspace.exportRequest(pages: []),
+            cleanup: PenCleanupRequest(mode: .deleteAfterAcknowledge, sender: sender)
+        )
+
+        // The read still succeeds and retains its library copy.
+        XCTAssertTrue(session.outcome.isSaved)
+        let cleanup = try XCTUnwrap(session.cleanup)
+        guard case .skipped(let reason) = cleanup else {
+            return XCTFail("expected the closed gate to skip cleanup, got \(cleanup)")
+        }
+        XCTAssertTrue(reason.contains("deletion evidence gate"), reason)
+
+        let sent = await sender.calls.allScopes
+        XCTAssertEqual(sent, [], "a closed gate must not send a deletion command")
+        let outstanding = try await workspace.library.outstandingScopes()
+        XCTAssertEqual(outstanding, [])
+    }
+
+    func testRetentionByChoiceSendsNoDeletionAndJournalsNothing() async throws {
+        let fixture = try IntegrationFixtures.offlineSession()
+        let workspace = try IntegrationWorkspace(policy: PenCleanupPolicy(evidence: openDeletionGate()))
+        defer { workspace.remove() }
+        let sender = RecordingDeletionSender()
+
+        let session = try await OfflineSessionImport(importer: workspace.importer).run(
+            transport: FakePenTransport(chunks: try fixture.decodedChunks()),
+            export: workspace.exportRequest(pages: []),
+            cleanup: PenCleanupRequest(mode: .keepOnPen, sender: sender)
+        )
+
+        XCTAssertEqual(session.cleanup, .retainedByChoice)
+        XCTAssertEqual(session.outcome.save?.insertion.addedStrokeCount, fixture.expectedStrokeCount)
+        let sent = await sender.calls.allScopes
+        XCTAssertEqual(sent, [], "retention must not send a deletion command")
+        let outstanding = try await workspace.library.outstandingScopes()
+        XCTAssertEqual(outstanding, [], "retention must journal no cleanup request")
+    }
+
+    func testAnInterruptedTransferSendsNoDeletionAndJournalsNothing() async throws {
+        let fixture = try IntegrationFixtures.offlineSession()
+        let workspace = try IntegrationWorkspace(policy: PenCleanupPolicy(evidence: openDeletionGate()))
+        defer { workspace.remove() }
+        let sender = RecordingDeletionSender()
+        let chunks = try fixture.decodedChunks()
+
+        let transport = FakePenTransport(
+            chunks: Array(chunks.prefix(5)),
+            failure: IntegrationTestError.connectionDropped
+        )
+        do {
+            _ = try await OfflineSessionImport(importer: workspace.importer).run(
+                transport: transport,
+                export: workspace.exportRequest(pages: []),
+                cleanup: PenCleanupRequest(mode: .deleteAfterAcknowledge, sender: sender)
+            )
+            XCTFail("expected the interrupted session to fail")
+        } catch is PenSessionError {
+            // Expected: a partial transfer is never a completed read.
+        }
+
+        let sent = await sender.calls.allScopes
+        XCTAssertEqual(sent, [], "an interrupted transfer must not delete")
+        let outstanding = try await workspace.library.outstandingScopes()
+        XCTAssertEqual(outstanding, [])
+        let pages = try await workspace.library.pages()
+        XCTAssertEqual(pages, [])
+    }
+
+    func testAFailedExportRetainsThePenCopyAndSendsNoDeletion() async throws {
+        let fixture = try IntegrationFixtures.offlineSession()
+        let workspace = try IntegrationWorkspace(
+            publisher: FailingExportPublisher(),
+            policy: PenCleanupPolicy(evidence: openDeletionGate())
+        )
+        defer { workspace.remove() }
+        let sender = RecordingDeletionSender()
+
+        let session = try await OfflineSessionImport(importer: workspace.importer).run(
+            transport: FakePenTransport(chunks: try fixture.decodedChunks()),
+            export: workspace.exportRequest(pages: []),
+            cleanup: PenCleanupRequest(mode: .deleteAfterAcknowledge, sender: sender)
+        )
+
+        XCTAssertFalse(session.outcome.export?.succeeded ?? true)
+        let cleanup = try XCTUnwrap(session.cleanup)
+        guard case .skipped(let reason) = cleanup else {
+            return XCTFail("expected a failed export to retain the pen copy, got \(cleanup)")
+        }
+        XCTAssertTrue(reason.contains("no export published in full"), reason)
+
+        let sent = await sender.calls.allScopes
+        XCTAssertEqual(sent, [], "a failed export must not delete")
+    }
+
+    func testAnEarlierPublishedNoteIsReclaimedWhileALaterNoteFails() async throws {
+        let fixture = try IntegrationFixtures.offlineSession()
+        let chunks = try fixture.decodedChunks()
+        let workspace = try IntegrationWorkspace(policy: PenCleanupPolicy(evidence: openDeletionGate()))
+        defer { workspace.remove() }
+        let sender = RecordingDeletionSender()
+        let importer = OfflineSessionImport(importer: workspace.importer)
+
+        // The earlier note completes: its transfer, import, and export succeed.
+        let earlierChunks = try Self.oneNoteSession(
+            chunks,
+            note: Self.note700,
+            frames: [0, 1, 2, 3, 4, 5, 6]
+        )
+        let earlier = try await importer.run(
+            transport: FakePenTransport(chunks: earlierChunks),
+            export: workspace.exportRequest(pages: [])
+        )
+        let earlierID = try XCTUnwrap(earlier.outcome.save?.batchID)
+
+        // The later note's export fails, so its sync has not completed. Its page
+        // set is disjoint from the earlier note's, which the fixture guarantees.
+        let laterChunks = try Self.oneNoteSession(
+            chunks,
+            note: Self.note701,
+            frames: [0, 1, 7, 8, 9]
+        )
+        let failing = workspace.importer(publisher: FailingExportPublisher())
+        let later = try await OfflineSessionImport(importer: failing).run(
+            transport: FakePenTransport(chunks: laterChunks),
+            export: workspace.exportRequest(pages: [])
+        )
+        let laterID = try XCTUnwrap(later.outcome.save?.batchID)
+        XCTAssertFalse(later.outcome.export?.succeeded ?? true)
+
+        // The completed note is reclaimed, and only on its own pages.
+        let reclaimed = try await workspace.importer.requestCleanup(
+            earlierID,
+            request: PenCleanupRequest(mode: .deleteAfterAcknowledge, sender: sender)
+        )
+        guard case .reclaimed(let pageCount) = reclaimed else {
+            return XCTFail("expected the completed note to be reclaimed, got \(reclaimed)")
+        }
+        XCTAssertEqual(pageCount, earlier.outcome.save?.pages.count)
+
+        let sent = await sender.calls.allScopes
+        XCTAssertEqual(sent.count, 1, "only the completed note may be sent")
+        XCTAssertEqual(sent.first?.pages, earlier.outcome.save?.pages)
+
+        // The incomplete note is retained.
+        let retained = try await workspace.importer.requestCleanup(
+            laterID,
+            request: PenCleanupRequest(mode: .deleteAfterAcknowledge, sender: sender)
+        )
+        guard case .skipped(let reason) = retained else {
+            return XCTFail("expected the incomplete note to be retained, got \(retained)")
+        }
+        XCTAssertTrue(reason.contains("no export published in full"), reason)
+        let stillSent = await sender.calls.allScopes
+        XCTAssertEqual(stillSent.count, 1, "the incomplete note must not reach the pen")
+    }
+
     // MARK: - Deletion stays disabled
 
     func testSessionSendsNoDeletionCommand() async throws {
@@ -185,6 +386,51 @@ final class OfflineSessionIntegrationTests: XCTestCase {
     }
 
     // MARK: - Helpers
+
+    /// The fixture note whose pages are 1, 16, and 17.
+    private static let note700 = (section: UInt8(3), owner: UInt32(27), id: UInt32(700))
+
+    /// The fixture note whose only page is 2, disjoint from `note700`.
+    private static let note701 = (section: UInt8(3), owner: UInt32(27), id: UInt32(701))
+
+    /// The fixture's chunks with its note list rewritten to one note.
+    ///
+    /// The fixture lists two notes and carries each one's page list, info, and
+    /// data packets in order. Rewriting the list makes a session read exactly the
+    /// frames of one note, so two sessions over disjoint pages describe two notes
+    /// without a second fixture.
+    ///
+    /// - Parameters:
+    ///   - chunks: The fixture's chunks, in trace order.
+    ///   - note: The one note the rewritten list reports.
+    ///   - frames: The chunk indices to keep. Index 1 is replaced by the rewritten
+    ///     note list.
+    /// - Returns: A stream a session reads as one note.
+    private static func oneNoteSession(
+        _ chunks: [[UInt8]],
+        note: (section: UInt8, owner: UInt32, id: UInt32),
+        frames: [Int]
+    ) throws -> [[UInt8]] {
+        var payload: [UInt8] = [1, 0]
+        let sectionOwner = UInt32(note.section) << 24 | note.owner
+        for value in [sectionOwner, note.id] {
+            payload.append(contentsOf: withUnsafeBytes(of: value.littleEndian) { Array($0) })
+        }
+
+        guard
+            let list = PenFrameEncoder.encode(
+                command: .responseOfflineNoteList,
+                payload: payload,
+                errorCode: 0
+            )
+        else {
+            throw IntegrationError.missingFixture("the note list could not be re-encoded")
+        }
+
+        return frames.map { index in
+            index == 1 ? list : chunks[index]
+        }
+    }
 
     /// The session fixture whose version response names sentinel devices.
     private func sessionChunksWithIdentitySentinel() throws -> [[UInt8]] {

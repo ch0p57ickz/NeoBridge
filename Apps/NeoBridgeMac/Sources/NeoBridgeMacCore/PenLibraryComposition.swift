@@ -29,16 +29,23 @@ public enum PenLibraryComposition {
 
     /// Opens the library and returns the verified importer over it.
     ///
-    /// - Parameter libraryURL: The database file to open or create.
+    /// - Parameters:
+    ///   - libraryURL: The database file to open or create.
+    ///   - policy: The pen cleanup policy. The default intends cleanup but its
+    ///     evidence gate is closed, so the pen's copy is retained.
     /// - Throws: `StorageError` when the file cannot be opened or its schema is
     ///   newer than this build.
-    public static func makeImporter(libraryURL: URL) throws -> PenLibraryImporter {
+    public static func makeImporter(
+        libraryURL: URL,
+        policy: PenCleanupPolicy = PenCleanupPolicy()
+    ) throws -> PenLibraryImporter {
         let library = try SQLitePenLibrary(url: libraryURL)
         return PenLibraryImporter(
             store: library,
             batches: library,
             journal: library,
-            publisher: FilePenExportPublisher()
+            publisher: FilePenExportPublisher(),
+            policy: policy
         )
     }
 }
@@ -79,7 +86,10 @@ public struct UnavailableImportCoordinator: PenImportCoordinator {
         throw failure
     }
 
-    public func acknowledge(_ batchID: UUID) async throws {
+    public func requestCleanup(
+        _ batchID: UUID,
+        request: PenCleanupRequest
+    ) async throws -> PenCleanupOutcome {
         throw failure
     }
 

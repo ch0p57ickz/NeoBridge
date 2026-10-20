@@ -102,13 +102,34 @@ private actor PublicationAttempts {
 
 private actor FakeCleanupJournal: PenCleanupJournal {
     private var states: [UUID: [PenCleanupState]] = [:]
+    private var scopes: [UUID: PenDeletionScope] = [:]
+    private var order: [UUID] = []
 
-    func record(_ state: PenCleanupState, batchID: UUID) async throws {
-        states[batchID, default: []].append(state)
+    func record(_ state: PenCleanupState, scope: PenDeletionScope) async throws {
+        if states[scope.batchID] == nil {
+            order.append(scope.batchID)
+        }
+        states[scope.batchID, default: []].append(state)
+        // The scope is recorded once, before anything can be sent, so a later
+        // state never rewrites it.
+        if scopes[scope.batchID] == nil {
+            scopes[scope.batchID] = scope
+        }
     }
 
     func latestState(batchID: UUID) async throws -> PenCleanupState? {
         states[batchID]?.last
+    }
+
+    func recordedScope(batchID: UUID) async throws -> PenDeletionScope? {
+        scopes[batchID]
+    }
+
+    func outstandingScopes() async throws -> [PenDeletionScope] {
+        order.compactMap { batchID in
+            guard states[batchID]?.last == .requested, let scope = scopes[batchID] else { return nil }
+            return scope
+        }
     }
 
     func recordedStates(batchID: UUID) async throws -> [PenCleanupState] {
@@ -159,16 +180,24 @@ private struct FakeImportCoordinator: PenImportCoordinator {
 
         let content = try await content(for: request.pages)
         let report = await publisher.publish(request, content: content)
-        if report.succeeded {
+        if report.succeeded, record.state != .published {
             try await transition(batchID, to: .published)
         }
         return report
     }
 
-    func acknowledge(_ batchID: UUID) async throws {
-        guard let record = try await batches.batch(id: batchID), record.state == .published else {
-            throw ImportBatchTransitionError.illegalTransition(from: .committed, to: .published)
+    func requestCleanup(
+        _ batchID: UUID,
+        request: PenCleanupRequest
+    ) async throws -> PenCleanupOutcome {
+        guard let record = try await batches.batch(id: batchID) else {
+            throw ImportBatchTransitionError.illegalTransition(from: .collecting, to: .published)
         }
+        guard request.mode == .deleteAfterAcknowledge else { return .retainedByChoice }
+        guard record.state == .published else {
+            return .skipped(reason: "the read is not stored and published yet")
+        }
+        return .skipped(reason: "the deletion evidence gate is closed")
     }
 
     func importRead(
@@ -532,28 +561,141 @@ final class PenDomainInterfaceTests: XCTestCase {
 
     // MARK: - Cleanup journal and retention
 
-    func testCleanupJournalRecordsDurableStates() async throws {
+    func testCleanupJournalRecordsTheScopeAndEveryDurableState() async throws {
         let journal = FakeCleanupJournal()
-        let batchID = UUID()
+        let scope = PenDeletionScope(batchID: UUID(), target: .note, pages: [page])
 
-        try await journal.record(.prepared, batchID: batchID)
-        let prepared = try await journal.latestState(batchID: batchID)
+        try await journal.record(.prepared, scope: scope)
+        let prepared = try await journal.latestState(batchID: scope.batchID)
+        let recorded = try await journal.recordedScope(batchID: scope.batchID)
+        let outstandingAfterPrepare = try await journal.outstandingScopes()
         XCTAssertEqual(prepared, .prepared)
-        try await journal.record(.requested, batchID: batchID)
-        try await journal.record(.confirmed, batchID: batchID)
-        let confirmed = try await journal.latestState(batchID: batchID)
-        XCTAssertEqual(confirmed, .confirmed)
-        let all = try await journal.recordedStates(batchID: batchID)
+        XCTAssertEqual(recorded, scope, "the exact scope must be durable before anything is sent")
+        XCTAssertEqual(outstandingAfterPrepare, [], "a prepared request has not been sent")
+
+        try await journal.record(.requested, scope: scope)
+        let outstanding = try await journal.outstandingScopes()
+        XCTAssertEqual(outstanding, [scope], "a requested scope is outstanding until it is confirmed")
+
+        try await journal.record(.confirmed, scope: scope)
+        let all = try await journal.recordedStates(batchID: scope.batchID)
+        let outstandingAfterConfirm = try await journal.outstandingScopes()
         XCTAssertEqual(all, [.prepared, .requested, .confirmed])
+        XCTAssertEqual(outstandingAfterConfirm, [])
     }
 
-    func testCleanupDefaultsToKeepOnPenAndDeletionIsDisabled() {
-        let policy = PenCleanupPolicy()
-        XCTAssertEqual(policy.mode, .keepOnPen)
-        XCTAssertFalse(policy.deletionEnabled)
+    func testCleanupScopeKeepsPagesInCanonicalOrder() {
+        let later = PageIdentity(section: 3, owner: 27, book: 700, page: 9)
+        let scope = PenDeletionScope(batchID: UUID(), target: .page, pages: [later, page])
+        XCTAssertEqual(scope.pages, [page, later], "a recorded scope never depends on transfer order")
+        XCTAssertEqual(scope.pageCount, 2)
+    }
 
-        let explicit = PenCleanupPolicy(mode: .deleteAfterAcknowledge)
-        XCTAssertFalse(explicit.deletionEnabled)
+    // MARK: - Cleanup intent and the evidence gate
+
+    func testCleanupIntentDefaultsToCleanupWhileTheGateIsClosed() {
+        let policy = PenCleanupPolicy()
+        XCTAssertEqual(policy.mode, .deleteAfterAcknowledge, "cleanup is the default intent")
+        XCTAssertFalse(policy.deletionEnabled, "the gate is closed with no physical trace")
+        XCTAssertNil(policy.provenTarget)
+        XCTAssertEqual(
+            policy.skipReason(for: .deleteAfterAcknowledge),
+            PenDeletionEvidence.unestablished.blockingReason
+        )
+        XCTAssertNil(
+            policy.skipReason(for: .keepOnPen),
+            "a sync that chose retention has nothing to explain"
+        )
+    }
+
+    func testDeletionStaysDisabledForEveryIncompleteVerdict() {
+        // Absent verdicts, a partially established gate, an unsafe verdict, and a
+        // proven scope with no proven command all keep the gate closed.
+        let complete: [PenDeletionCondition: PenDeletionEvidence.Verdict] =
+            Dictionary(
+                uniqueKeysWithValues: PenDeletionCondition.allCases.map { ($0, .safe) }
+            )
+        var unsafeVerdicts = complete
+        unsafeVerdicts[.deletionScope] = .unsafe
+        var partialVerdicts = complete
+        partialVerdicts.removeValue(forKey: .responseMeaning)
+
+        let candidates: [PenDeletionEvidence] = [
+            .unestablished,
+            PenDeletionEvidence(target: .note),
+            PenDeletionEvidence(target: .note, verdicts: partialVerdicts),
+            PenDeletionEvidence(target: .note, verdicts: unsafeVerdicts),
+            PenDeletionEvidence(verdicts: complete),
+        ]
+
+        for evidence in candidates {
+            XCTAssertFalse(evidence.isSafe, "\(evidence) must not open the gate")
+            XCTAssertFalse(PenCleanupPolicy(evidence: evidence).deletionEnabled)
+            XCTAssertNil(PenCleanupPolicy(evidence: evidence).provenTarget)
+            XCTAssertFalse(evidence.blockingReason.isEmpty)
+        }
+
+        // The gate names the conditions a trace still has to establish.
+        XCTAssertEqual(
+            PenDeletionEvidence(target: .note, verdicts: unsafeVerdicts).blockingConditions,
+            [.deletionScope]
+        )
+        XCTAssertEqual(
+            PenDeletionEvidence(target: .note, verdicts: partialVerdicts).blockingConditions,
+            [.responseMeaning]
+        )
+    }
+
+    func testDeletionIsEnabledOnlyForACompletelySafeVerdict() {
+        let verdicts = Dictionary(
+            uniqueKeysWithValues: PenDeletionCondition.allCases.map {
+                ($0, PenDeletionEvidence.Verdict.safe)
+            }
+        )
+        let evidence = PenDeletionEvidence(target: .page, verdicts: verdicts)
+        let policy = PenCleanupPolicy(evidence: evidence)
+
+        XCTAssertTrue(evidence.isSafe)
+        XCTAssertEqual(evidence.blockingConditions, [])
+        XCTAssertTrue(policy.deletionEnabled)
+        XCTAssertEqual(policy.provenTarget, .page)
+        XCTAssertNil(policy.skipReason(for: .deleteAfterAcknowledge))
+    }
+
+    func testCleanupOutcomeSummariesNameEachOutcome() {
+        XCTAssertTrue(PenCleanupOutcome.retainedByChoice.summary.contains("kept on the pen"))
+        XCTAssertTrue(PenCleanupOutcome.reclaimed(pageCount: 1).summary.contains("Reclaimed 1 page"))
+        XCTAssertTrue(
+            PenCleanupOutcome.reclaimed(pageCount: 3).summary.contains("Reclaimed 3 pages")
+        )
+        XCTAssertTrue(PenCleanupOutcome.skipped(reason: "the gate is closed").summary.contains("the gate is closed"))
+        XCTAssertTrue(
+            PenCleanupOutcome.outstanding(reason: "no acknowledgement").summary.contains("outstanding")
+        )
+        XCTAssertFalse(PenCleanupOutcome.retainedByChoice.isReclaimed)
+        XCTAssertTrue(PenCleanupOutcome.reclaimed(pageCount: 2).isReclaimed)
+    }
+
+    func testDeletionOutcomeReportsItsScopeAndConfirmation() {
+        let scope = PenDeletionScope(batchID: UUID(), target: .note, pages: [page])
+        XCTAssertEqual(PenDeletionOutcome.confirmed(scope).scope, scope)
+        XCTAssertTrue(PenDeletionOutcome.confirmed(scope).isConfirmed)
+        XCTAssertFalse(PenDeletionOutcome.unacknowledged(scope).isConfirmed)
+        XCTAssertFalse(PenDeletionOutcome.refused(scope: scope, code: 0x05).isConfirmed)
+    }
+
+    func testRequestCleanupRefusesABatchThatWasNeverStored() async throws {
+        let (coordinator, _, _, journal) = makeCoordinator()
+        let batch = try await coordinator.collect([stroke(offset: 0)])
+
+        let outcome = try await coordinator.requestCleanup(
+            batch.id,
+            request: PenCleanupRequest()
+        )
+
+        XCTAssertFalse(outcome.isReclaimed)
+        let states = try await journal.recordedStates(batchID: batch.id)
+        XCTAssertEqual(states, [], "an uncommitted batch must record no cleanup request")
     }
 
     // MARK: - Export report

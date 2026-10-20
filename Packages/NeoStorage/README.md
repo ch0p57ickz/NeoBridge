@@ -46,6 +46,7 @@ The schema version is recorded in `metadata.schema_version`, and
 | `batches` | Import progress: state, counts, and an insertion ordinal |
 | `batch_pages` | The pages a batch's strokes belong to, so publication can be retried |
 | `cleanup_journal` | Append-only cleanup states per batch |
+| `cleanup_requests` | The exact scope of a cleanup request: its batch, proven command, and pages |
 
 A stroke's identity is the SHA-256 digest of its canonical encoding: the page
 tuple, the pen-origin time and its reliability, and the ordered points. Host
@@ -89,14 +90,73 @@ A publication is one file at a time: a failure leaves the committed strokes in
 place and reports each file's own outcome, so a retry finishes the set without
 importing the read again.
 
-## Pen retention
+## Pen cleanup
 
-`PenCleanupPolicy.mode` defaults to `keepOnPen`, and
-`PenCleanupPolicy.deletionEnabled` is `false` for every policy this build can
-construct. A `keepOnPen` import writes no cleanup journal row at all. A policy
-that asks for deletion records `prepared` and stops there: `requested` is never
-recorded and no deletion command exists in the session, so the pen always keeps
-its copy. Physical A1 acceptance must pass before a later change enables cleanup.
+Cleanup is requested separately from the import, by
+`PenLibraryImporter.requestCleanup(_:request:)`, so it can be ordered after it.
+The ordering rule is what makes it safe: the pen's copy is reclaimed only for data
+whose complete transfer has committed durably **and** for which an export published
+in full. A batch that is not `published` is refused, so a read whose publication
+failed, was left partial, or was never requested keeps its pen copy: with nothing
+published, the library copy is the read's only copy, and the reason says so. A scope
+that shares a page with a batch that has not published is refused too, so a
+completed note is reclaimed only on its own pages and a later failed note keeps its
+strokes on the pen.
+
+The request is journaled in three states:
+
+| State | Written when | Meaning |
+| --- | --- | --- |
+| `prepared` | the exact scope is known, before anything can be sent | the scope is durable, so a restart can compare it with a fresh read |
+| `requested` | before the bytes can reach the pen | a deletion may have been sent; the effect is unknown |
+| `confirmed` | an evidence-backed response proves the recorded scope was removed | the pen's copy is gone |
+
+`cleanup_requests` holds the scope itself — the batch, the proven command, and the
+pages — so a request can be compared with a later read instead of repeated.
+
+The journal is terminal in both directions: a `requested` request is never resent
+automatically, and a `confirmed` one is never sent again. `resolveCleanup(_:storedPages:)`
+is the only thing that may resolve an outstanding request, it never deletes, and it
+reads the pages from the durable record rather than from its caller. It requires the
+pen's whole stored-page inventory: `storedPages: nil` means the read did not finish
+or did not cover the whole pen, which is also what a read that returns only new data
+passes, so removal is not proven and the request stays outstanding. Only when every
+recorded page is absent from an inventory of the whole pen is the request confirmed.
+
+One batch has at most one request in flight: a second `requestCleanup` for a batch
+that is already between its checks and its send is reported as outstanding rather
+than sending the command again, because the journal's own states cannot close that
+window. A request whose task is cancelled before the command is sent is recorded and
+left outstanding, so a sync the user ended puts nothing on the wire.
+
+A journal write that fails after the pen confirmed removal does not change the
+reported outcome: the read is reported reclaimed, because the removal happened. The
+unrecorded confirmation leaves the request outstanding, which is the state a crash
+between the send and the write leaves, so a later read resolves it by comparing the
+recorded scope with the pen's inventory instead of resending the command.
+
+A journal row this build cannot decode is refused rather than read as an absent
+request: `latestState(batchID:)` and `recordedScope(batchID:)` throw
+`StorageError.unreadableCleanupState` or `.unreadableCleanupScope`, and the cleanup
+path reports the outcome as outstanding, because a row that cannot be read says
+nothing about whether a deletion was already sent. A state that names a request
+whose scope is missing, or a confirmation whose scope is missing, is treated the
+same way: the removal is not proven and the request is not repeated.
+
+A read with no stored page is refused too, so an empty scope is never journaled and
+never sent.
+
+A read whose export was never requested stays `committed`, so it is not reclaimable
+either: cleanup requires an export that published in full, and a read with none
+retains the pen's copy with a reason that names the batch's state and says the
+library copy is the read's only copy.
+
+`PenCleanupPolicy.mode` defaults to `deleteAfterAcknowledge`, which is an intent,
+not permission. `PenCleanupPolicy.deletionEnabled` derives from
+`PenDeletionEvidence`, and the evidence record holds a `pending` verdict for every
+condition until a physical A1 trace establishes it, so no deletion command can be
+sent by this build. Physical A1 acceptance must pass before a later change records
+the safe verdicts that open the gate.
 
 ## Building and testing
 
@@ -122,5 +182,5 @@ rather than as a compile error.
 
 The test suites cover round trips, canonical page identity, deduplication of
 replayed and unreliable strokes, rollback of a failed batch, schema refusal,
-batch progress across a reopen, the cleanup journal, and the importer's save,
-export-failure, retry, and restart paths.
+batch progress across a reopen, the cleanup journal and its recorded scopes, and
+the importer's save, export-failure, retry, restart, and cleanup-ordering paths.

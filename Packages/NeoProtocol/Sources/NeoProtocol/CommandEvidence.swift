@@ -1,3 +1,5 @@
+import NeoCore
+
 /// How well a command's wire behavior is established.
 public enum CommandEvidenceLevel: String, Hashable, Sendable, Codable, CaseIterable {
     /// The wire behavior is documented by an official Neo SDK and covered by a
@@ -54,8 +56,14 @@ public enum CommandAuthorization: Hashable, Sendable {
     /// production request and must not emit a completed stroke.
     case inspectionOnly(reason: String)
 
-    /// The command is wire-documented but gated behind a later milestone.
-    case blocked(reason: String)
+    /// The command is wire-documented but gated behind an evidence gate.
+    ///
+    /// The gate is data rather than a constant: the deletion commands become
+    /// `production` only when the recorded ``PenDeletionEvidence`` proves their
+    /// payload framing, deletion scope, response meaning, and interrupted-transfer
+    /// retention safe. While the gate is closed the command may not be sent, and
+    /// the reason names the conditions that are not yet established.
+    case gated(reason: String)
 
     /// No evidence exists for the command.
     case unsupported(reason: String)
@@ -69,6 +77,12 @@ public enum CommandAuthorization: Hashable, Sendable {
     public var allowsCompletedStroke: Bool {
         self == .production
     }
+
+    /// Why an evidence gate refuses the command, or `nil` when none does.
+    public var gateReason: String? {
+        if case .gated(let reason) = self { return reason }
+        return nil
+    }
 }
 
 /// The evidence table the decoder consults.
@@ -78,8 +92,9 @@ public struct CommandEvidenceRegistry: Hashable, Sendable {
     /// Commands whose payload layout the SDK documents and whose behavior a
     /// fixture test covers are `officialSDK`. The SoundPen and log commands are
     /// `provisional`: their identifiers are known, but their wire behavior is not
-    /// validated for the A1, so they stay inspection-only. Offline deletion is
-    /// `blocked` until physical A1 acceptance passes.
+    /// validated for the A1, so they stay inspection-only. The offline deletion
+    /// commands are `gated`: their identifiers are documented, and the deletion
+    /// evidence gate in ``deletionEvidence`` decides whether they may be sent.
     public static let neoSDK3 = CommandEvidenceRegistry(entries: [
         .versionInfo: CommandEvidence(
             command: .versionInfo,
@@ -90,6 +105,16 @@ public struct CommandEvidenceRegistry: Hashable, Sendable {
             command: .responseVersionInfo,
             level: .officialSDK,
             source: "Neo iOS SDK 3.0 NISDK3/Classes/Model/ResponseStruct.swift (PenVersionInfo)"
+        ),
+        .penState: CommandEvidence(
+            command: .penState,
+            level: .physicalDevice,
+            source: "2026-10-19 physical NWP-F151 0x04 request and 0x84 response"
+        ),
+        .responsePenState: CommandEvidence(
+            command: .responsePenState,
+            level: .physicalDevice,
+            source: "2026-10-19 physical NWP-F151 64-byte pen-state payload and Neo iOS SDK 3.0"
         ),
         .eventPenUpDown: CommandEvidence(
             command: .eventPenUpDown,
@@ -205,8 +230,25 @@ public struct CommandEvidenceRegistry: Hashable, Sendable {
 
     private let entries: [PenCommand: CommandEvidence]
 
-    public init(entries: [PenCommand: CommandEvidence]) {
+    /// The evidence gate behind the offline deletion commands.
+    ///
+    /// The gate is data, so opening it is a change to the recorded verdicts rather
+    /// than an edit to a boolean. The default is the closed gate: no physical A1
+    /// deletion trace has established a payload framing, a scope, a response
+    /// meaning, or interrupted-transfer retention for either command.
+    public let deletionEvidence: PenDeletionEvidence
+
+    /// Creates a registry.
+    ///
+    /// - Parameters:
+    ///   - entries: The evidence for each command identifier.
+    ///   - deletionEvidence: The gate the deletion commands consult.
+    public init(
+        entries: [PenCommand: CommandEvidence],
+        deletionEvidence: PenDeletionEvidence = .unestablished
+    ) {
         self.entries = entries
+        self.deletionEvidence = deletionEvidence
     }
 
     /// The evidence for a command.
@@ -217,14 +259,16 @@ public struct CommandEvidenceRegistry: Hashable, Sendable {
     }
 
     /// What the decoder may do with a command.
+    ///
+    /// The offline deletion commands are decided by ``deletionEvidence`` rather
+    /// than by a constant, so a command becomes sendable only when a physical trace
+    /// proves the whole gate for that command.
     public func authorization(for command: PenCommand) -> CommandAuthorization {
-        switch command {
-        case .deleteOfflineNoteRequest, .deleteOfflinePageRequest:
-            return .blocked(
-                reason: "offline deletion stays disabled until physical A1 acceptance passes"
-            )
-        default:
-            break
+        if let target = command.deletionTarget {
+            guard deletionEvidence.proves(target) else {
+                return .gated(reason: deletionEvidence.blockingReason(for: target))
+            }
+            return .production
         }
 
         let evidence = evidence(for: command)
@@ -346,15 +390,19 @@ extension PenCommand {
 
         // Requests the capture exercised, accepted without an error code.
         case .versionInfo,
+             .penState,
              .offlineNoteListRequest,
              .offlinePageListRequest,
              .offlineDataRequest1:
             return .event
 
-        // No framing evidence. Reject rather than guess.
+        // No framing evidence. Reject rather than guess. The two deletion
+        // requests are here as well: their payload framing is one of the
+        // conditions the deletion evidence gate must establish, so until a
+        // physical trace settles it the decoder must not guess where their length
+        // field starts.
         case .comparePassword,
              .changePassword,
-             .penState,
              .setPenState,
              .systemChange,
              .systemInfo,
@@ -366,6 +414,19 @@ extension PenCommand {
              .soundRequestLogInfo,
              .soundRequestLogData:
             return nil
+        }
+    }
+
+    /// The deletion target a command scopes to, or `nil` for every other command.
+    ///
+    /// The mapping is a property of the identifier, so the evidence gate can name
+    /// the command it proves without the storage layer having to know a wire
+    /// value.
+    public var deletionTarget: PenDeletionTarget? {
+        switch self {
+        case .deleteOfflineNoteRequest: return .note
+        case .deleteOfflinePageRequest: return .page
+        default: return nil
         }
     }
 }

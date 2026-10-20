@@ -184,6 +184,7 @@ public struct BluetoothPenSyncRunner: PenSyncRunning {
         let session = PenSession(
             transport: transport,
             timeouts: timeouts,
+            queryPenState: true,
             onStateChange: { state in
                 trace?.recordState(state.label)
                 guard let stage = PenSyncStage(state) else { return }

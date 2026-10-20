@@ -6,8 +6,9 @@ import Foundation
 /// The interfaces stay free of platform types so a Linux test can drive them with
 /// in-memory fakes. They describe the two-phase verified import that the design
 /// requires: collect and validate a batch, commit records, publish deterministic
-/// exports atomically, then acknowledge the batch. Pen cleanup is journaled and
-/// stays disabled until physical A1 acceptance passes.
+/// exports atomically, then request cleanup for the batch. Cleanup is journaled
+/// and its deletion command stays unreachable until the evidence gate in
+/// ``PenDeletionEvidence`` proves it safe.
 
 /// The lifecycle of one verified import batch.
 public enum ImportBatchState: String, Hashable, Sendable, Codable, CaseIterable {
@@ -23,7 +24,7 @@ public enum ImportBatchState: String, Hashable, Sendable, Codable, CaseIterable 
     /// Exports for the batch are published.
     case published
 
-    /// The batch failed and must not be acknowledged to the pen.
+    /// The batch failed and must not have its pen copy reclaimed.
     case failed
 
     /// The allowed transitions out of this state.
@@ -183,11 +184,23 @@ public protocol PenImportCoordinator: Sendable {
     /// Publishes exports for a committed batch.
     func publish(_ batchID: UUID, request: PenExportRequest) async throws -> PenExportReport
 
-    /// Acknowledges a published batch so the pen may release its copy.
+    /// Requests cleanup of a published batch's verified data.
     ///
-    /// Pen cleanup stays disabled: acknowledging records that the host is done
-    /// with the batch and sends nothing to the pen.
-    func acknowledge(_ batchID: UUID) async throws
+    /// The call records the exact scope durably before anything can be sent, marks
+    /// it requested before bytes can reach the pen, and marks it confirmed only
+    /// when an evidence-backed response proves the recorded scope was removed.
+    /// Nothing is sent for a batch that is not published, for a sync that chose
+    /// retention, or while the deletion evidence gate is closed; each of those is
+    /// reported as its own outcome instead.
+    ///
+    /// - Parameters:
+    ///   - batchID: The batch whose verified data cleanup targets.
+    ///   - request: The intent for this sync and the channel to send over.
+    /// - Returns: What the cleanup ended with. A non-confirming send leaves the
+    ///   request outstanding rather than reporting reclamation.
+    /// - Throws: When the batch is unknown, so a cleanup can never be recorded
+    ///   against data that was not stored.
+    func requestCleanup(_ batchID: UUID, request: PenCleanupRequest) async throws -> PenCleanupOutcome
 
     /// Imports one complete, validated read.
     ///
@@ -224,54 +237,5 @@ extension PenImportCoordinator {
     }
 }
 
-/// How the app treats strokes that are already stored on the pen.
-public enum PenCleanupMode: String, Hashable, Sendable, Codable, CaseIterable {
-    /// Leave strokes on the pen. This is the default.
-    case keepOnPen
-
-    /// Request deletion after the batch is acknowledged.
-    case deleteAfterAcknowledge
-}
-
-/// The durable states of a pen cleanup request.
-public enum PenCleanupState: String, Hashable, Sendable, Codable, CaseIterable {
-    /// A cleanup request is recorded but not yet sent.
-    case prepared
-
-    /// A cleanup request has been sent to the pen.
-    case requested
-
-    /// The pen confirmed the cleanup.
-    case confirmed
-}
-
-/// The pen cleanup policy.
-///
-/// The policy defaults to `keepOnPen`. Deletion stays disabled until physical A1
-/// acceptance passes, so `deletionEnabled` is `false` for every policy this
-/// package can construct.
-public struct PenCleanupPolicy: Hashable, Sendable {
-    /// The configured mode.
-    public let mode: PenCleanupMode
-
-    public init(mode: PenCleanupMode = .keepOnPen) {
-        self.mode = mode
-    }
-
-    /// Whether the app may send a deletion request to the pen.
-    ///
-    /// Always `false` in this change. Physical A1 acceptance must pass before a
-    /// later change can enable deletion.
-    public var deletionEnabled: Bool {
-        false
-    }
-}
-
-/// A durable journal for pen cleanup requests.
-public protocol PenCleanupJournal: Sendable {
-    /// Records a cleanup state for a batch.
-    func record(_ state: PenCleanupState, batchID: UUID) async throws
-
-    /// Returns the most recently recorded state for a batch.
-    func latestState(batchID: UUID) async throws -> PenCleanupState?
-}
+// The cleanup mode, its durable journal states, the deletion evidence gate, and
+// the cleanup policy live in `PenCleanup.swift`.

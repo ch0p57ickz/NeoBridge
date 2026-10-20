@@ -25,7 +25,7 @@ enum TestRead {
     }
 
     /// A read result carrying strokes, with the counts a real read would report.
-    static func result(strokes: [Stroke], noteCount: Int = 1) -> PenReadResult {
+    static func result(strokes: [Stroke], noteCount: Int = 1, penState: PenState? = nil) -> PenReadResult {
         let dotCount = strokes.reduce(0) { $0 + $1.points.count }
         let pageCount = Set(strokes.map(\.page)).count
         let note = PenSyncNoteSummary(
@@ -41,7 +41,8 @@ enum TestRead {
                 distinctPageCount: pageCount,
                 notes: noteCount == 0 ? [] : [note]
             ),
-            transfer: PenReadTransfer(strokes: strokes, noteCount: noteCount)
+            transfer: PenReadTransfer(strokes: strokes, noteCount: noteCount),
+            penState: penState
         )
     }
 
@@ -150,9 +151,11 @@ struct TestLibrary {
     ///
     /// - Parameters:
     ///   - publisher: The publisher to publish through. The default writes files.
+    ///   - policy: The pen cleanup policy. The default is the closed gate.
     ///   - faultInjection: A fault the store raises, to model a storage failure.
     init(
         publisher: any PenExportPublisher = FilePenExportPublisher(),
+        policy: PenCleanupPolicy = PenCleanupPolicy(),
         faultInjection: (@Sendable (Int) throws -> Void)? = nil
     ) throws {
         root = FileManager.default.temporaryDirectory
@@ -169,7 +172,8 @@ struct TestLibrary {
             store: library,
             batches: library,
             journal: library,
-            publisher: publisher
+            publisher: publisher,
+            policy: policy
         )
     }
 
@@ -196,8 +200,13 @@ enum InjectedStorageFailure: Error, Hashable {
 
 /// A one-shot gate that suspends an import until a test opens it.
 actor Gate {
-    private var isOpen = false
+    private var isOpen: Bool
     private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    /// Creates a gate, closed unless a test wants one that is already open.
+    init(isOpen: Bool = false) {
+        self.isOpen = isOpen
+    }
 
     /// Suspends until ``open()`` is called.
     func wait() async {
@@ -222,16 +231,39 @@ actor StubImportCoordinator: PenImportCoordinator {
     /// What the import ends with.
     let outcome: PenImportOutcome
 
+    /// The cleanup outcome a request returns.
+    let cleanup: PenCleanupOutcome
+
     /// The gate held open during the saving step.
     let saving: Gate
 
     /// The gate held open during the exporting step.
     let exporting: Gate
 
-    init(outcome: PenImportOutcome, saving: Gate = Gate(), exporting: Gate = Gate()) {
+    /// The gate held open during a publication retry. It is open by default, so a
+    /// test that does not watch the retry is not held up by it.
+    let retry: Gate
+
+    /// The report a publication retry returns.
+    let retryReport: PenExportReport
+
+    /// How many cleanup requests the controller has made.
+    private var cleanupRequestCount = 0
+
+    init(
+        outcome: PenImportOutcome,
+        cleanup: PenCleanupOutcome = .skipped(reason: "the deletion evidence gate is closed"),
+        saving: Gate = Gate(),
+        exporting: Gate = Gate(),
+        retry: Gate = Gate(isOpen: true),
+        retryReport: PenExportReport = PenExportReport(artifacts: [])
+    ) {
         self.outcome = outcome
+        self.cleanup = cleanup
         self.saving = saving
         self.exporting = exporting
+        self.retry = retry
+        self.retryReport = retryReport
     }
 
     func importRead(
@@ -258,9 +290,21 @@ actor StubImportCoordinator: PenImportCoordinator {
         PenExportReport(artifacts: [])
     }
 
-    func acknowledge(_ batchID: UUID) async throws {}
+    func requestCleanup(
+        _ batchID: UUID,
+        request: PenCleanupRequest
+    ) async throws -> PenCleanupOutcome {
+        cleanupRequestCount += 1
+        // Retention is reported without consulting the scripted outcome, because
+        // that is what the real importer does.
+        return request.mode == .keepOnPen ? .retainedByChoice : cleanup
+    }
+
+    /// How many cleanup requests the controller has made.
+    func requestedCleanupCount() -> Int { cleanupRequestCount }
 
     func retryExport(batchID: UUID, request: PenExportRequest) async throws -> PenExportReport {
-        PenExportReport(artifacts: [])
+        await retry.wait()
+        return retryReport
     }
 }

@@ -322,21 +322,30 @@ final class SQLitePenLibraryTests: XCTestCase {
 
     // MARK: - Cleanup journal
 
+    private func scope(
+        batchID: UUID,
+        target: PenDeletionTarget = .note,
+        pages: [PageIdentity]? = nil
+    ) -> PenDeletionScope {
+        PenDeletionScope(batchID: batchID, target: target, pages: pages ?? [page])
+    }
+
     func testCleanupJournalRecordsEveryStateAcrossAReopen() async throws {
         let url = directory.file("library.sqlite")
         let batchID = UUID()
+        let scope = scope(batchID: batchID)
 
         do {
             let library = try SQLitePenLibrary(url: url)
-            try await library.record(.prepared, batchID: batchID)
-            try await library.record(.requested, batchID: batchID)
+            try await library.record(.prepared, scope: scope)
+            try await library.record(.requested, scope: scope)
         }
 
         let reopened = try SQLitePenLibrary(url: url)
         let latest = try await reopened.latestState(batchID: batchID)
         XCTAssertEqual(latest, .requested)
 
-        try await reopened.record(.confirmed, batchID: batchID)
+        try await reopened.record(.confirmed, scope: scope)
         let states = try await reopened.recordedStates(batchID: batchID)
         XCTAssertEqual(states, [.prepared, .requested, .confirmed])
     }
@@ -345,5 +354,115 @@ final class SQLitePenLibraryTests: XCTestCase {
         let library = try SQLitePenLibrary(url: directory.file("library.sqlite"))
         let state = try await library.latestState(batchID: UUID())
         XCTAssertNil(state)
+        let scope = try await library.recordedScope(batchID: UUID())
+        XCTAssertNil(scope)
+    }
+
+    func testCleanupJournalReturnsTheRecordedScopeInCanonicalOrder() async throws {
+        let url = directory.file("library.sqlite")
+        let batchID = UUID()
+        let later = PageIdentity(section: 3, owner: 27, book: 700, page: 9)
+        let earlier = PageIdentity(section: 3, owner: 27, book: 700, page: 2)
+        let recorded = scope(batchID: batchID, target: .page, pages: [later, earlier])
+
+        do {
+            let library = try SQLitePenLibrary(url: url)
+            try await library.record(.prepared, scope: recorded)
+        }
+
+        let reopened = try SQLitePenLibrary(url: url)
+        let stored = try await reopened.recordedScope(batchID: batchID)
+        XCTAssertEqual(stored?.target, .page)
+        XCTAssertEqual(stored?.pages, [earlier, later])
+    }
+
+    func testOutstandingScopesListOnlyRequestedBatchesOldestFirst() async throws {
+        let library = try SQLitePenLibrary(url: directory.file("library.sqlite"))
+        let requestedFirst = UUID()
+        let requestedSecond = UUID()
+        let prepared = UUID()
+        let confirmed = UUID()
+
+        try await library.record(.requested, scope: scope(batchID: requestedFirst))
+        try await library.record(.prepared, scope: scope(batchID: confirmed))
+        try await library.record(.requested, scope: scope(batchID: confirmed))
+        try await library.record(.confirmed, scope: scope(batchID: confirmed))
+        try await library.record(.prepared, scope: scope(batchID: prepared))
+        try await library.record(.requested, scope: scope(batchID: requestedSecond))
+
+        let outstanding = try await library.outstandingScopes()
+        XCTAssertEqual(outstanding.map(\.batchID), [requestedFirst, requestedSecond])
+    }
+
+    func testAConfirmedScopeIsNoLongerOutstanding() async throws {
+        let library = try SQLitePenLibrary(url: directory.file("library.sqlite"))
+        let batchID = UUID()
+        let scope = scope(batchID: batchID)
+
+        try await library.record(.requested, scope: scope)
+        var outstanding = try await library.outstandingScopes()
+        XCTAssertEqual(outstanding.map(\.batchID), [batchID])
+
+        try await library.record(.confirmed, scope: scope)
+        outstanding = try await library.outstandingScopes()
+        XCTAssertTrue(outstanding.isEmpty)
+    }
+
+    func testAnUndecodableRecordedScopeIsRefused() async throws {
+        let url = directory.file("library.sqlite")
+        let batchID = UUID()
+
+        do {
+            let library = try SQLitePenLibrary(url: url)
+            try await library.record(.prepared, scope: scope(batchID: batchID))
+        }
+
+        // A row this build cannot decode must be refused rather than read as an
+        // empty scope: "the pen no longer holds these pages" is exactly the claim
+        // a deletion outcome must not invent.
+        do {
+            let connection = try SQLiteConnection(path: url.path)
+            try connection.execute("UPDATE cleanup_requests SET pages = 'not json'")
+        }
+
+        let reopened = try SQLitePenLibrary(url: url)
+        do {
+            _ = try await reopened.recordedScope(batchID: batchID)
+            XCTFail("expected an undecodable scope to be refused")
+        } catch {
+            XCTAssertEqual(error as? StorageError, .unreadableCleanupScope(batchID: batchID))
+        }
+    }
+
+    func testAnUndecodableJournalStateIsRefused() async throws {
+        let url = directory.file("library.sqlite")
+        let batchID = UUID()
+
+        do {
+            let library = try SQLitePenLibrary(url: url)
+            try await library.record(.requested, scope: scope(batchID: batchID))
+        }
+
+        // A state this build cannot read must not be reported as "no request",
+        // which is the one answer that would let the same deletion be sent twice.
+        do {
+            let connection = try SQLiteConnection(path: url.path)
+            try connection.execute("UPDATE cleanup_journal SET state = 'unknown'")
+        }
+
+        let reopened = try SQLitePenLibrary(url: url)
+        do {
+            _ = try await reopened.latestState(batchID: batchID)
+            XCTFail("expected an undecodable state to be refused")
+        } catch {
+            XCTAssertEqual(error as? StorageError, .unreadableCleanupState(batchID: batchID))
+        }
+
+        do {
+            _ = try await reopened.recordedStates(batchID: batchID)
+            XCTFail("expected the recorded history to refuse the same row")
+        } catch {
+            XCTAssertEqual(error as? StorageError, .unreadableCleanupState(batchID: batchID))
+        }
     }
 }

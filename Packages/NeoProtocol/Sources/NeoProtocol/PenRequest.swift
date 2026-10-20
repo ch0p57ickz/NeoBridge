@@ -2,15 +2,54 @@
 ///
 /// Values come from `REQ.OfflineTransOption` in Neo iOS SDK 3.0
 /// (`NISDK3/Classes/Model/RequestStruct.swift`).
+///
+/// The enum carries every value the SDK defines, including the deleting one, so
+/// the wire table stays complete. It is not what the read path sends: the session
+/// sends an ``OfflineReadTransferOption``, which has no deleting member, so a
+/// `0x23` request the session builds can never ask the pen to delete during the
+/// transfer.
 public enum OfflineTransferOption: UInt8, Hashable, Sendable {
-    /// `NotNextTransfer`: leave the note's data untouched.
+    /// `NotNextTransfer` (0): leave the note's data untouched.
     case notNextTransfer = 0
 
-    /// `NextAndDelete`: delete the note's data after the transfer.
+    /// `NextAndDelete` (1): delete the note's data after the transfer.
+    ///
+    /// Excluded from the read path by ``OfflineReadTransferOption``. Deleting
+    /// during the transfer would remove the pen's copy before the host has
+    /// committed anything, so the deletion this build can perform travels on the
+    /// acknowledged path instead.
     case nextAndDelete = 1
 
-    /// `NextAndReserve`: keep the note's data so a later read still finds it.
+    /// `NextAndReserve` (2): keep the note's data so a later read still finds it.
     case nextAndReserve = 2
+}
+
+/// The `0x23` transfer options the offline read path may send.
+///
+/// The type exists so the read path has no route to a deleting option: it has no
+/// `nextAndDelete` member, so `PenRequest.offlineData(for:)` cannot be asked to
+/// delete during a transfer even by a mistake at a call site.
+///
+/// Two physical A1 reads on 2026-10-19 established the non-destructive behavior
+/// of ``nextAndReserve``: a second read of note 700 returned all 8062 strokes
+/// again, 8062 of them already stored, so the pen still held every stroke after
+/// the first read. No read has shown either option to advance a cursor and return
+/// only new strokes, so ``nextAndReserve`` is the established non-destructive
+/// option rather than an incremental one. See `docs/protocol-a1.md`.
+public enum OfflineReadTransferOption: UInt8, Hashable, Sendable, CaseIterable {
+    /// `NotNextTransfer` (0): leave the note's data untouched.
+    case notNextTransfer = 0
+
+    /// `NextAndReserve` (2): keep the note's data so a later read still finds it.
+    case nextAndReserve = 2
+
+    /// The wire value this option carries.
+    public var option: OfflineTransferOption {
+        switch self {
+        case .notNextTransfer: return .notNextTransfer
+        case .nextAndReserve: return .nextAndReserve
+        }
+    }
 }
 
 /// Whether the pen should compress a `0x23` transfer.
@@ -78,6 +117,11 @@ public enum PenRequest {
         return PenFrameEncoder.encode(command: .versionInfo, payload: payload)
     }
 
+    /// Builds the physical A1's zero-payload `0x04` state request.
+    public static func penState() -> [UInt8]? {
+        PenFrameEncoder.encode(command: .penState, payload: [])
+    }
+
     /// Builds the `0x21` offline note list request.
     ///
     /// Body: `sectionOwnerId` (4).
@@ -134,17 +178,25 @@ public enum PenRequest {
 
     /// Builds the `0x23` request for a discovered note.
     ///
-    /// The physical A1 trace of 2026-10-18 used `next-and-reserve`, no
-    /// compression, and a zero page count; the session follows that trace.
+    /// The transfer option is an ``OfflineReadTransferOption``, so the read path
+    /// cannot ask the pen to delete during the transfer. The default is
+    /// `nextAndReserve`: the physical A1 kept every stroke across two reads with
+    /// that option, which establishes its non-destructive behavior. No trace has
+    /// established an option that returns only new strokes, so this is the
+    /// non-destructive option rather than an incremental one.
+    ///
+    /// Source of the behavior: the 2026-10-18 and 2026-10-19 physical A1 reads in
+    /// `docs/protocol-a1.md`, where a second read of note 700 re-transferred all
+    /// 8062 stored strokes instead of deleting them.
     public static func offlineData(
         for note: PenOfflineNote,
-        transferOption: OfflineTransferOption = .nextAndReserve,
+        transferOption: OfflineReadTransferOption = .nextAndReserve,
         compressionOption: OfflineCompressionOption = .none
     ) -> [UInt8]? {
         offlineData(
             sectionOwnerId: note.sectionOwnerId,
             noteId: note.note,
-            transferOption: transferOption,
+            transferOption: transferOption.option,
             compressionOption: compressionOption
         )
     }

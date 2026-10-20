@@ -30,8 +30,13 @@ struct PenSyncMenu: View {
         }
 
         if let outcome = controller.outcome {
+            if let state = controller.penState {
+                Text("Battery: \(state.batteryLevel)% · \(state.isCharging ? "Charging" : "Not charging")")
+                Text("Pen storage used: \(state.memoryUsed)%")
+            }
             Text(Self.summary(for: outcome.summary))
             Text(outcome.notice)
+            Text(outcome.cleanupNotice)
             if let export = outcome.export, !export.succeeded {
                 ForEach(export.failed, id: \.path) { artifact in
                     Text(Self.failure(for: artifact))
@@ -45,6 +50,20 @@ struct PenSyncMenu: View {
 
         if let message = controller.errorMessage {
             Text(message)
+        }
+
+        Divider()
+        Text(PenSyncController.cleanupIntentStatement)
+        Text(controller.cleanupIntentLine)
+        if controller.canChooseCleanup {
+            if controller.isCleanupIntended {
+                Button(PenSyncController.retainPenDataTitle) { controller.retainPenDataForThisSync() }
+            } else {
+                Button("Remove Them After a Successful Read") { controller.intendCleanupForThisSync() }
+            }
+        }
+        if let reason = controller.cleanupUnavailableReason {
+            Text("Cleanup is unavailable: \(reason)")
         }
 
         Divider()

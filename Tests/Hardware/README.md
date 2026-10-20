@@ -110,6 +110,27 @@ transcript, so it can be kept. Raw captures still belong in
 
 ## pen-session
 
+### Pen-state reporting acceptance (new change)
+
+The 2026-10-19 physical A1 probe established `0x04`/`0x84` and the 64-byte
+payload layout in `docs/protocol-a1.md`. After building the app with this change,
+run the headless acceptance command above and check that `outboundCommands`
+starts `0x01,0x04,0x21`. Open the menu and details window after a completed read
+and compare their battery, charging, and storage-used values with a fresh sanitized
+`0x84` probe. Do not record a pass for the app display until that observation is
+made; the earlier acceptance runs predate this feature.
+
+| Scenario | Automated coverage | Hardware result |
+| --- | --- | --- |
+| State query follows handshake | `PenSessionTests`, `BluetoothPenSyncRunnerTests` | Pending app run with physical A1 |
+| Battery, charging, storage match the pen | `PenSessionTests`, `PenSyncControllerTests` | Pending app display comparison with physical A1 |
+
+An app acceptance attempt on 2026-10-19 used the newly built bundle and failed
+before connection: no pen advertised `Neosmartpen_A1` during the scan. The sanitized
+transcript is `/private/tmp/neobridge-pen-health-acceptance.txt`; it contains no
+pen-state exchange. The two rows above remain pending.
+
+
 | Scenario | Automated coverage | The hardware run must confirm | Pass / Fail |
 | --- | --- | --- | --- |
 | Session runs on a fake transport | `PenSessionTests` drives the whole lifecycle over `FakePenTransport` on Linux | Not applicable to hardware; the same lifecycle runs here over CoreBluetooth | **Pass.** The same lifecycle ran over CoreBluetooth: 612 outbound frames in 3052 inbound chunks, reading one note. |
@@ -226,6 +247,20 @@ status was 0.
 | Export content is inspected for device secrets | `NeoExportTests`, `Tests/Integration` | No exported file contains a Bluetooth address, serial number, or authentication material | **Pass.** A scan of all 66 files found no pen model, firmware, serial number, Bluetooth address, or `NWP-F151` string. |
 | Successful import | `PenSessionTests`, `BluetoothPenSyncRunnerTests` | The pen's strokes remain on the pen and no deletion request is sent | **Pass.** The transcript's `outboundCommands` line lists only `0x01`, `0x21`, `0x22`, `0x23`, and `0xA4` (707 acknowledgements); no `0x25` or `0x27` appears anywhere in the transcript. |
 
+## pen cleanup
+
+These rows need a real A1 **and** the deletion evidence gate open. The gate is
+closed in this build, because no trace has established a deletion command's payload
+framing, scope, response meaning, or interrupted-transfer retention, so none of
+them can be reached yet. They stay unchecked until a trace opens the gate.
+
+| Scenario | Automated coverage | The hardware run must confirm | Pass / Fail |
+| --- | --- | --- | --- |
+| Default cleanup after a verified import and export | `OfflineSessionIntegrationTests`, `PenLibraryImporterTests` | The pen receives exactly one deletion command for the read's own pages, and its response is proven to mean that scope was removed | **Unverified.** The gate is closed, so no deletion command is reachable. |
+| Library and published copies survive deletion | `OfflineSessionIntegrationTests`, `FilePublicationTests` | Every deleted page is still readable in the library and can be published again | **Unverified.** Requires a completed deletion. |
+| Newer unverified strokes are untouched | `PenLibraryImporterTests`, `OfflineSessionIntegrationTests` | Strokes written after the read, on the same page or note, remain on the pen | **Unverified.** Requires a completed deletion. |
+| Retaining mode sends no deletion through the whole stack | `PenSessionTests`, `PenLibraryImporterTests`, `NeoBridgeMacCoreTests` | A headless retaining run's `outboundCommands` line contains no `0x25` or `0x27` | **Unverified.** The headless retaining path has not been run. |
+
 ## After the run
 
 1. Tick each row that passed and record the observed value for the rows that
@@ -237,10 +272,14 @@ status was 0.
 3. Confirm cleanup stayed on the pen:
 
    ```bash
-   grep -rn "deletionEnabled" Packages/NeoCore/Sources/NeoCore
+   grep -rn "deletionEnabled\|PenDeletionEvidence" Packages/NeoCore/Sources/NeoCore
    ```
 
-   `PenCleanupPolicy.deletionEnabled` must still be `false`, and the command log
-   must contain no `0x25` or `0x27`.
-4. If a row failed, leave it unchecked and record the failure. Do not archive
+   `PenCleanupPolicy.deletionEnabled` must still derive from `PenDeletionEvidence`,
+   the evidence record must still hold a `pending` verdict for every condition, and
+   the command log must contain no `0x25` or `0x27`.
+4. Confirm the retaining mode sends no deletion through the whole stack: run one
+   headless read after making retention the intent, and check that its
+   `outboundCommands` line contains no `0x25` or `0x27`.
+5. If a row failed, leave it unchecked and record the failure. Do not archive
    the change while a row that the change depends on is failing.

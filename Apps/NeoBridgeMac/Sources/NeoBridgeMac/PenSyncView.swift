@@ -34,6 +34,10 @@ struct PenSyncView: View {
 
             Divider()
 
+            cleanup
+
+            Divider()
+
             actions
         }
         .padding(20)
@@ -78,6 +82,10 @@ struct PenSyncView: View {
 
     @ViewBuilder
     private func completed(_ outcome: PenReadOutcome) -> some View {
+        if let state = controller.penState {
+            Text("Battery: \(state.batteryLevel)% · \(state.isCharging ? "Charging" : "Not charging")")
+            Text("Pen storage used: \(state.memoryUsed)%")
+        }
         if outcome.isEmpty {
             Text("The pen reported no stroke to save.")
                 .foregroundStyle(.secondary)
@@ -98,6 +106,10 @@ struct PenSyncView: View {
 
         Text(outcome.notice)
             .font(.callout)
+
+        Text(outcome.cleanupNotice)
+            .font(.callout)
+            .foregroundStyle(.secondary)
 
         if let export = outcome.export, !export.artifacts.isEmpty {
             Text("Files")
@@ -150,6 +162,37 @@ struct PenSyncView: View {
                 .foregroundStyle(.secondary)
             if let folderMessage {
                 Text(folderMessage)
+                    .font(.callout)
+            }
+        }
+    }
+
+    /// The pen's copy: the intent on screen, and the outcome after a read.
+    @ViewBuilder
+    private var cleanup: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Pen cleanup")
+                .font(.headline)
+            Text(PenSyncController.cleanupIntentStatement)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            Text(controller.cleanupIntentLine)
+                .font(.callout)
+
+            if controller.canChooseCleanup {
+                if controller.isCleanupIntended {
+                    Button(PenSyncController.retainPenDataTitle) {
+                        controller.retainPenDataForThisSync()
+                    }
+                } else {
+                    Button("Remove Them After a Successful Read") {
+                        controller.intendCleanupForThisSync()
+                    }
+                }
+            }
+
+            if let reason = controller.cleanupUnavailableReason {
+                Text("Cleanup is unavailable: \(reason)")
                     .font(.callout)
             }
         }

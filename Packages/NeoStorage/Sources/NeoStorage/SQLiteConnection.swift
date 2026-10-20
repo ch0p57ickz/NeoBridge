@@ -25,6 +25,20 @@ public enum StorageError: Error, Hashable, Sendable {
     /// taken from the pen again rather than committed from a partial buffer.
     case collectedStrokesUnavailable(batchID: UUID)
 
+    /// A recorded cleanup scope could not be read back.
+    ///
+    /// The row holds a value this build does not understand, so the request's
+    /// scope cannot be trusted and no deletion may be sent for it.
+    case unreadableCleanupScope(batchID: UUID)
+
+    /// A recorded cleanup state could not be read back.
+    ///
+    /// The row holds a state this build does not understand, so whether the
+    /// request was already sent cannot be known. It is refused rather than read
+    /// as "never requested", which would risk sending a second deletion for the
+    /// same scope.
+    case unreadableCleanupState(batchID: UUID)
+
     /// A human-readable message for the app's error row.
     public var message: String {
         switch self {
@@ -40,6 +54,11 @@ public enum StorageError: Error, Hashable, Sendable {
             return "This read cannot be exported again: its stored batch is\(described)."
         case .collectedStrokesUnavailable:
             return "The pen read was interrupted before it was stored. Read the pen again."
+        case .unreadableCleanupScope:
+            return "A recorded cleanup request could not be read back, so no deletion was sent."
+        case .unreadableCleanupState:
+            return "A recorded cleanup request has a state this build cannot read,"
+                + " so no deletion was sent for it."
         }
     }
 }

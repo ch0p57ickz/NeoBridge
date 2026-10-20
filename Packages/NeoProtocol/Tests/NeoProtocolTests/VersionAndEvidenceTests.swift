@@ -103,14 +103,61 @@ final class CommandEvidenceTests: XCTestCase {
         XCTAssertEqual(registry.evidence(for: command).level, .provisional)
     }
 
-    func testDeletionCommandsAreBlocked() {
+    func testDeletionCommandsAreGatedAndRefuseWhileTheGateIsClosed() {
+        // The commands are no longer hardcoded as blocked: their authorization
+        // comes from the recorded evidence, and with no physical A1 deletion trace
+        // the gate names the conditions that are not established yet.
         for command in [PenCommand.deleteOfflineNoteRequest, .deleteOfflinePageRequest] {
-            guard case .blocked = registry.authorization(for: command) else {
-                return XCTFail("expected blocked for \(command)")
+            let authorization = registry.authorization(for: command)
+            guard case .gated(let reason) = authorization else {
+                return XCTFail("expected gated for \(command), got \(authorization)")
             }
+            XCTAssertTrue(reason.contains("deletion evidence gate"), reason)
             XCTAssertFalse(registry.maySendProductionRequest(command))
             XCTAssertFalse(registry.mayEmitCompletedStroke(command))
+            XCTAssertEqual(registry.evidence(for: command).level, .officialSDK)
         }
+    }
+
+    func testDeletionGateOpensOnlyForTheProvenCommandWithEveryVerdictSafe() {
+        let safe = Dictionary(
+            uniqueKeysWithValues: PenDeletionCondition.allCases.map {
+                ($0, PenDeletionEvidence.Verdict.safe)
+            }
+        )
+
+        // A proven note scope opens `0x25` and leaves `0x27` gated, because the
+        // trace establishes what one command does, not what the other does.
+        let noteProven = CommandEvidenceRegistry(
+            entries: registryEntries,
+            deletionEvidence: PenDeletionEvidence(target: .note, verdicts: safe)
+        )
+        XCTAssertTrue(noteProven.maySendProductionRequest(.deleteOfflineNoteRequest))
+        XCTAssertFalse(noteProven.maySendProductionRequest(.deleteOfflinePageRequest))
+
+        // An unsafe verdict keeps both closed even though a command is proven.
+        var unsafeVerdicts = safe
+        unsafeVerdicts[.interruptedTransferRetention] = .unsafe
+        let unsafe = CommandEvidenceRegistry(
+            entries: registryEntries,
+            deletionEvidence: PenDeletionEvidence(target: .page, verdicts: unsafeVerdicts)
+        )
+        for command in [PenCommand.deleteOfflineNoteRequest, .deleteOfflinePageRequest] {
+            XCTAssertFalse(unsafe.maySendProductionRequest(command), "\(command)")
+        }
+    }
+
+    /// The evidence entries of the default registry, so a test can vary only the
+    /// deletion gate.
+    private var registryEntries: [PenCommand: CommandEvidence] {
+        var entries: [PenCommand: CommandEvidence] = [:]
+        for command in PenCommand.allCases {
+            let evidence = registry.evidence(for: command)
+            if evidence.level != .none {
+                entries[command] = evidence
+            }
+        }
+        return entries
     }
 
     func testAuthenticationWithoutFixtureEvidenceIsUnsupported() {
@@ -224,13 +271,14 @@ final class PenEventDecoderTests: XCTestCase {
         XCTAssertEqual(decoder.decode(frame), .error(.unsupportedCommand(command: .responseFirmwareFile1)))
     }
 
-    func testBlockedCommandReturnsBlockedError() {
+    func testGatedCommandReturnsAGatedError() {
         var decoder = PenEventDecoder()
         let frame = PenFrame(commandByte: PenCommand.deleteOfflinePageRequest.rawValue, command: .deleteOfflinePageRequest, payload: [])
-        guard case .error(.blockedCommand(let command, _)) = decoder.decode(frame) else {
-            return XCTFail("expected a blocked command error")
+        guard case .error(.gatedCommand(let command, let reason)) = decoder.decode(frame) else {
+            return XCTFail("expected a gated command error")
         }
         XCTAssertEqual(command, .deleteOfflinePageRequest)
+        XCTAssertTrue(reason.contains("deletion evidence gate"), reason)
     }
 
     func testProvisionalCommandIsIgnoredAndCannotCompleteAStroke() {
@@ -428,6 +476,7 @@ final class CommandFrameKindTests: XCTestCase {
         .soundResponseOid,
         .soundResponseStatus,
         .versionInfo,
+        .penState,
         .offlineNoteListRequest,
         .offlinePageListRequest,
         .offlineDataRequest1,
@@ -467,7 +516,6 @@ final class CommandFrameKindTests: XCTestCase {
         let unclassified: [PenCommand] = [
             .comparePassword,
             .changePassword,
-            .penState,
             .setPenState,
             .systemChange,
             .systemInfo,

@@ -54,6 +54,9 @@ public enum PenSessionStep: String, Hashable, Sendable, CaseIterable {
     /// Sending `0x01` and awaiting the `0x81` version response.
     case handshake
 
+    /// Sending `0x04` and awaiting the `0x84` pen state.
+    case penState
+
     /// Sending `0x21` and awaiting the `0xA1` note list.
     case noteList
 
@@ -70,6 +73,7 @@ public enum PenSessionStep: String, Hashable, Sendable, CaseIterable {
     public var label: String {
         switch self {
         case .handshake: return "the version handshake"
+        case .penState: return "the pen state response"
         case .noteList: return "the offline note list"
         case .pageList: return "the offline page list"
         case .dataInfo: return "the offline data info response"
@@ -172,6 +176,9 @@ public struct PenSessionTimeouts: Hashable, Sendable {
     /// The wait for the `0x81` version response.
     public var handshake: Duration
 
+    /// The wait for the `0x84` pen state response.
+    public var penState: Duration
+
     /// The wait for the `0xA1` note list.
     public var noteList: Duration
 
@@ -186,12 +193,14 @@ public struct PenSessionTimeouts: Hashable, Sendable {
 
     public init(
         handshake: Duration = .seconds(10),
+        penState: Duration = .seconds(10),
         noteList: Duration = .seconds(10),
         pageList: Duration = .seconds(10),
         dataInfo: Duration = .seconds(10),
         dataPacket: Duration = .seconds(20)
     ) {
         self.handshake = handshake
+        self.penState = penState
         self.noteList = noteList
         self.pageList = pageList
         self.dataInfo = dataInfo
@@ -205,6 +214,7 @@ public struct PenSessionTimeouts: Hashable, Sendable {
     public func duration(for step: PenSessionStep) -> Duration {
         switch step {
         case .handshake: return handshake
+        case .penState: return penState
         case .noteList: return noteList
         case .pageList: return pageList
         case .dataInfo: return dataInfo
@@ -275,6 +285,9 @@ public struct PenSessionResult: Hashable, Sendable {
     /// The pen's advertised device name and firmware version.
     public let versionInfo: PenVersionInfo
 
+    /// The measured state when this session requested it.
+    public let penState: PenState?
+
     /// One entry per note that was read, in the order the pen listed them.
     public let notes: [PenNoteTransfer]
 
@@ -313,8 +326,11 @@ public struct PenSessionResult: Hashable, Sendable {
 /// so a retry is a new session over a new transport; the failed session closes
 /// the transport it was given.
 ///
-/// Deletion stays disabled: the session sends no `0x25` or `0x27` command, and
-/// the evidence table blocks both.
+/// Deletion is not part of a read: the session sends no `0x25` or `0x27` command,
+/// and the evidence table gates both behind the deletion evidence, which no
+/// physical A1 trace has opened yet. Cleanup travels on the acknowledged path
+/// instead, so it can be ordered after a durable import and published exports;
+/// see ``PenCleanupPolicy``.
 public final class PenSession: Sendable {
     private struct Status: Sendable {
         var state: PenSessionState = .idle
@@ -330,6 +346,7 @@ public final class PenSession: Sendable {
     private let appVersion: String
     private let declaredProtocolVersion: String
     private let penClockIsTrusted: Bool
+    private let queryPenState: Bool
     private let onStateChange: (@Sendable (PenSessionState) -> Void)?
     private let status = Mutex(Status())
 
@@ -362,6 +379,7 @@ public final class PenSession: Sendable {
         appVersion: String = "1.0.0",
         declaredProtocolVersion: String = PenRequest.sdkDeclaredProtocolVersion,
         penClockIsTrusted: Bool = true,
+        queryPenState: Bool = false,
         onStateChange: (@Sendable (PenSessionState) -> Void)? = nil
     ) {
         self.transport = transport
@@ -373,6 +391,7 @@ public final class PenSession: Sendable {
         self.appVersion = appVersion
         self.declaredProtocolVersion = declaredProtocolVersion
         self.penClockIsTrusted = penClockIsTrusted
+        self.queryPenState = queryPenState
         self.onStateChange = onStateChange
     }
 
@@ -455,6 +474,27 @@ public final class PenSession: Sendable {
             throw PenSessionError.unsupportedVersion(version)
         }
 
+        let measuredState: PenState?
+        if queryPenState {
+            try await send(PenRequest.penState(), command: .penState)
+            guard let stateFrame = try await awaitFrame(
+                channel: channel,
+                expecting: .responsePenState,
+                step: .penState
+            ) else {
+                throw PenSessionError.transportEnded(step: .penState)
+            }
+            try requireAccepted(stateFrame)
+            guard let state = PenState(payload: stateFrame.payload) else {
+                throw PenSessionError.protocolFailure(
+                    .malformedPayload(command: .responsePenState, reason: "expected a 64-byte state with percentages from 0 through 100")
+                )
+            }
+            measuredState = state
+        } else {
+            measuredState = nil
+        }
+
         // 3. Discovery and retrieval.
         transition(to: .syncing)
 
@@ -466,6 +506,7 @@ public final class PenSession: Sendable {
             return PenSessionResult(
                 version: version,
                 versionInfo: info,
+                penState: measuredState,
                 notes: [],
                 strokes: []
             )
@@ -482,6 +523,7 @@ public final class PenSession: Sendable {
         return PenSessionResult(
             version: version,
             versionInfo: info,
+            penState: measuredState,
             notes: transfers,
             strokes: strokes
         )
