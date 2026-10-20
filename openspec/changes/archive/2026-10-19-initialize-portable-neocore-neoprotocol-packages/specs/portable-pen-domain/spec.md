@@ -26,16 +26,22 @@ The system SHALL represent pen events and assembled strokes with page identity, 
 - **WHEN** a point arrives before down or the page changes before up
 - **THEN** the system reports an invalid sequence and emits no completed stroke
 
-### Requirement: Replay-safe stroke identity
-The system SHALL derive a stable SHA-256 fingerprint from a versioned canonical representation of each completed stroke. Two strokes are replay-equivalent only when their full page tuple, pen-origin stroke start time, and ordered point sequence match after normalization to the same integer coordinate, pen-time, and pressure units. The fingerprint MUST exclude host arrival time, live/offline source, and transport chunking. It MUST preserve point order and MUST NOT round or omit normalized point values. A stroke without a reliable pen-origin start time MUST NOT be automatically deduplicated across sources.
+### Requirement: Replay-equivalent strokes share a fingerprint
+The system SHALL derive a stable SHA-256 fingerprint from a versioned canonical representation of each completed stroke. Two strokes are replay-equivalent only when their full page tuple, pen-origin stroke start time, and ordered point sequence match after normalization to the same integer coordinate, pen-time, and pressure units.
+
+#### Scenario: Changed stroke data
+- **WHEN** a normalized point, pen-origin start time, or page identity changes
+- **THEN** the canonical fingerprint changes
+
+### Requirement: A fingerprint ignores transport and arrival facts
+The fingerprint MUST exclude host arrival time, live/offline source, and transport chunking. It MUST preserve point order and MUST NOT round or omit normalized point values.
 
 #### Scenario: Duplicate replay
 - **WHEN** the same completed stroke is processed from live and offline input with matching pen-origin time and ordered normalized points
 - **THEN** both inputs produce the same fingerprint for deduplication
 
-#### Scenario: Changed stroke data
-- **WHEN** a normalized point, pen-origin start time, or page identity changes
-- **THEN** the canonical fingerprint changes
+### Requirement: A stroke without a pen-origin time is not deduplicated
+A stroke without a reliable pen-origin start time MUST NOT be automatically deduplicated across sources.
 
 #### Scenario: Missing pen time
 - **WHEN** a completed stroke has no reliable pen-origin start time

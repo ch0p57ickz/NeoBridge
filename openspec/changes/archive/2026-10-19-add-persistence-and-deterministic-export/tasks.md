@@ -40,5 +40,22 @@
   - Verified on Linux: all five packages build with pinned dependencies, import no Apple-only framework, and pass; the SQLite header precondition is checked first.
 - [x] 5.3 Run `Scripts/remote-mac-build.sh` on the Mac runner with its Xcode gate enabled; record the passing portable, SwiftUI, CoreBluetooth, and `xcodebuild` results.
   - Recorded in `docs/portable-verification.md`: portable suites, SwiftPM release build, `xcodebuild` gate, and the assembled ad-hoc-signed bundle all pass.
-- [ ] 5.4 Run physical A1 save-and-export acceptance with a sanitized transcript, confirm output bytes and `keepOnPen` outbound commands, and record the result in `Tests/Hardware/README.md`; leave this task unchecked if hardware is unavailable.
-  - Blocked: no physical A1 pen is available to this run. The headless acceptance path (`NEOBRIDGE_ACCEPTANCE_TRACE` plus `NEOBRIDGE_EXPORT_DIRECTORY`) is implemented and the deletion/`keepOnPen` behavior is covered by the portable session and integration tests, but the on-device save-and-export bytes are not yet confirmed. Leave unchecked until a pen is available.
+- [x] 5.4 Run physical A1 save-and-export acceptance with a sanitized transcript, confirm output bytes and `keepOnPen` outbound commands, and record the result in `Tests/Hardware/README.md`; leave this task unchecked if hardware is unavailable.
+  - Verified 2026-10-19 against a physical `NWP-F151` (protocol `2.23`) from the built bundle: one headless read of note 700, section 3, owner 27 saved 8064 strokes across 22 pages (adding 2, with 8062 already stored from the earlier hand-run) and published 66 files (22 x JSON, SVG, Markdown) for pages 1 and 16-36. Exit status 0.
+  - Byte counts match the files on disk (spot-checked three pages in both directions), all 22 JSON files parse, all 22 SVG files are well-formed, every page declares `viewBox="0 0 54.84 88.58"` at `130.0mm x 210.0mm`, and no file carries a pen model, firmware, serial number, or Bluetooth address.
+  - The transcript's `outboundCommands` line lists only `0x01`, `0x21`, `0x22`, `0x23`, and `0xA4`; no `0x25` or `0x27` appears anywhere, so `keepOnPen` held with 707 acknowledgements sent for the 707 transfer packets.
+  - The transcript (12,355 lines) is the sanitized packet log; no Bluetooth addresses, serial numbers, or authentication material were found in it. Recorded under "Save-and-export acceptance (add-persistence-and-deterministic-export)" in `Tests/Hardware/README.md`.
+
+## 6. SVG page canvas
+
+- [x] 6.1 Draw every SVG page on one declared canvas instead of each page's own ink, so the pages of a note share a scale and an origin; verify that a sparse and a dense page declare the same canvas.
+  - Verified: 41 NeoExport tests pass, including `testEveryPageRendersOnTheSameCanvas`.
+- [x] 6.2 Set the stroke width from the pen's real line width instead of one pen coordinate unit, and declare the canvas size in millimetres; verify the golden bytes.
+  - The canvas is the 130 x 210 mm sheet, and one pen unit is 6.72 NCode project points, which is 2.3707 mm. The stroke width is 0.15 units, the one-point line the SDK's own renderer draws.
+- [x] 6.3 Never clip a stroke: grow the canvas for ink reaching past the sheet's right or bottom edge, and keep the origin fixed so pages still line up; verify with a point past the sheet and with a negative point.
+- [x] 6.4 Document the canvas, its provenance, and the millimetre size in the package README, and check the result against real handwriting.
+  - Re-rendered all 22 pages of a real note 700 export through the shipped renderer: every page declared `viewBox="0 0 54.84 88.58"` and the handwriting was legible. The check used a throwaway test, because it needs the owner's exported files.
+- [x] 6.5 Record the pen coordinate unit and the sheet geometry, and correct the earlier guess that treated a pen unit as 2.54 mm.
+  - Recorded in `PenUnits` (the unit and its corroboration) and in `PageCanvas` and the package README (the sheet). One unit is 6.72 NCode project points (`ScaleHelper.nprojToDot`, `NeoSmartpen/iOS-SDK3.0`), which is 2.3707 mm. The sheet size belongs to the notebook, not the pen: Neo sells NCode paper from 148 x 83 mm pocket notebooks to A4, and the A1's own notebook is 130 x 210 mm.
+  - The two figures corroborate each other. The ink reaches 54.39 units on x, so a unit above `130 / 54.39 = 2.390` mm would put that ink past the edge of the 130 mm sheet: the SDK's 2.3707 mm fits with 0.8% to spare, and 2.54 mm would run about 8 mm over. That makes 2.54 mm inconsistent with the owner's own notebook rather than merely unverified.
+  - The physical unit is not part of the wire format, so `docs/protocol-a1.md` records neither figure; the coordinate model is the right home. The sheet size is a notebook property, so a future notebook would need its own constants.

@@ -6,10 +6,7 @@ The packet body SHALL be `command, optional error code, length, payload`. A resp
 command SHALL carry an error code byte between the command and the length field; an event
 or notification command SHALL NOT. The decoder MUST determine which layout a command uses
 from the command identifier, and MUST report the error code together with the decoded
-packet. A response whose error code is non-zero MUST produce an explicit protocol error
-and MUST NOT be decoded as a payload. The offline data command `0x24`
-(`REQ2_OFFLINE_DATA`), which the pen sends, MUST be framed without an error code; its
-host-side acknowledgement `0xA4` (`RES2_OFFLINE_DATA`) is a response and carries one.
+packet.
 
 #### Scenario: Response frame with an error code
 
@@ -21,15 +18,31 @@ host-side acknowledgement `0xA4` (`RES2_OFFLINE_DATA`) is a response and carries
 - **WHEN** a frame is replayed whose command identifier is an event
 - **THEN** the decoder reads the length immediately after the command and reports no error code
 
+### Requirement: Offline data framing
+
+The offline data command `0x24` (`REQ2_OFFLINE_DATA`), which the pen sends, MUST be framed
+without an error code; its host-side acknowledgement `0xA4` (`RES2_OFFLINE_DATA`) is a
+response and carries one.
+
 #### Scenario: Offline data framing
 
 - **WHEN** a frame carries the offline data identifier `0x24` from the pen
 - **THEN** the decoder reads the length immediately after the command and recovers the declared payload
 
+### Requirement: A non-zero error code fails the command
+
+A response whose error code is non-zero MUST produce an explicit protocol error and MUST
+NOT be decoded as a payload.
+
 #### Scenario: Failed response
 
 - **WHEN** a response frame carries a non-zero error code
 - **THEN** the layer that turns frames into device tokens reports an explicit failure for that command and produces no events for that frame, while the framing layer still reports the packet with its error code so the failed exchange stays diagnosable
+
+### Requirement: An unclassified command is rejected
+
+The decoder MUST NOT guess a body layout for a command identifier that the evidence table
+does not classify as a response or an event.
 
 #### Scenario: Unknown command
 
@@ -60,38 +73,49 @@ capability byte.
 - **WHEN** a version payload is shorter than the layout needed to reach the capability byte
 - **THEN** the system reports compressed transfer as unsupported without failing the whole response
 
-### Requirement: Multi-packet offline transfers
+### Requirement: Offline transfers assemble from their packets
 
 The system SHALL assemble an offline data transfer from the packets the pen sends, and
 MUST report whether the transfer is complete. The pen sends one packet per host
 acknowledgement, and each packet carries an identifier and a transfer position of start,
 middle, or end. A packet MUST be decoded on its own terms, because a packet is one slice
-of a transfer rather than a whole one. The system MUST NOT treat a transfer as complete
-before its end packet arrives, and MUST report a packet that does not continue the
-identifier sequence instead of importing a hole. A start packet MUST NOT be required, so
-a transfer that resumes mid-stream after a reconnect is accepted.
+of a transfer rather than a whole one.
 
 #### Scenario: Complete transfer
 
 - **WHEN** a transfer is assembled from its start packet through its end packet
 - **THEN** the assembled stream holds every packet's strokes and the transfer reports complete
 
+### Requirement: A transfer is complete only on its end packet
+
+The system MUST NOT treat a transfer as complete before its end packet arrives.
+
 #### Scenario: Packet before the end
 
 - **WHEN** only start and middle packets have arrived
 - **THEN** the transfer reports incomplete and is not importable
+
+#### Scenario: Packet after the end
+
+- **WHEN** a packet arrives after the transfer has already reported complete
+- **THEN** the system reports an explicit error
+
+### Requirement: An identifier gap is reported, not imported
+
+The system MUST report a packet that does not continue the identifier sequence instead of
+importing a hole.
 
 #### Scenario: Dropped packet
 
 - **WHEN** a packet arrives whose identifier does not continue the sequence
 - **THEN** the system reports an explicit error and does not count that packet
 
+### Requirement: A resumed transfer may begin mid-stream
+
+A start packet MUST NOT be required, so a transfer that resumes mid-stream after a
+reconnect is accepted.
+
 #### Scenario: Resumed transfer
 
 - **WHEN** assembly begins at a packet whose position is middle
 - **THEN** the packet is accepted and the transfer completes when its end packet arrives
-
-#### Scenario: Packet after the end
-
-- **WHEN** a packet arrives after the transfer has already reported complete
-- **THEN** the system reports an explicit error

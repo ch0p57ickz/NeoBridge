@@ -1,10 +1,10 @@
-# Spec Delta
+# page-export Specification
 
 ## Purpose
 
 Publishes portable, reproducible representations of locally stored pages in a directory chosen by the user.
 
-## ADDED Requirements
+## Requirements
 
 ### Requirement: Three page formats
 The system SHALL export each selected non-empty page as one JSON, one SVG, and one Markdown file without cloud access. Users SHALL NOT need to select formats.
@@ -31,6 +31,23 @@ For the same canonical page and stroke multiset and export format version, the s
 #### Scenario: Equal stroke content appears more than once
 - **WHEN** the library retains multiple strokes with identical canonical content because their identity is unreliable
 - **THEN** each occurrence appears in the exported data and its position does not depend on a storage row ID
+
+### Requirement: Fixed page canvas
+The system SHALL draw every SVG page on one declared page canvas, so that the pages of a note share a scale and an origin and can be compared or overlaid. The canvas SHALL be the notebook sheet expressed in pen coordinate units, and the drawing SHALL also declare its size in millimetres. The stroke width SHALL be a pen line rather than one pen coordinate unit.
+
+The canvas SHALL cover the sheet and any ink past the sheet's right or bottom edge. The origin SHALL be fixed, because a moving origin would stop two pages of a note from lining up; ink past the left or top edge is therefore outside the canvas, which a normalized coordinate cannot reach because the wire format carries a `UInt16` integer part.
+
+#### Scenario: Two pages of one note
+- **WHEN** two pages of the same note are exported, one carrying a few strokes and one carrying many
+- **THEN** both drawings declare the same canvas size and the same origin
+
+#### Scenario: Ink falls past the sheet
+- **WHEN** a page carries a point past the sheet's right or bottom edge
+- **THEN** the canvas covers that point, no stroke is clipped, and the origin is unchanged
+
+#### Scenario: Stroke width
+- **WHEN** any page is exported
+- **THEN** the drawing's stroke width is one point, which is a pen line, and not one pen coordinate unit, which is 2.37 mm
 
 ### Requirement: Complete file publication
 The system SHALL publish each of the three files by atomic replacement and SHALL report export success only after all three succeed. It SHALL report the success or failure of each target file. A failed publication SHALL preserve committed library data.

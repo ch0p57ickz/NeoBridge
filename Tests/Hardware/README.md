@@ -13,6 +13,17 @@ behaviour of the SwiftUI shell were not reached during that run and are marked a
 unverified with the reason; the details-window command was reached on first use
 afterwards and is recorded in its row.
 
+The pen owner then used the app by hand on 2026-10-19, after that fix, and reports it
+working; no per-row observation was recorded, so the rows below keep the status the
+headless run gave them rather than being ticked on a summary. The cases that need a
+second pen, a Bluetooth toggle, a denied permission prompt, or a forced mid-transfer
+failure are left out of the acceptance for this change by decision, not because they
+are expected to fail.
+
+A later run on the same day, recorded under [Save-and-export
+acceptance](#save-and-export-acceptance-add-persistence-and-deterministic-export),
+exercised the durable save and deterministic export path against the same pen.
+
 The unit suites are not a substitute for this run: they use a fake transport and
 fixture frames, and nothing in them proves how the physical pen behaves. The run
 also found three defects that the unit suites could not have found, all now fixed: a
@@ -153,6 +164,10 @@ transcript, so it can be kept. Raw captures still belong in
 These rows need the user interface, which the headless acceptance mode does not
 drive. The values it does check are recorded in the rows where they appear.
 
+The interface was used by hand on 2026-10-19 and reported working, but no per-row
+observation was written down, so these rows stay unverified. Ticking them needs a run
+with the interface in hand and one note per row, not a summary judgement.
+
 | Scenario | Automated coverage | The hardware run must confirm | Pass / Fail |
 | --- | --- | --- | --- |
 | Launch as a menu-bar app | The bundle carries `LSUIElement`, checked by `Scripts/remote-mac-build.sh` | The app has no Dock icon and its menu-bar item is present after launch | **Pass.** The assembled bundle launched as an accessory process with no Dock icon. |
@@ -164,6 +179,52 @@ drive. The values it does check are recorded in the rows where they appear.
 | Cancel an active sync | `PenSyncControllerTests` returns to idle without a result | **Cancel** stops the scan or read and returns to idle, with no completion notice | **Unverified.** Needs the user interface. |
 | Completed sync is labelled unsaved | `PenSyncControllerTests` checks the notice text | The completed view states that nothing was written to disk or exported | **Unverified.** Needs the user interface. |
 | Read action is labelled clearly | `PenSyncControllerTests` checks the action title | The command reads **Read Pen Data** and never implies an import or an export | **Unverified.** Needs the user interface. |
+
+## Save-and-export acceptance (add-persistence-and-deterministic-export)
+
+The durable save and deterministic export this change adds needs the same physical
+A1, driven by the same headless mode with `NEOBRIDGE_EXPORT_DIRECTORY` also set, so
+the read commits to the library and publishes files in one attempt:
+
+```bash
+Scripts/remote-mac-build.sh
+NEOBRIDGE_ACCEPTANCE_TRACE=/tmp/a1-run.txt \
+NEOBRIDGE_EXPORT_DIRECTORY=/tmp/a1-export \
+  Apps/NeoBridgeMac/.build/bundle/NeoBridgeMac.app/Contents/MacOS/NeoBridgeMac
+echo "exit=$?"
+```
+
+Run record:
+
+| Field | Value |
+| --- | --- |
+| Date | 2026-10-19 |
+| Host | Jamess-MacBook-Pro-M4.local |
+| macOS version | 27.2 (26B5112a) |
+| Xcode version | 27.1 (27A9275) |
+| Pen model | `NWP-F151` |
+| Pen firmware | `3.00` |
+| Reported protocol version | `2.23` |
+| App build | `Scripts/remote-mac-build.sh`, release configuration |
+| Transcript | sanitized packet log, 12,355 lines; no Bluetooth address, serial number, or authentication material |
+
+The run read note 700, section 3, owner 27 across 22 pages: 8064 strokes and 82238
+dots in 711 outbound frames and 3547 inbound chunks. It committed 8064 strokes to the
+library and published 66 files (22 pages times JSON, SVG, and Markdown). The exit
+status was 0.
+
+| Scenario | Automated coverage | The hardware run must confirm | Pass / Fail |
+| --- | --- | --- | --- |
+| Repeated offline transfer | `PenLibraryImporterTests`, `SQLitePenLibraryTests` | A second read of the same note adds no duplicate reliable strokes | **Pass.** The batch added 2 strokes and reported 8062 duplicates, so the 8062 strokes already stored from the earlier hand-run were not re-added. |
+| Verified durable import is reported | `PenLibraryImporterTests` | A completed read states that the library save succeeded and names the export destination | **Pass, for the notice text.** The notice read: "Saved 8064 strokes across 22 pages to the library. Wrote 66 files to <destination>." |
+| Complete transfer contains no strokes | `PenLibraryImporterTests` | Reachable only against an emptied pen; record as unverified | **Unverified.** The pen holds note 700. |
+| Export a stored page | `FilePublicationTests` | Every non-empty page produces one JSON, one SVG, and one Markdown file | **Pass.** 66 files: 22 of each format, for pages 1 and 16 through 36. |
+| Deterministic bytes | `PageExportGoldenTests` | Byte-for-byte equality of a re-export | **Not exercised on hardware.** The destination was a fresh directory, so no target was pre-existing; byte equality across order, source, and restart is covered by the golden tests. |
+| Fixed page canvas | `PageExportGoldenTests` | Every page's SVG declares the same canvas and origin | **Pass.** All 22 SVGs declare `viewBox="0 0 54.84 88.58"`, `width="130.0mm"`, and `height="210.0mm"`. |
+| Complete file publication | `FilePublicationTests` | Every target is reported published or failed, and no file on disk is partial | **Pass.** All 66 targets reported `published`, none failed; every JSON file parsed and every SVG file was well-formed. |
+| Preserve existing destination files | `FilePublicationTests` | Reachable only when a target already differs; record as unverified | **Unverified.** The run used a fresh export directory, so no target was replaced and no backup was built. |
+| Export content is inspected for device secrets | `NeoExportTests`, `Tests/Integration` | No exported file contains a Bluetooth address, serial number, or authentication material | **Pass.** A scan of all 66 files found no pen model, firmware, serial number, Bluetooth address, or `NWP-F151` string. |
+| Successful import | `PenSessionTests`, `BluetoothPenSyncRunnerTests` | The pen's strokes remain on the pen and no deletion request is sent | **Pass.** The transcript's `outboundCommands` line lists only `0x01`, `0x21`, `0x22`, `0x23`, and `0xA4` (707 acknowledgements); no `0x25` or `0x27` appears anywhere in the transcript. |
 
 ## After the run
 

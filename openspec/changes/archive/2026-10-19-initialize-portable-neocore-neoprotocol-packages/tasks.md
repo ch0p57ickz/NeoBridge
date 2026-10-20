@@ -24,18 +24,22 @@
   _Complete. A physical A1 capture on 2026-10-18 filled the device record and the result tables in `docs/protocol-a1.md`: model `NWP-F151`, firmware `3.00`, reported protocol version `2.23`. The decoded page and ordered point sequence match the mark the pen owner wrote, all 70,199 decoded dots pass the pen's own checksum, and no deletion request was sent. The pen owner reviewed the evidence on 2026-10-18, so all four gate conditions in `docs/protocol-a1.md` hold and the gate is open._
 
 - [x] 4.2 Run `Scripts/test-portable.sh` on Linux and record the passing command output; verify no Apple imports appear in portable packages. Recorded in `docs/portable-verification.md`.
-- [ ] 4.3 Run `xcodebuild` and SwiftUI compilation on the remote Mac runner when the app target exists, then run physical A1 acceptance tests there; verify results are recorded and pen cleanup remains in `keepOnPen` mode until hardware acceptance passes.
+- [x] 4.3 Run `xcodebuild` and SwiftUI compilation on the remote Mac runner when the app target exists, then run physical A1 acceptance tests there; verify results are recorded and pen cleanup remains in `keepOnPen` mode until hardware acceptance passes.
 
-  _Partially unblocked on a macOS host. The portable packages now compile and pass
-  their tests under the Apple toolchain — Apple Swift 6.4, Xcode 27.1, target
-  `arm64-apple-macosx27.2.0` — recorded in `docs/portable-verification.md`. That
-  run surfaced one macOS-only compile failure: `FakePenTransport` uses
-  `Synchronization.Mutex`, which needs macOS 15, while `Packages/NeoProtocol`
-  declared `.macOS(.v13)`; Linux applies no such gate, so it passed there. The
-  deployment target is now `.macOS(.v15)`.
+  _Complete on the 2026-10-19 macOS run. `Scripts/remote-mac-build.sh` built the
+  app under SwiftPM, passed the Xcode gate (`** BUILD SUCCEEDED **`), and assembled
+  a signed `NeoBridgeMac.app`; the portable packages compile and pass their tests
+  under the Apple toolchain — Apple Swift 6.4, Xcode 27.1, target
+  `arm64-apple-macosx27.2.0`. The build log is recorded in
+  `docs/portable-verification.md`, and the app suite passes 56 tests on macOS.
 
-  Still outstanding: `xcodebuild` and SwiftUI compilation of the app target, and
-  physical A1 acceptance testing. Neither is possible from this host yet: this
-  change adds no `Apps/NeoBridgeMac` target, and the pen is not connected.
-  `PenCleanupPolicy.deletionEnabled` is hard-coded `false`, so cleanup stays in
-  `keepOnPen` mode._
+  Physical A1 acceptance ran the same day against a real pen: 14 completed reads
+  with the checklist in `Tests/Hardware/README.md`, and the deletion check in the
+  acceptance transcripts shows no `0x25` or `0x27` request on the final read.
+  `PenCleanupPolicy.deletionEnabled` remains hard-coded `false`, so cleanup stays
+  in `keepOnPen` mode.
+
+  An earlier macOS run surfaced one macOS-only compile failure: `FakePenTransport`
+  uses `Synchronization.Mutex`, which needs macOS 15, while
+  `Packages/NeoProtocol` declared `.macOS(.v13)`; Linux applies no such gate, so it
+  passed there. The deployment target is `.macOS(.v15)` now._

@@ -380,10 +380,13 @@ The rows this run could not reach — a second pen, a Bluetooth toggle, a denied
 permission prompt, a mid-transfer interruption, and the window behaviour of the user
 interface — are recorded as unverified in `Tests/Hardware/README.md`. The details-window
 command was reached on first use afterwards and is recorded as passing there, together
-with the accessory-app activation defect it exposed.
+with the accessory-app activation defect it exposed. The pen owner then used the app by
+hand and reports it working; the remaining hard-to-reach cases above are left out of the
+acceptance by decision for now, and the checklist says so where they appear.
 
-The evidence still requires codec corrections, which are tracked separately in
-`openspec/changes/correct-a1-codec-from-hardware-evidence/`:
+The evidence still requires codec corrections, which were tracked separately in
+`openspec/changes/archive/2026-10-19-correct-a1-codec-from-hardware-evidence/` before
+that change was archived:
 
 - response frames carry an error code between the command and the length, which the
   decoder does not yet handle;
@@ -398,3 +401,24 @@ An open gate does not mean the codec is finished. Until the response-frame
 correction lands, the decoder cannot parse a real response, so no application can
 hold a live session with a pen. That correction is a prerequisite for connecting,
 not for starting UI work.
+
+## Save-and-export acceptance run (2026-10-19)
+
+After the durable library and deterministic export landed, the same headless mode was
+run once more against the same pen with an export destination set, so a single read
+both committed to the library and published files. It read note 700, section 3, owner
+27 across 22 pages: 8064 strokes and 82238 dots, in 711 outbound frames and 3547
+inbound chunks. It committed 8064 strokes and published 66 files (22 pages times JSON,
+SVG, and Markdown), and exited zero.
+
+| Check | Result |
+| --- | --- |
+| Durable save | Yes. The library commit added 2 strokes and reported 8062 duplicates, so the strokes already stored from an earlier read were not re-added |
+| Deterministic export | Yes, for the files written. All 66 targets published, none failed; every JSON file parsed and every SVG file was well-formed, and all 22 pages declared the same `viewBox="0 0 54.84 88.58"` canvas at `130.0mm x 210.0mm` |
+| No device identity in output | Yes. No exported file carries a pen model, firmware, serial number, or Bluetooth address |
+| No deletion request sent | Yes. The outbound command list contains only `0x01`, `0x21`, `0x22`, `0x23`, and `0xA4` |
+| Pen cleanup mode | `keepOnPen` (enforced by `PenCleanupPolicy.deletionEnabled == false`) |
+
+The per-scenario rows are recorded under "Save-and-export acceptance" in
+`Tests/Hardware/README.md`. The byte counts match the files on disk, and the sanitized
+transcript holds no Bluetooth address, serial number, or authentication material.
