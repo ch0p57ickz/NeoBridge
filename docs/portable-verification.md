@@ -1,11 +1,11 @@
 # Portable verification record
 
 This record captures the Linux verification required by
-`openspec/changes/initialize-portable-neocore-neoprotocol-packages/tasks.md`
+`openspec/changes/archive/2026-10-19-initialize-portable-neocore-neoprotocol-packages/tasks.md`
 tasks 1.1, 1.2, and 4.2, by
-`openspec/changes/correct-a1-codec-from-hardware-evidence/tasks.md` task 3.5, and
-by `openspec/changes/add-macos-connect-and-sync/tasks.md` tasks 1.8 and 4.3, and by
-`openspec/changes/add-persistence-and-deterministic-export/tasks.md` tasks 1.2, 2.1–2.4, 3.1–3.3, 4.2, 5.1, 5.2, and 5.3.
+`openspec/changes/archive/2026-10-19-correct-a1-codec-from-hardware-evidence/tasks.md` task 3.5, and
+by `openspec/changes/archive/2026-10-19-add-macos-connect-and-sync/tasks.md` tasks 1.8 and 4.3,
+and by `openspec/changes/add-persistence-and-deterministic-export/tasks.md` tasks 1.2, 2.1–2.4, 3.1–3.3, 4.2, 5.1, 5.2, and 5.3.
 
 ## Command
 
@@ -405,6 +405,41 @@ Test Suite 'NeoBridgeMacCoreTests.xctest' passed
 
 Recorded on 2026-10-19 (PDT).
 
+### Linux verification for the SVG page canvas (tasks 6.1–6.5)
+
+The canvas fix is portable code in `NeoExport` and `NeoCore`, so it was re-run
+through `Scripts/test-portable.sh` in the `swift:6.4.1` container after the fix
+landed. The script's own copy is refreshed from a read-only mount before the run,
+so the counts below are the fixed tree.
+
+| Item | Value |
+| --- | --- |
+| Host platform | Linux (Ubuntu 26.04.1 LTS, aarch64) in a Docker container on macOS 27.2 (26B5112a), arm64 |
+| Container image | `swift:6.4.1` |
+| Toolchain | Swift 6.4.1 (swift-6.4.1-RELEASE), target `aarch64-unknown-linux-gnu` |
+| Xcode | Not used |
+| Bluetooth hardware | Not used |
+
+```text
+== Package tests
+-- swift test (Packages/NeoCore)
+     Executed 44 tests, with 0 failures (0 unexpected)
+-- swift test (Packages/NeoProtocol)
+     Executed 141 tests, with 0 failures (0 unexpected)
+-- swift test (Packages/NeoStorage)
+     Executed 32 tests, with 0 failures (0 unexpected)
+-- swift test (Packages/NeoExport)
+     Executed 41 tests, with 0 failures (0 unexpected)
+-- swift test (Tests/Integration)
+     Executed 6 tests, with 0 failures (0 unexpected)
+== Result
+PASSED: portable packages build with pinned dependencies, import no Apple-only framework, and pass their tests, and the integration scenarios pass.
+```
+
+Recorded on 2026-10-19 (UTC). `NeoExport` grew from 35 tests to 41 with the shared
+canvas, the pen-width stroke, and the canvas-growth cases, and every other suite
+kept its count, so the canvas change altered only the renderer.
+
 ### Copying the repository into the Linux container
 
 The container copy must not carry macOS AppleDouble `._*` files. GNU `tar` on the
@@ -413,6 +448,7 @@ Linux side turns the pax `LIBARCHIVE.xattr.*` records a macOS `tar` emits into
 `._x.json` as a fixture, which fails with a JSON decode error. Strip them after
 copying (`find /work3 -name '._*' -delete`) or copy with a method that does not
 carry extended attributes.
+
 ## Fixture sanitization
 
 Verified when the capture-derived handshake fixture landed:
@@ -442,6 +478,7 @@ Verified when the capture-derived handshake fixture landed:
 4. The SQLite development header (`sqlite3.h`) is present. `NeoStorage` reaches
    SQLite through a `systemLibrary` target, so a Linux host needs
    `libsqlite3-dev`; macOS ships the header in the SDK.
+
 ## Network use
 
 The test suites make no network calls. The only network step is the first fetch

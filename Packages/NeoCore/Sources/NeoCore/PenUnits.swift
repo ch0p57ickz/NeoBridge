@@ -10,6 +10,18 @@ public enum PenUnits {
     /// The A1 reports a coordinate as a 16-bit integer part plus a two-digit
     /// fractional part. Normalizing to hundredths keeps that precision as an
     /// integer, so no rounding is required when encoding.
+    ///
+    /// One unit is 6.72 NCode project points (`ScaleHelper.nprojToDot` in the Neo
+    /// iOS SDK 3.0), which is 2.3707 mm. The sheet size belongs to the notebook,
+    /// not to the pen: Neo sells NCode paper from 148 x 83 mm pocket notebooks up
+    /// to A4, and the A1's own notebook is 130 x 210 mm, so a page spans
+    /// 54.84 x 88.58 units.
+    ///
+    /// The owner's ink is consistent with that. It reaches 54.39 units on the x
+    /// axis, so a unit larger than `130 / 54.39 = 2.390` mm would put that ink
+    /// past the edge of the 130 mm sheet, assuming the writing stayed on the
+    /// paper. The SDK's 2.3707 mm fits with 0.8% to spare; the 2.54 mm an earlier
+    /// guess assumed would run about 8 mm over.
     public static let coordinateHundredthsPerUnit = 100
 
     /// Pen-time offsets and pen-origin stroke times are integer milliseconds.

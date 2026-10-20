@@ -10,6 +10,7 @@ imports no Apple-only framework.
 | Type | Role |
 | --- | --- |
 | `PageExportDocument` | One page's strokes in canonical order, plus its file names |
+| `PageCanvas` | The fixed page canvas every SVG drawing is placed on |
 | `JSONPageRenderer`, `SVGPageRenderer`, `MarkdownPageRenderer` | The three renderers |
 | `FilePenExportPublisher` | Publishes the three files for every page |
 | `ExportNumberFormat`, `ExportEscaping` | Fixed number formatting and XML/Markdown escaping |
@@ -73,10 +74,29 @@ order has to be fixed for byte-for-byte reproducibility.
 
 ### SVG (`ncode-s<section>-o<owner>-b<book>-p<page>.svg`)
 
-The drawing carries the same sorted strokes. The `viewBox` is derived only from
-the page's own points and is at least one hundredth of a unit wide and high, so a
-single point still produces a valid box. Every coordinate is written with exactly
-two decimals, and every text node and attribute is XML-escaped.
+The drawing carries the same sorted strokes. Every page is drawn on the same
+canvas, so the pages of a note share one scale and one origin and can be compared
+or overlaid.
+
+- The canvas is the notebook sheet, `0 0 54.84 88.58` in pen coordinate units.
+  The sheet is 130 x 210 mm, and the pen's coordinate unit is 6.72 NCode project
+  points, which is 2.3707 mm.
+- The canvas is emitted in millimetres as well, so the file prints at its true
+  size.
+- The stroke width is 0.15 units, which is the one-point line the Neo iOS SDK's
+  own stroke renderer draws.
+- A page whose ink reaches past the sheet's right or bottom edge grows the canvas
+  rather than clipping the stroke. The origin stays at `0 0`, because a moving
+  origin would stop two pages of a note from lining up. Ink past the left or top
+  edge would therefore fall outside the canvas, which a real read cannot produce:
+  the wire format carries a `UInt16` integer part, so a coordinate is never
+  negative.
+- Every coordinate is written with exactly two decimals, and every text node and
+  attribute is XML-escaped.
+
+Deriving the canvas from each page's own ink, which is what an earlier version
+did, gave every page a different scale and origin and drew the ink at the size of
+the writing, which is unreadable for a line of text.
 
 ### Markdown (`ncode-s<section>-o<owner>-b<book>-p<page>.md`)
 

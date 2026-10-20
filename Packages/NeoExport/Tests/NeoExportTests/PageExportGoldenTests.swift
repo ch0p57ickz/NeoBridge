@@ -59,15 +59,18 @@ final class PageExportGoldenTests: XCTestCase {
     }
 
     func testSVGGoldenBytes() {
-        let document = PageExportDocument(page: page, strokes: [stroke()])
+        let document = PageExportDocument(
+            page: page,
+            strokes: [stroke(points: [point(x: 3_301, y: 752), point(x: 3_305, y: 827)])]
+        )
 
         let expected = """
             <?xml version="1.0" encoding="UTF-8"?>
-            <svg xmlns="http://www.w3.org/2000/svg" version="1.1" viewBox="-123.45 678.90 0.01 0.01" width="0.01" height="0.01">
+            <svg xmlns="http://www.w3.org/2000/svg" version="1.1" viewBox="0 0 54.84 88.58" width="130.0mm" height="210.0mm">
               <title>Ncode page section 3, owner 27, book 700, page 1</title>
-              <desc>1 stroke(s), 1 dot(s)</desc>
-              <g fill="none" stroke="#000000" stroke-width="1" stroke-linecap="round" stroke-linejoin="round">
-                <path d="M -123.45,678.90"/>
+              <desc>1 stroke(s), 2 dot(s)</desc>
+              <g fill="none" stroke="#000000" stroke-width="0.15" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M 33.01,7.52 L 33.05,8.27"/>
               </g>
             </svg>
 
@@ -315,32 +318,92 @@ final class PageExportGoldenTests: XCTestCase {
         )
     }
 
-    func testSVGViewBoxIsDerivedOnlyFromThePoints() {
+    // MARK: - Page canvas
+
+    func testEveryPageRendersOnTheSameCanvas() {
+        // The canvas is the sheet, not the ink, so two pages of one note share a
+        // scale and an origin and can be compared or overlaid. Deriving it from
+        // each page's own ink is what made every page a different size.
+        let sparse = PageExportDocument(
+            page: page,
+            strokes: [stroke(points: [point(x: 3_301, y: 752)])]
+        )
+        let dense = PageExportDocument(
+            page: PageIdentity(section: 3, owner: 27, book: 700, page: 23),
+            strokes: [stroke(points: [point(x: 552, y: 906), point(x: 4_965, y: 8_036)])]
+        )
+
+        let sparseSVG = text(SVGPageRenderer.render(sparse))
+        let denseSVG = text(SVGPageRenderer.render(dense))
+
+        XCTAssertTrue(
+            sparseSVG.contains("viewBox=\"0 0 54.84 88.58\""),
+            "the canvas must not shrink to the ink: \(sparseSVG)"
+        )
+        XCTAssertTrue(denseSVG.contains("viewBox=\"0 0 54.84 88.58\""))
+        XCTAssertTrue(sparseSVG.contains("width=\"130.0mm\" height=\"210.0mm\""))
+        XCTAssertTrue(denseSVG.contains("width=\"130.0mm\" height=\"210.0mm\""))
+    }
+
+    func testTheCanvasGrowsToFitInkPastTheSheet() {
+        // Ink past the sheet's right or bottom edge grows the canvas rather than
+        // being clipped, and only the size changes: the origin stays at zero so
+        // pages of a note still line up.
         let document = PageExportDocument(
             page: page,
-            strokes: [
-                stroke(points: [point(x: 0, y: 0), point(x: 100, y: 200)]),
-                stroke(points: [point(x: -50, y: 50)]),
-            ]
+            strokes: [stroke(points: [point(x: 6_000, y: 9_000)])]
         )
 
         let rendered = text(SVGPageRenderer.render(document))
         XCTAssertTrue(
-            rendered.contains("viewBox=\"-0.50 0.00 1.50 2.00\""),
-            "the viewBox must cover every point: \(rendered)"
+            rendered.contains("viewBox=\"0 0 60.08 90.08\""),
+            "the canvas must cover a point past the sheet: \(rendered)"
         )
+        XCTAssertTrue(rendered.contains("width=\"142.4mm\" height=\"213.5mm\""))
     }
 
-    func testSVGViewBoxIsAtLeastOneUnitWideForASinglePoint() {
-        let document = PageExportDocument(page: page, strokes: [stroke(points: [point(x: 5, y: 7)])])
+    func testANegativePointDoesNotMoveTheOrigin() {
+        // A real read cannot produce a negative coordinate, because the wire
+        // format carries a UInt16 integer part, and PenPoint is built from it. A
+        // coordinate read back from the library as Int32 could still be negative,
+        // so the origin must not move even then: a canvas that shifted would stop
+        // two pages of a note from lining up. The point is left off the canvas
+        // instead, which is the documented trade.
+        let document = PageExportDocument(
+            page: page,
+            strokes: [stroke(points: [point(x: -5_000, y: -5_000)])]
+        )
+
         let rendered = text(SVGPageRenderer.render(document))
-        XCTAssertTrue(rendered.contains("viewBox=\"0.05 0.07 0.01 0.01\""))
+        XCTAssertTrue(rendered.contains("viewBox=\"0 0 54.84 88.58\""))
+    }
+
+    func testACorruptCoordinateSaturatesInsteadOfOverflowing() {
+        // A stored coordinate near Int32.max must not trap the renderer.
+        let extent = PageCanvas.extent(forPoints: [point(x: Int32.max, y: Int32.max)])
+        XCTAssertEqual(extent.width, Int32.max)
+        XCTAssertEqual(extent.height, Int32.max)
+    }
+
+    func testTheStrokeWidthIsAPenLineAndNotAPenUnit() {
+        // One pen unit is 2.37 mm, so a width of one unit drew a line wider than
+        // most strokes are long. The SDK's own renderer draws one point.
+        XCTAssertEqual(PageCanvas.strokeWidthHundredths, 15)
+        XCTAssertEqual(ExportNumberFormat.hundredths(PageCanvas.strokeWidthHundredths), "0.15")
+
+        let document = PageExportDocument(page: page, strokes: [stroke()])
+        XCTAssertTrue(text(SVGPageRenderer.render(document)).contains("stroke-width=\"0.15\""))
+    }
+
+    func testTheCanvasIsTheDocumentedSheet() {
+        XCTAssertEqual(ExportNumberFormat.millimetres(PageCanvas.widthHundredths), "130.0")
+        XCTAssertEqual(ExportNumberFormat.millimetres(PageCanvas.heightHundredths), "210.0")
     }
 
     func testAnEmptySVGPageStillRendersValidMarkup() {
         let document = PageExportDocument(page: page, strokes: [])
         let rendered = text(SVGPageRenderer.render(document))
-        XCTAssertTrue(rendered.contains("viewBox=\"0.00 0.00 0.01 0.01\""))
+        XCTAssertTrue(rendered.contains("viewBox=\"0 0 54.84 88.58\""))
         XCTAssertTrue(rendered.contains("0 stroke(s), 0 dot(s)"))
         XCTAssertTrue(rendered.hasSuffix("</svg>\n"))
     }
@@ -356,6 +419,29 @@ final class PageExportGoldenTests: XCTestCase {
         XCTAssertEqual(ExportNumberFormat.hundredths(-12_345), "-123.45")
         XCTAssertEqual(ExportNumberFormat.hundredths(Int32.max), "21474836.47")
         XCTAssertEqual(ExportNumberFormat.hundredths(Int32.min), "-21474836.48")
+    }
+
+    func testMillimetreFormattingIsFixedAndLocaleIndependent() {
+        // One pen unit is 889/375 mm, so one unit (100 hundredths) is 2.4 mm and
+        // the 130 x 210 mm sheet is 54.84 x 88.58 units.
+        XCTAssertEqual(ExportNumberFormat.millimetres(0), "0.0")
+        XCTAssertEqual(ExportNumberFormat.millimetres(100), "2.4")
+        XCTAssertEqual(ExportNumberFormat.millimetres(1_000), "23.7")
+        XCTAssertEqual(ExportNumberFormat.millimetres(-1_000), "-23.7")
+        XCTAssertEqual(ExportNumberFormat.millimetres(5_484), "130.0")
+        XCTAssertEqual(ExportNumberFormat.millimetres(8_858), "210.0")
+        XCTAssertEqual(ExportNumberFormat.millimetres(Int32.max), "50909679.0")
+        XCTAssertEqual(ExportNumberFormat.millimetres(Int32.min), "-50909679.0")
+    }
+
+    func testMillimetreRoundingTurnsOverAtTheHalfTenth() {
+        // Half a tenth of a millimetre is 1875/889 = 2.11 hundredths, so 2
+        // hundredths rounds down to 0.0 mm and 3 rounds up to 0.1 mm. Without the
+        // rounding term in the formatter, 3 would truncate to 0.0 and this fails.
+        XCTAssertEqual(ExportNumberFormat.millimetres(2), "0.0")
+        XCTAssertEqual(ExportNumberFormat.millimetres(3), "0.1")
+        XCTAssertEqual(ExportNumberFormat.millimetres(-2), "0.0")
+        XCTAssertEqual(ExportNumberFormat.millimetres(-3), "-0.1")
     }
 }
 

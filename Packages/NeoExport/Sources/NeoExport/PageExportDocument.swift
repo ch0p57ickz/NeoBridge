@@ -96,6 +96,22 @@ public enum ExportNumberFormat {
         "\(value)"
     }
 
+    /// Formats a length in hundredths of a pen coordinate unit as millimetres,
+    /// with one decimal.
+    ///
+    /// One pen unit is `6.72 * 25.4 / 72 = 889/375` mm, so a hundredth of a unit
+    /// is `889/37500` mm and a tenth of a millimetre is `889/3750` hundredths.
+    /// The conversion is integer arithmetic on the magnitude, so a negative
+    /// length rounds away from zero exactly as a positive one does, and no
+    /// locale or rounding mode can change the text.
+    ///
+    /// - Parameter hundredths: A length in hundredths of a pen coordinate unit.
+    public static func millimetres(_ hundredths: Int32) -> String {
+        let magnitude = hundredths.magnitude
+        let tenths = (UInt64(magnitude) * 889 + 1_875) / 3_750
+        return signed("\(tenths / 10).\(tenths % 10)", hundredths < 0 && tenths > 0)
+    }
+
     /// Formats a fractional part as exactly two digits.
     private static func paddedTwoDigits(_ value: UInt32) -> String {
         value < 10 ? "0\(value)" : "\(value)"
