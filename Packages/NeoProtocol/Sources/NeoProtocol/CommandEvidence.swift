@@ -233,9 +233,11 @@ public struct CommandEvidenceRegistry: Hashable, Sendable {
     /// The evidence gate behind the offline deletion commands.
     ///
     /// The gate is data, so opening it is a change to the recorded verdicts rather
-    /// than an edit to a boolean. The default is the closed gate: no physical A1
-    /// deletion trace has established a payload framing, a scope, a response
-    /// meaning, or interrupted-transfer retention for either command.
+    /// than an edit to a boolean. The default is the record the physical A1 trace of
+    /// 2026-10-20 establishes, which settles the payload framing, the response
+    /// meaning, and interrupted-transfer retention, and refuses the deletion scope.
+    /// Both deletion commands therefore stay gated, and the reason they give names
+    /// the scope rather than a missing trace.
     public let deletionEvidence: PenDeletionEvidence
 
     /// Creates a registry.
@@ -245,7 +247,7 @@ public struct CommandEvidenceRegistry: Hashable, Sendable {
     ///   - deletionEvidence: The gate the deletion commands consult.
     public init(
         entries: [PenCommand: CommandEvidence],
-        deletionEvidence: PenDeletionEvidence = .unestablished
+        deletionEvidence: PenDeletionEvidence = .physicalTrace2026_10_20
     ) {
         self.entries = entries
         self.deletionEvidence = deletionEvidence

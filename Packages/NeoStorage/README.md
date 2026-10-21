@@ -153,10 +153,10 @@ library copy is the read's only copy.
 
 `PenCleanupPolicy.mode` defaults to `deleteAfterAcknowledge`, which is an intent,
 not permission. `PenCleanupPolicy.deletionEnabled` derives from
-`PenDeletionEvidence`, and the evidence record holds a `pending` verdict for every
-condition until a physical A1 trace establishes it, so no deletion command can be
-sent by this build. Physical A1 acceptance must pass before a later change records
-the safe verdicts that open the gate.
+`PenDeletionEvidence`, and the record this build carries is the physical A1 trace of
+2026-10-20, which settles three conditions and records the deletion scope as
+`unsafe`, so no deletion command can be sent. A later change records the safe
+verdicts that would open the gate, and only a scope a trace proves can supply them.
 
 ## Building and testing
 

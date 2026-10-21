@@ -596,16 +596,41 @@ final class PenDomainInterfaceTests: XCTestCase {
     func testCleanupIntentDefaultsToCleanupWhileTheGateIsClosed() {
         let policy = PenCleanupPolicy()
         XCTAssertEqual(policy.mode, .deleteAfterAcknowledge, "cleanup is the default intent")
-        XCTAssertFalse(policy.deletionEnabled, "the gate is closed with no physical trace")
+        XCTAssertFalse(policy.deletionEnabled, "the gate is closed by the physical trace")
         XCTAssertNil(policy.provenTarget)
         XCTAssertEqual(
             policy.skipReason(for: .deleteAfterAcknowledge),
-            PenDeletionEvidence.unestablished.blockingReason
+            PenDeletionEvidence.physicalTrace2026_10_20.blockingReason
         )
         XCTAssertNil(
             policy.skipReason(for: .keepOnPen),
             "a sync that chose retention has nothing to explain"
         )
+    }
+
+    func testThePhysicalTraceKeepsTheGateClosedOnTheDeletionScope() {
+        let evidence = PenDeletionEvidence.physicalTrace2026_10_20
+
+        XCTAssertEqual(evidence.target, .note, "0x25 is the command the trace proved note-scoped")
+        XCTAssertEqual(evidence.verdict(for: .payloadFraming), .safe)
+        XCTAssertEqual(evidence.verdict(for: .responseMeaning), .safe)
+        XCTAssertEqual(evidence.verdict(for: .interruptedTransferRetention), .safe)
+        XCTAssertEqual(
+            evidence.verdict(for: .deletionScope),
+            .unsafe,
+            "the traced command removed a stroke no read had imported"
+        )
+        XCTAssertEqual(
+            evidence.blockingConditions,
+            [.deletionScope],
+            "the trace settles the other three conditions and refuses the scope"
+        )
+        XCTAssertFalse(evidence.isSafe, "an unsafe scope is what keeps the gate shut")
+        XCTAssertTrue(
+            evidence.blockingReason.contains("deletion scope"),
+            "a build must name the scope, not a missing trace, as the reason cleanup is skipped"
+        )
+        XCTAssertFalse(PenCleanupPolicy(evidence: evidence).deletionEnabled)
     }
 
     func testDeletionStaysDisabledForEveryIncompleteVerdict() {

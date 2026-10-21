@@ -86,7 +86,7 @@ The app is its own SwiftPM package and only builds on macOS:
 
 ## Mac build and packaging
 
-`Scripts/remote-mac-build.sh` is the single macOS entry point. It runs
+`Scripts/remote-mac-build.sh` is the macOS entry point for the app. It runs
 `Scripts/test-portable.sh`, builds the app with SwiftPM, gates on `xcodebuild`, and
 assembles an ad-hoc-signed `NeoBridgeMac.app` in
 `Apps/NeoBridgeMac/.build/bundle/`:
@@ -174,13 +174,19 @@ Present today:
   cross-check the implementation instead of restating it. Regenerate only when a
   fixture must change, then review the generated diff.
 - `Tests/Hardware/README.md` — the physical A1 connect-and-sync acceptance checklist.
+- `Tests/Hardware/PenLab` — a macOS-only package that sends the two deletion commands
+  the app refuses to frame, with its own codec for them. It is not in any app target
+  and not in the portable package list; `README.md` in `Tests/Hardware` records how
+  to build and run it.
 - `Scripts/test-portable.sh` — the portable verification entry point.
 - `Scripts/remote-mac-build.sh` — the Mac build, Xcode gate, and bundle assembly.
+- `Scripts/pen-lab-build.sh` — the PenLab build and bundle assembly.
 - `docs/protocol-a1.md` — M0 protocol evidence and the hardware gate.
 - `docs/portable-verification.md` — the recorded verification runs.
 
-Planned but not present yet: `Packages/NeoStorage`, `Packages/NeoExport`, and
-`Tests/Integration`. `openspec/config.yaml` describes what each should contain.
+`Packages/NeoStorage` and `Packages/NeoExport` hold the durable library and the
+deterministic export, and `Tests/Integration` holds the fake-transport integration
+scenarios. `openspec/config.yaml` describes what each contains.
 
 ## Conventions
 

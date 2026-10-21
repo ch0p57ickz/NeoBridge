@@ -329,11 +329,12 @@ public struct PenSessionResult: Hashable, Sendable {
 /// The session sends the `0x23` transfer option it was built with, which defaults
 /// to the non-destructive ``OfflineReadTransferOption/nextAndReserve``. The option
 /// is a parameter so the acceptance run can vary it while establishing which value
-/// is incremental; no trace has settled that yet.
+/// is incremental; the 2026-10-19 experiment found neither incremental, and
+/// `nextAndReserve` is the only one with completed-transfer evidence.
 ///
 /// Deletion is not part of a read: the session sends no `0x25` or `0x27` command,
-/// and the evidence table gates both behind the deletion evidence, which no
-/// physical A1 trace has opened yet. Cleanup travels on the acknowledged path
+/// and the evidence table gates both behind the deletion evidence, whose recorded
+/// deletion-scope verdict is `unsafe`. Cleanup travels on the acknowledged path
 /// instead, so it can be ordered after a durable import and published exports;
 /// see ``PenCleanupPolicy``.
 public final class PenSession: Sendable {

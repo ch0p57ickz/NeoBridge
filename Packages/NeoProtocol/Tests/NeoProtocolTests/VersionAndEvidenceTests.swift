@@ -104,15 +104,17 @@ final class CommandEvidenceTests: XCTestCase {
     }
 
     func testDeletionCommandsAreGatedAndRefuseWhileTheGateIsClosed() {
-        // The commands are no longer hardcoded as blocked: their authorization
-        // comes from the recorded evidence, and with no physical A1 deletion trace
-        // the gate names the conditions that are not established yet.
+        // The commands are no longer hardcoded as blocked: their authorization comes
+        // from the recorded evidence, and the record the registry carries is the
+        // physical A1 trace, which refuses the deletion scope. The reason therefore
+        // names the scope rather than claiming that no trace exists.
         for command in [PenCommand.deleteOfflineNoteRequest, .deleteOfflinePageRequest] {
             let authorization = registry.authorization(for: command)
             guard case .gated(let reason) = authorization else {
                 return XCTFail("expected gated for \(command), got \(authorization)")
             }
             XCTAssertTrue(reason.contains("deletion evidence gate"), reason)
+            XCTAssertTrue(reason.contains("deletion scope"), reason)
             XCTAssertFalse(registry.maySendProductionRequest(command))
             XCTAssertFalse(registry.mayEmitCompletedStroke(command))
             XCTAssertEqual(registry.evidence(for: command).level, .officialSDK)

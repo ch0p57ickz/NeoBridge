@@ -30,6 +30,12 @@ established which `0x23` transfer option the pen supports by reading with each
 candidate, interrupting a transfer, and re-reading. A fourth, single read made
 retention the intent and confirmed that no deletion command is sent.
 
+A later session, on 2026-10-20, sent the two deletion commands themselves. The app
+cannot frame either one, so a lab tool sent them; what it found keeps the deletion
+gate closed rather than opening it. The tool, the runs, and the verdicts they record
+are under [Deletion experiment (PenLab)](#deletion-experiment-penlab), and the
+[pen cleanup](#pen-cleanup) rows below carry the result.
+
 The unit suites are not a substitute for this run: they use a fake transport and
 fixture frames, and nothing in them proves how the physical pen behaves. The run
 also found three defects that the unit suites could not have found, all now fixed: a
@@ -327,16 +333,61 @@ archived under `Tests/Fixtures/raw/acceptance-2026-10-19-transfer-option/`.
 ## pen cleanup
 
 These rows need a real A1 **and** the deletion evidence gate open. The gate is
-closed in this build, because no trace has established a deletion command's payload
-framing, scope, response meaning, or interrupted-transfer retention, so none of
-them can be reached yet. They stay unchecked until a trace opens the gate.
+closed in this build, and the 2026-10-20 deletion experiment is why: it traced a
+deletion command's payload framing, scope, response meaning, and
+interrupted-transfer retention, and it recorded the **deletion scope** as unsafe
+rather than pending. A deletion request cannot be sent by the app, so the rows that
+need one stay unchecked.
 
 | Scenario | Automated coverage | The hardware run must confirm | Pass / Fail |
 | --- | --- | --- | --- |
-| Default cleanup after a verified import and export | `OfflineSessionIntegrationTests`, `PenLibraryImporterTests` | The pen receives exactly one deletion command for the read's own pages, and its response is proven to mean that scope was removed | **Unverified.** The gate is closed, so no deletion command is reachable. |
-| Library and published copies survive deletion | `OfflineSessionIntegrationTests`, `FilePublicationTests` | Every deleted page is still readable in the library and can be published again | **Unverified.** Requires a completed deletion. |
-| Newer unverified strokes are untouched | `PenLibraryImporterTests`, `OfflineSessionIntegrationTests` | Strokes written after the read, on the same page or note, remain on the pen | **Unverified.** Requires a completed deletion. |
+| Default cleanup after a verified import and export | `OfflineSessionIntegrationTests`, `PenLibraryImporterTests` | The pen receives exactly one deletion command for the read's own pages, and its response is proven to mean that scope was removed | **Unverified.** The gate is closed, so the app sends no deletion. The lab's own `0x25` run confirmed the response means a completed removal, and it is recorded in `docs/protocol-a1.md`. |
+| Library and published copies survive deletion | `OfflineSessionIntegrationTests`, `FilePublicationTests` | Every deleted page is still readable in the library and can be published again | **Partly verified.** The lab's delete removed note 700's 22 pages from the pen, and the library snapshots taken before and after it both list all 22, so the deleted data is still readable and the earlier exports still exist. Publishing a deleted page again from the app is untested, because the app's cleanup path still cannot run. |
+| Newer unverified strokes are untouched | `PenLibraryImporterTests`, `OfflineSessionIntegrationTests` | Strokes written after the read, on the same page or note, remain on the pen | **Fail.** A mark was written on page 1 of note 700 and left unread, so the page held delivered strokes and an undelivered one together. After the command, page 1 was gone from the pen with both. The note-scoped command removes a note's stored data as a whole, and the pen refuses the page-scoped command (`0x27` → `0x05`), so no command it accepts can leave newer strokes behind. This is the row that closes the gate. |
 | Retaining mode sends no deletion through the whole stack | `PenSessionTests`, `PenLibraryImporterTests`, `NeoBridgeMacCoreTests` | A headless retaining run's `outboundCommands` line contains no `0x25` or `0x27` | **Pass.** The retaining run recorded `cleanup=keepOnPen` on its `run` line, completed with 8,092 strokes and 0 duplicates, and its `outboundCommands` line lists only `0x01`, `0x04`, `0x21`, `0x22`, `0x23`, and `0xA4`. |
+
+## Deletion experiment (PenLab)
+
+`Tests/Hardware/PenLab` is a macOS-only package whose only job is to send the two
+commands the app refuses to frame. It exists because `PenCommand.frameKind` returns
+`nil` for `0x25` and `0x27`, so the portable encoder cannot build them and no app
+target can reach them; the lab carries its own codec for those two bodies and nothing
+else. Its frames are pinned in
+`Tests/Hardware/PenLab/Tests/PenLabTests/PenLabFramesTests.swift`.
+
+Build it through the script, which assembles the bundle CoreBluetooth needs for its
+usage description:
+
+```bash
+Scripts/pen-lab-build.sh
+```
+
+Run it from inside the bundle, or CoreBluetooth refuses the process access:
+
+```bash
+LAB=Tests/Hardware/PenLab/.build/bundle/PenLab.app/Contents/MacOS/PenLab
+"$LAB" --help
+```
+
+The invocation is:
+
+```text
+PenLab <probe|delete-note|delete-page> [--section n] [--owner n] [--note n] [--page n]
+       [--trace path] [--timeout seconds] [--send]
+```
+
+Nothing is sent without `--send`; without it the tool prints the frames it would send
+and stops. The tool never reads the pen first, so it cannot check that its target
+exists — it removes what it is told to remove, or reports the pen's refusal. Its
+transcript names the subject of each step, and it records a payload only for an
+`0xA5` or `0xA7` answer, because the version response carries the pen's Bluetooth
+address. The exit status is 0 when every step was answered with error code 0, 1 when
+a step was refused or went unanswered, and 2 for a refused invocation.
+
+The 2026-10-20 transcripts are archived under
+`Tests/Fixtures/raw/acceptance-2026-10-20-deletion/`, and the run, the frames, and the
+verdicts are recorded in the "Deletion experiment, 2026-10-20" section of
+`docs/protocol-a1.md`.
 
 ## After the run
 
@@ -353,8 +404,8 @@ them can be reached yet. They stay unchecked until a trace opens the gate.
    ```
 
    `PenCleanupPolicy.deletionEnabled` must still derive from `PenDeletionEvidence`,
-   the evidence record must still hold a `pending` verdict for every condition, and
-   the command log must contain no `0x25` or `0x27`.
+   the record must still hold the `unsafe` verdict for `deletionScope` that the
+   2026-10-20 trace recorded, and the command log must contain no `0x25` or `0x27`.
 4. Confirm the retaining mode sends no deletion through the whole stack: run one
    headless read after making retention the intent, and check that its
    `outboundCommands` line contains no `0x25` or `0x27`.

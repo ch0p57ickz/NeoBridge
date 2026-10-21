@@ -196,7 +196,7 @@ authoritative table. Summary:
 | Handshake | `VERSION_INFO` `0x01`, `RES_VERSION_INFO` `0x81` | official SDK + fixture | allowed |
 | Pen events | `0x63`, `0x69`, `0x6A`, `0x64`, `0x6B`, `0x65`, `0x6C` | official SDK + fixture | allowed |
 | Offline read | `0x21`, `0x22`, `0x23`, `0x24`, `0xA3`, `0xA4` | official SDK + fixture | allowed |
-| Offline deletion | `0x25`, `0x27` | official SDK | gated on the deletion evidence; refused while any verdict is pending |
+| Offline deletion | `0x25`, `0x27` | official SDK | gated on the deletion evidence; refused while any verdict is not `safe`, and the recorded deletion-scope verdict is `unsafe` |
 | SoundPen and log | `0x73`, `0x74`, `0x75`, `0x76`, `0x77`, `0xF4`, `0xF5` | provisional | inspection only |
 | Authentication | `0x02`, `0x03` | none | unsupported |
 | Everything else | — | none | unsupported |
@@ -237,7 +237,7 @@ sensitive fields removed and stays git-ignored.
 | Every decoded dot passes the pen's own checksum | Yes, 70,199 of 70,199 dots |
 | Decoded transfer | 604 packets, 6,920 strokes, 70,199 dots, in a single transfer that ended at transfer position `2` |
 | No deletion request sent | Yes, `0x25` and `0x27` were never sent |
-| Pen cleanup mode | That build requested no cleanup, so the pen kept its copy. Deletion is unreachable in every build: `PenCleanupPolicy.deletionEnabled` derives from the deletion evidence gate, and the gate has no safe verdict |
+| Pen cleanup mode | That build requested no cleanup, so the pen kept its copy. Deletion is unreachable in every build: `PenCleanupPolicy.deletionEnabled` derives from the deletion evidence gate, whose recorded deletion-scope verdict is `unsafe` |
 | Evidence reviewed by | Jimmy, 2026-10-18 |
 
 ## Pen session flow
@@ -363,32 +363,154 @@ Conclusions:
 The experiment read the pen twice with each option, so the cursor question is
 settled by repetition rather than by one read.
 
+## Deletion experiment, 2026-10-20
+
+The deletion evidence gate needs physical traces of `0x25` and `0x27`. Neither can be
+sent from the app: `PenCommand.frameKind` returns `nil` for both, so the portable
+encoder refuses to frame them and no shipped binary can reach them. The experiment
+therefore ran through `Tests/Hardware/PenLab`, a macOS-only package that carries its
+own codec for exactly these two frames and lives outside every app target. It sends
+nothing without `--send`, it names the subject of each step in its transcript, and it
+records no payload except a deletion answer, because the version response carries the
+pen's Bluetooth address.
+
+| Field | Value |
+| --- | --- |
+| Date | 2026-10-20 |
+| Pen model | `NWP-F151` |
+| Pen firmware | `3.00` |
+| Reported protocol version | `2.23` |
+| Tool | `Tests/Hardware/PenLab`, assembled by `Scripts/pen-lab-build.sh` |
+| Subject | note 700, section 3, owner 27 — the note the transfer-option experiment read |
+
+Three runs made up the experiment, and a normal acceptance read closed it. The
+transcripts are sanitized and git-ignored under
+`Tests/Fixtures/raw/acceptance-2026-10-20-deletion/`.
+
+| Run | Transcript | What it asked the pen |
+| --- | --- | --- |
+| probe | `probe-0x25-0x27-raw.txt` | both commands, aimed at note 999 and at page 1 of note 999, which the pen does not hold |
+| page delete | `delete-page-1.txt` | page 1 of note 700, the page the mark was written on |
+| note delete | `delete-note-700.txt` | every stroke of note 700 |
+| read afterwards | `read-after-delete.txt` | a normal `nextAndReserve` read, with cleanup kept on the pen |
+
+The probe was re-run with the tool revision that prints a response body verbatim, so
+`probe-0x25-0x27-raw.txt` carries `body=` and `declaredLength=` lines. The two delete
+transcripts predate those lines and record the command, the error code, and the
+payload; their frames and answers have the same shape.
+
+### Framing and what the answers mean
+
+| Step | Request frame | Answer | Reading |
+| --- | --- | --- | --- |
+| `0x25` on note 999 | `C02509001B00000301E7030000C1` | body `A500010000`, error `0x00`, declared length 1, payload `00` | the frame layout was accepted, and the pen reported that it removed nothing |
+| `0x27` on page 1 of note 999 | `C0270D001B000003E70300000101000000C1` | body `A7050000`, error `0x05`, declared length 0, payload empty | refused with `NotSupportCMD` |
+| `0x25` on note 700 | `C02509001B00000301BC020000C1` | error `0x00`, payload `01` | the same layout, accepted, with one removal reported |
+| `0x27` on page 1 of note 700 | `C0270D001B000003BC0200000101000000C1` | error `0x05` | refused for a note the pen does hold as well |
+
+Both requests use the layout Neo iOS SDK 3.0 documents (`NISDK3/Classes/Model/RequestStruct.swift`):
+a request body is the command, a little-endian `UInt16` length, the packed section and
+owner, the note identifiers, and a count. `0x25` names notes; `0x27` names one note
+and pages. Neither takes a page range, so no request can say "every page of this note"
+other than by listing them. The two request frames are pinned byte for byte in
+`Tests/Hardware/PenLab/Tests/PenLabTests/PenLabFramesTests.swift`, so a change to their
+layout fails there.
+
+Both answers use the response framing the decoder already handles: the command, an
+error code, a little-endian `UInt16` length, and the payload. The pen answers an
+`0x25` in about 30 ms.
+
+The first payload byte counts the notes whose data went: `00` for note 999, which the
+pen does not hold, and `01` for note 700, which it did. The answer therefore reports a
+completed removal rather than a bare acceptance, and the read that followed bears it
+out. It carries no identifier list behind the count, so a
+reader expecting the SDK's count-then-identifiers payload meets a one-byte payload
+instead; the lab records that mismatch rather than smoothing it into a reading the
+bytes do not support.
+
+`0x27` is a different matter. The pen answers it with error code `0x05`
+(`NotSupportCMD`) whether or not it holds the note, so this firmware implements no
+page-scoped deletion, and `0x25` is the only deletion command the pen offers.
+
+### What the note delete removed
+
+What the pen held before the command is known from the library rather than from a pen
+read: the snapshot `library-before-deletion.sqlite`, taken first, holds 22 pages for
+note 700 — page 1 and pages 16 to 36. The pen owner then wrote a mark on page 1 by hand
+and left it unread, so that page held delivered strokes and a newer, undelivered one
+together. The mark is the pen owner's account, and no transcript shows it, because the
+lab never reads the pen.
+
+| Observation | The library snapshot taken first | The read after the command |
+| --- | --- | --- |
+| Pages of note 700 | 22 — 1 and 16 to 36 | 2 — 36 and 37 |
+| Strokes | 8,087 | 346, every one of them new to the library |
+
+The read afterwards imported all 346 as new strokes — no fingerprint in it matches
+either snapshot — and the pen owner confirmed they were written **after** the command.
+They are therefore new writing rather than survivors, and nothing the pen held when the
+command ran is listed afterwards. Page 36 shows that directly: it was one of the 22
+pages, and every stroke now on it is new, so the strokes it held before the command were
+removed. Page 1 is gone entirely, and the owner's account is that the mark went with the
+delivered strokes.
+
+The library was never in the request path, and it kept everything: the snapshots taken
+before the deletion and after it both list 22 pages, the read afterwards added all 346
+strokes as new ones, and the cleanup journal stayed empty because the run kept the pen's
+copy.
+
+### Verdicts this trace records
+
+| Condition | Verdict | What the trace shows |
+| --- | --- | --- |
+| `payloadFraming` | `safe` | both request layouts were parsed and both answers carry the command, an error code, a little-endian length, and a payload. `0x25` was accepted; `0x27` was parsed and refused |
+| `responseMeaning` | `safe` | the first payload byte counts the notes whose data went, `00` for a note the pen does not hold and `01` for one it does, and the following read confirms the data was gone |
+| `deletionScope` | `unsafe` | the pen refuses the page-scoped command (`0x27` → `0x05`), so the only deletion it accepts takes a whole note, and the `0x25` run removed that note's 22 delivered pages. No command this firmware accepts can remove a read's verified data while leaving a newer stroke on the same note |
+| `interruptedTransferRetention` | `safe` | the 2026-10-19 experiment (`opt02-abort`, `opt02-abort-recovery`) interrupted a `nextAndReserve` read after 99 packets, and the next read returned all 8,092 identities, including the 5 that no read had imported |
+
+One command is proven to what it scopes: `0x25` is note-scoped. No trace proves a page
+scope, because `0x27` is refused. The gate stays shut all the same, and not for want of
+a verdict: `deletionScope` is `unsafe`, so `deletionEnabled` stays false and no
+deletion is reachable.
+
+The scope verdict does not rest on the mark. A transcript shows the removal of the
+note's delivered pages, and the owner's account is that the mark written afterwards on
+page 1 went with them. Either way the pen refuses the page-scoped command, so no command
+it accepts can separate a note's newer strokes from the ones a read already holds.
+`PenDeletionEvidence.physicalTrace2026_10_20` is that record, and `PenCleanupPolicy`
+carries it, so the app reports the deletion scope — rather than a missing trace — as the
+reason it kept the pen's copy.
+
 ## Deletion evidence gate
 
 The A1 has two offline deletion commands, `0x25` and `0x27`, answered by `0xA5`
 and `0xA7`. The SDK documents their identifiers, and this build records them at
-`officialSDK` level for that reason. No physical A1 trace has established their
-payload framing, what their answer means, or what they remove, so neither may be
-sent.
+`officialSDK` level for that reason. The deletion experiment of 2026-10-20 traced
+both against the physical pen, and what it found closes the gate rather than opens
+it, so neither may be sent.
 
 `PenDeletionEvidence` turns that into data: `PenCleanupPolicy.deletionEnabled`
 derives from it, so opening the gate is a change to the recorded verdicts rather
-than an edit to a boolean. Four conditions must each be `safe`:
+than an edit to a boolean. Four conditions must each be `safe`, and the trace of
+2026-10-20 settles all four:
 
-| Condition | What a trace must establish | Verdict today |
-| --- | --- | --- |
-| `payloadFraming` | the request payload layout and the response framing that answers it | pending — no A1 trace |
-| `deletionScope` | that the command removes exactly the verified data, including when newer strokes exist on the same page or note | pending — no A1 trace |
-| `responseMeaning` | whether `0xA5`/`0xA7` means acceptance of the command or completed removal of the requested scope | pending — no A1 trace |
-| `interruptedTransferRetention` | that an interrupted transfer leaves every not-yet-imported stroke retrievable | trace exists, verdict not recorded — the 2026-10-19 transfer-option experiment (`opt02-abort`, `opt02-abort-recovery`) shows a `nextAndReserve` read interrupted after 99 packets leaves all 8,092 identities, including the 5 no read had imported, retrievable by the next read. Recording it as a verdict is a deliberate step, and it would not open the gate while the other three conditions stand |
+| Condition | What a trace must establish | Verdict | Citation |
+| --- | --- | --- | --- |
+| `payloadFraming` | the request payload layout and the response framing that answers it | `safe` | `probe-0x25-0x27-raw.txt`: both requests were framed and answered in that layout, and both answers carry the command, an error code, a length, and a payload |
+| `deletionScope` | that the command removes exactly the verified data, including when newer strokes exist on the same page or note | `unsafe` | `delete-note-700.txt` and `delete-page-1.txt`: the pen refuses the page-scoped command with `0x05`, so the only deletion it accepts takes a whole note, and the `0x25` run removed that note's 22 delivered pages. No command it accepts can remove a verified subset of a note |
+| `responseMeaning` | whether `0xA5`/`0xA7` means acceptance of the command or completed removal of the requested scope | `safe` | `probe-0x25-0x27-raw.txt` and `delete-note-700.txt`: `00` for a note the pen does not hold, `01` for one it does, and `read-after-delete.txt` confirms the removal |
+| `interruptedTransferRetention` | that an interrupted transfer leaves every not-yet-imported stroke retrievable | `safe` | the 2026-10-19 transfer-option experiment (`opt02-abort`, `opt02-abort-recovery`) left all 8,092 identities, including the 5 no read had imported, retrievable |
 
-The proven command scope is also unset: no trace has settled whether `0x25` is
-note-scoped and `0x27` page-scoped, or whether both take a page range. A trace's
-mere existence would not open the gate, and a trace showing unsafe behavior would
-close it.
+The proven command scope is `0x25`, note-scoped. `0x27` is refused with `0x05`
+(`NotSupportCMD`), so no trace proves a page scope on this firmware. A trace's mere
+existence would not open the gate, and this one shows unsafe behavior: it closes the
+gate on `deletionScope`. An unsafe verdict is not the same as a missing one, so the
+reason a build gives names the scope instead of claiming that no trace exists.
+`PenDeletionEvidence.physicalTrace2026_10_20` is that record, and
+`PenCleanupPolicy` carries it.
 
 While the gate is closed, `CommandEvidenceRegistry.authorization(for:)` reports
-both commands as `.gated` and names the conditions that are not established, so no
+both commands as `.gated` and names the conditions that are not `safe`, so no
 deletion frame can be encoded or sent. `VersionAndEvidenceTests` pins the gate: a
 proven `note` scope opens `0x25` and leaves `0x27` gated, and an `unsafe` verdict
 keeps both closed even when a scope is proven.
@@ -469,7 +591,7 @@ switched off and on again while a scan was already running.
 | Every decoded dot passes the pen's own checksum | Yes, no checksum or framing error over 3,053 notification chunks and 1,335,753 inbound bytes |
 | Acknowledgement pacing | Yes. 608 `0xA4` frames, one per `0x24` packet, operation `1` (Continue) through packet 607 and `0` (Stop) on packet 608 |
 | No deletion request sent | Yes. The outbound command list of every run contains only `0x01`, `0x21`, `0x22`, `0x23`, and `0xA4` |
-| Pen cleanup mode | That build requested no cleanup, so the pen kept its copy. Deletion is unreachable in every build: `PenCleanupPolicy.deletionEnabled` derives from the deletion evidence gate, and the gate has no safe verdict |
+| Pen cleanup mode | That build requested no cleanup, so the pen kept its copy. Deletion is unreachable in every build: `PenCleanupPolicy.deletionEnabled` derives from the deletion evidence gate, whose recorded deletion-scope verdict is `unsafe` |
 | Link released after a read | Yes. Every completed read logged a Disconnected state, and each of four consecutive reads found the pen advertising again |
 
 The run's totals exceed the 6,920 strokes and 70,199 dots recorded on 2026-10-18
@@ -547,7 +669,7 @@ SVG, and Markdown), and exited zero.
 | Deterministic export | Yes, for the files written. All 66 targets published, none failed; every JSON file parsed and every SVG file was well-formed, and all 22 pages declared the same `viewBox="0 0 54.84 88.58"` canvas at `130.0mm x 210.0mm` |
 | No device identity in output | Yes. No exported file carries a pen model, firmware, serial number, or Bluetooth address |
 | No deletion request sent | Yes. The outbound command list contains only `0x01`, `0x21`, `0x22`, `0x23`, and `0xA4` |
-| Pen cleanup mode | That build requested no cleanup, so the pen kept its copy. Deletion is unreachable in every build: `PenCleanupPolicy.deletionEnabled` derives from the deletion evidence gate, and the gate has no safe verdict |
+| Pen cleanup mode | That build requested no cleanup, so the pen kept its copy. Deletion is unreachable in every build: `PenCleanupPolicy.deletionEnabled` derives from the deletion evidence gate, whose recorded deletion-scope verdict is `unsafe` |
 
 The per-scenario rows are recorded under "Save-and-export acceptance" in
 `Tests/Hardware/README.md`. The byte counts match the files on disk, and the sanitized

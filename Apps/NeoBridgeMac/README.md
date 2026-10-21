@@ -5,7 +5,9 @@ saves them to a durable local library, and writes deterministic page files to a
 folder you choose. Each read intends to remove its verified data from the pen once
 it is saved and its files are written, and you can keep the strokes on the pen for
 one read instead. Deletion is unreachable in this build: the pen's copy is retained
-until a physical A1 trace opens the deletion evidence gate.
+because the physical A1 trace of 2026-10-20 recorded the deletion scope as unsafe —
+the command the pen accepts removes a note's stored data as a whole, including
+strokes no read had imported.
 
 ## What the app is made of
 
@@ -291,7 +293,9 @@ gate is data, not a switch. `PenDeletionEvidence` holds a verdict for each safet
 condition — payload framing, exact deletion scope, response meaning, and
 interrupted-transfer retention — and `PenCleanupPolicy.deletionEnabled` derives
 from those verdicts, so opening the gate is a change to the recorded evidence
-rather than an edit to a boolean. The app never supplies a deletion sender, so no
+rather than an edit to a boolean. The record this build carries is the physical A1
+trace of 2026-10-20, which settles three conditions and refuses the fourth, so the
+line names the deletion scope. The app never supplies a deletion sender, so no
 deletion frame is built at all.
 
 ### What the app reports
@@ -329,7 +333,7 @@ Dock icon, and closing the window leaves the menu-bar item in place.
 | Cleanup intent line | Always | Names the intent on screen and what the choice applies to: "Removing the pen's strokes when this read completes.", "Retry Export keeps the pen's strokes.", or "The next read removes the pen's strokes after they are saved." |
 | **Keep Strokes on the Pen for This Read** | No attempt is running and cleanup is the intent on screen | Retains the pen's copy for the transfer the intent line names |
 | **Remove Them After a Successful Read** | No attempt is running and retention is the intent on screen | Restores the default cleanup intent for the transfer the intent line names |
-| Cleanup-unavailable line | The deletion evidence gate is closed | "Cleanup is unavailable: …", naming the condition that is not established |
+| Cleanup-unavailable line | The deletion evidence gate is closed | "Cleanup is unavailable: …", naming the condition that is not safe |
 | **Choose Export Folder…** | Always | Picks the folder page files are written into and remembers it |
 | Export-folder line | Always | Shows the chosen folder, or that no folder is chosen |
 | Failure line | A read failed | Shows the human-readable error |
@@ -363,9 +367,9 @@ a new session, so a retry starts a new scan rather than resuming the old one.
 - No deletion. Cleanup is the intent, but the pen's copy is retained: the session
   sends no `0x25` or `0x27` command, the evidence table gates both behind the
   deletion evidence, and `PenCleanupPolicy.deletionEnabled` derives from that
-  evidence, which has no safe verdict yet. The app supplies no deletion sender, so
-  no deletion frame is built. Strokes stay on the pen after a read, and the app
-  says why.
+  evidence, whose recorded deletion-scope verdict is `unsafe`. The app supplies no
+  deletion sender, so no deletion frame is built. Strokes stay on the pen after a
+  read, and the app says why.
 - No connection codes or authentication beyond the SDK's default sixteen zero
   bytes. A pen that rejects that code fails with a clear message, and the app
   does not guess another.

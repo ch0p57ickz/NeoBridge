@@ -42,9 +42,9 @@ public enum PenCleanupState: String, Hashable, Sendable, Codable, CaseIterable {
 
 /// Which pen deletion command a request targets.
 ///
-/// The A1 has two identifiers, `0x25` and `0x27`. Which one scopes to a note and
-/// which to a page is an open question until a physical trace settles it, so the
-/// evidence record names the one it proves rather than assuming a split.
+/// The A1 has two identifiers, `0x25` and `0x27`. The physical trace of 2026-10-20
+/// proves `0x25` note-scoped and finds `0x27` refused, so the evidence record names
+/// the command it proves rather than assuming that both work.
 public enum PenDeletionTarget: String, Hashable, Sendable, Codable, CaseIterable {
     /// The note-scoped deletion request, `0x25`.
     case note
@@ -137,6 +137,38 @@ public struct PenDeletionEvidence: Hashable, Sendable {
     /// closed and no deletion may be sent.
     public static let unestablished = PenDeletionEvidence()
 
+    /// The record the physical A1 trace of 2026-10-20 establishes.
+    ///
+    /// The deletion experiment recorded in the "Deletion experiment, 2026-10-20"
+    /// section of `docs/protocol-a1.md` traced both commands against the pen and
+    /// settled every condition:
+    ///
+    /// - both request layouts were accepted and both answers carry an error code and
+    ///   a little-endian length, so `payloadFraming` is `safe`;
+    /// - the first payload byte of an `0xA5` answer counts the notes whose data went
+    ///   — `00` for a note the pen does not hold and `01` for one it does — and the
+    ///   read that followed found the data gone, so `responseMeaning` is `safe`;
+    /// - the pen refuses `0x27` with `0x05` (`NotSupportCMD`), so the only deletion it
+    ///   accepts takes a whole note. The `0x25` request that removed data also removed
+    ///   page 1, where a mark no read had imported had been written, so
+    ///   `deletionScope` is `unsafe`, and that verdict is what keeps the gate shut;
+    /// - the 2026-10-19 transfer-option experiment (`opt02-abort`,
+    ///   `opt02-abort-recovery`) showed that an interrupted read leaves every stroke
+    ///   retrievable, so `interruptedTransferRetention` is `safe`.
+    ///
+    /// The verdicts are recorded rather than left `pending` so a build's report names
+    /// the real reason the gate is closed — the deletion scope — instead of claiming
+    /// that no trace exists.
+    public static let physicalTrace2026_10_20 = PenDeletionEvidence(
+        target: .note,
+        verdicts: [
+            .payloadFraming: .safe,
+            .deletionScope: .unsafe,
+            .responseMeaning: .safe,
+            .interruptedTransferRetention: .safe
+        ]
+    )
+
     /// The verdict recorded for a condition.
     public func verdict(for condition: PenDeletionCondition) -> Verdict {
         verdicts[condition] ?? .pending
@@ -215,11 +247,11 @@ public struct PenCleanupPolicy: Hashable, Sendable {
     ///
     /// - Parameters:
     ///   - mode: The default intent for a sync.
-    ///   - evidence: The recorded deletion evidence. It defaults to the closed
-    ///     gate.
+    ///   - evidence: The recorded deletion evidence. It defaults to the physical A1
+    ///     trace, which keeps the gate closed.
     public init(
         mode: PenCleanupMode = .deleteAfterAcknowledge,
-        evidence: PenDeletionEvidence = .unestablished
+        evidence: PenDeletionEvidence = .physicalTrace2026_10_20
     ) {
         self.mode = mode
         self.evidence = evidence
@@ -227,8 +259,8 @@ public struct PenCleanupPolicy: Hashable, Sendable {
 
     /// Whether the app may send a deletion request to the pen.
     ///
-    /// Derived from ``evidence``, never from a constant. With no physical A1
-    /// deletion trace the gate is closed, so this is `false` and the pen's copy
+    /// Derived from ``evidence``, never from a constant. The physical A1 trace
+    /// records the deletion scope as `unsafe`, so this is `false` and the pen's copy
     /// is retained.
     public var deletionEnabled: Bool {
         evidence.isSafe

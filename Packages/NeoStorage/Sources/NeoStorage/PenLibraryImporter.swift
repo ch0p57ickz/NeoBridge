@@ -228,8 +228,8 @@ public actor PenLibraryImporter: PenImportCoordinator {
             return .reclaimed(pageCount: recorded.pageCount)
         }
 
-        // The gate is data, not a constant: it names the conditions no trace has
-        // established yet.
+        // The gate is data, not a constant: it names the conditions a trace has not
+        // left `safe`.
         if let reason = policy.skipReason(for: request.mode) {
             return .skipped(reason: reason)
         }
