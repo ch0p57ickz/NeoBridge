@@ -875,12 +875,15 @@ final class DeletingTransferStorageTests: XCTestCase {
     func testMarkingAnEmptyDeletingBatchFailedLeavesEveryOtherBatchAlone() async throws {
         let library = try SQLitePenLibrary(url: directory.file("library.sqlite"))
 
-        // An ordinary batch, which this call must never reinterpret.
+        // An ordinary batch, which this call must never reinterpret. It is in
+        // progress and holds no packet, so the kind is the only thing keeping a
+        // call meant for a deleting read out of it.
         let ordinary = UUID()
         try await library.save(
             PenImportBatchRecord(
                 batchID: ordinary,
-                state: .published,
+                state: .committed,
+                completion: .inProgress,
                 pages: [page],
                 strokeCount: 1,
                 dotCount: 1
@@ -907,10 +910,10 @@ final class DeletingTransferStorageTests: XCTestCase {
         // An identifier no batch holds is a no-op as well.
         try await library.failDeletingRead(batchID: UUID())
 
-        let published = try await library.batch(id: ordinary)
-        XCTAssertEqual(published?.state, .published)
-        XCTAssertEqual(published?.kind, .ordinary)
-        XCTAssertEqual(published?.completion, .complete)
+        let untouched = try await library.batch(id: ordinary)
+        XCTAssertEqual(untouched?.state, .committed)
+        XCTAssertEqual(untouched?.kind, .ordinary)
+        XCTAssertEqual(untouched?.completion, .inProgress)
 
         let prefix = try await library.batch(id: withPacket)
         XCTAssertEqual(prefix?.state, .committed)
