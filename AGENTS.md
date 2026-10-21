@@ -154,9 +154,11 @@ with grep, so a violation fails verification instead of surfacing in review.
 - Do not claim that a protocol command or BLE feature works without official SDK
   evidence or a physical A1 trace. Leave unverified fields in `docs/protocol-a1.md`
   marked as pending.
-- Keep destructive pen cleanup unreachable until the deletion evidence gate records
-  safe verdicts from physical A1 traces. Cleanup is the default intent, but the intent
-  alone never sends a deletion: the gate is data, not a boolean.
+- Keep destructive pen cleanup behind per-route evidence: a route may remove the pen's
+  copy only while its own record's verdicts are safe, and every verdict has to come from
+  a physical A1 trace. The records and the verdicts they currently carry are in
+  `docs/protocol-a1.md`. Cleanup is the default intent, but the intent alone never sends
+  a deletion: the gate is data, not a boolean.
 - Sanitize any captured pen traffic: no Bluetooth addresses, serial numbers, or
   authentication material. Raw captures belong in `Tests/Fixtures/raw/`, which is
   git-ignored.
@@ -174,10 +176,11 @@ Present today:
   cross-check the implementation instead of restating it. Regenerate only when a
   fixture must change, then review the generated diff.
 - `Tests/Hardware/README.md` — the physical A1 connect-and-sync acceptance checklist.
-- `Tests/Hardware/PenLab` — a macOS-only package that sends the two deletion commands
-  the app refuses to frame, with its own codec for them. It is not in any app target
-  and not in the portable package list; `README.md` in `Tests/Hardware` records how
-  to build and run it.
+- `Tests/Hardware/PenLab` — a macOS-only package for the pen's destructive paths: the
+  two deletion commands, framed by its own codec because the app cannot build them,
+  and a `next-delete` experiment that drives a `0x23` transfer with the deleting
+  option. PenLab is not in any app target and not in the portable package list;
+  `README.md` in `Tests/Hardware` records how to build and run it.
 - `Scripts/test-portable.sh` — the portable verification entry point.
 - `Scripts/remote-mac-build.sh` — the Mac build, Xcode gate, and bundle assembly.
 - `Scripts/pen-lab-build.sh` — the PenLab build and bundle assembly.

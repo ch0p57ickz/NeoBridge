@@ -223,6 +223,56 @@ final class PenSyncControllerTests: XCTestCase {
         XCTAssertEqual(second.save?.batchID, first.save?.batchID, "a retry exports the stored batch")
     }
 
+    /// A completed read whose files a retry can still publish offers no cleanup
+    /// confirmation, because a retry publishes from the library and removes nothing.
+    ///
+    /// The button is driven by this property, so offering it here would offer a
+    /// control that does nothing while the intent line directly above says the retry
+    /// removes nothing from the pen.
+    func testARetryableCompletionAsksForNoCleanupConfirmation() async throws {
+        let library = try makeLibrary(
+            publisher: StubPenExportPublisher(failures: [.svg: "the disk is full"])
+        )
+        defer { library.remove() }
+        let controller = makeController(
+            library: library.importer,
+            destination: library.destination,
+            outcome: .success(TestRead.result(strokes: [TestRead.stroke()]))
+        )
+
+        controller.readPenData()
+        try await waitForAttemptToSettle(controller)
+
+        XCTAssertTrue(controller.canRetryExport)
+        XCTAssertTrue(controller.isCleanupIntended, "cleanup is still the intended state")
+        XCTAssertFalse(
+            controller.needsCleanupConfirmation,
+            "a retry removes nothing, so it needs no confirmation"
+        )
+        XCTAssertFalse(controller.isCleanupConfirmedForThisSync)
+        XCTAssertTrue(
+            controller.canChooseCleanup,
+            "the retention choice stays offered for an ordinary read, whose retry honours it"
+        )
+
+        // Confirming is refused, which is why the button must not be offered: the
+        // two agree that this completion has no cleanup to authorize.
+        controller.confirmCleanupForThisSync()
+        XCTAssertFalse(controller.isCleanupConfirmedForThisSync)
+        XCTAssertFalse(controller.needsCleanupConfirmation)
+
+        // The retry still publishes, and it changes nothing about the pen's copy.
+        controller.retryExport()
+        try await waitForAttemptToSettle(controller)
+
+        XCTAssertTrue(try XCTUnwrap(controller.outcome).exportSucceeded)
+
+        // The retry published, so this completion is no longer retryable and the
+        // confirmation is about the next read again, which needs one.
+        XCTAssertFalse(controller.canRetryExport)
+        XCTAssertTrue(controller.needsCleanupConfirmation)
+    }
+
     func testRetryIsUnavailableForAReadThatSavedNothing() async throws {
         let library = try makeLibrary(
             publisher: StubPenExportPublisher(failures: [.svg: "the disk is full"])
@@ -558,18 +608,29 @@ final class PenSyncControllerTests: XCTestCase {
             outcome: .success(TestRead.result(strokes: [TestRead.stroke()]))
         )
 
-        // Before any transfer, cleanup is what the sync intends and retention is
-        // the offered alternative.
+        // Before any transfer, cleanup is what the sync intends, the route is
+        // available, and retention is the offered alternative. The confirmation is
+        // still outstanding, so the line says what would make the deleting route
+        // usable rather than claiming it is armed.
         XCTAssertEqual(controller.cleanupIntent, .deleteAfterAcknowledge)
         XCTAssertTrue(controller.isCleanupIntended)
         XCTAssertTrue(controller.canChooseCleanup)
+        XCTAssertTrue(controller.isCleanupAvailable)
+        XCTAssertNil(controller.cleanupUnavailableReason)
+        XCTAssertTrue(controller.needsCleanupConfirmation)
         XCTAssertEqual(
             controller.cleanupIntentLine,
-            "The next read removes the pen's strokes after they are saved."
+            "The next read can remove acknowledged packets once you confirm cleanup for it."
         )
         XCTAssertEqual(
             PenSyncController.cleanupIntentStatement,
-            "Strokes are normally removed from the pen after they are saved and their files are written."
+            "If you confirm cleanup for this read, each packet saved to the local library is removed"
+                + " from the pen when the read acknowledges it. The files requested for this read are"
+                + " exported afterwards; if that export fails, retry it from the local library."
+        )
+        XCTAssertEqual(
+            PenSyncController.confirmCleanupTitle,
+            "Remove Acknowledged Packets for This Read"
         )
         XCTAssertEqual(
             PenSyncController.retainPenDataTitle,
@@ -579,10 +640,12 @@ final class PenSyncControllerTests: XCTestCase {
         controller.retainPenDataForThisSync()
         XCTAssertEqual(controller.cleanupIntent, .keepOnPen)
         XCTAssertFalse(controller.isCleanupIntended)
+        XCTAssertFalse(controller.needsCleanupConfirmation, "retention needs no confirmation")
         XCTAssertEqual(controller.cleanupIntentLine, "The next read keeps the pen's strokes.")
 
         controller.intendCleanupForThisSync()
         XCTAssertEqual(controller.cleanupIntent, .deleteAfterAcknowledge)
+        XCTAssertTrue(controller.needsCleanupConfirmation, "cleanup needs its confirmation again")
     }
 
     func testRetentionAppliesToOnlyOneSyncAndJournalsNothing() async throws {
@@ -738,7 +801,10 @@ final class PenSyncControllerTests: XCTestCase {
         // the line names the retry rather than the next read.
         controller.retainPenDataForThisSync()
         XCTAssertEqual(controller.cleanupIntent, .keepOnPen)
-        XCTAssertEqual(controller.cleanupIntentLine, "Retry Export keeps the pen's strokes.")
+        XCTAssertEqual(
+            controller.cleanupIntentLine,
+            "Retry Export publishes files from the library and removes nothing from the pen."
+        )
 
         controller.retryExport()
         try await waitForAttemptToSettle(controller)
@@ -900,6 +966,85 @@ final class PenSyncControllerTests: XCTestCase {
         XCTAssertEqual(controller.outcome?.cleanup, .retainedByChoice)
     }
 
+    func testTheCleanupConfirmationSurvivesAPenChoiceAndReachesTheChosenRead() async throws {
+        let library = try makeLibrary()
+        defer { library.remove() }
+        let first = PenPeripheral(id: UUID(), name: penName)
+        let second = PenPeripheral(id: UUID(), name: penName)
+        let counter = RunnerCounter()
+        let intents = DeletingReadRecorder()
+        let penName = self.penName
+        let read = TestRead.deletingResult(
+            strokes: [TestRead.stroke()],
+            packetCount: 1,
+            isComplete: true
+        )
+        // The controller publishes a deleting read's stored rows rather than
+        // importing them, so the coordinator only has to answer the publication.
+        let coordinator = StubImportCoordinator(
+            outcome: .saved(TestRead.save(), export: nil),
+            publishReport: PenExportReport(artifacts: [])
+        )
+        let controller = PenSyncController(
+            runners: PenSyncRunnerFactory { _ in
+                counter.increment()
+                if counter.value == 1 {
+                    return StubPenSyncRunner(
+                        stages: [.scanning],
+                        outcome: .failure(
+                            PenBluetoothError.multiplePensFound(
+                                advertisedName: penName,
+                                candidates: [first, second]
+                            )
+                        ),
+                        intents: intents
+                    )
+                }
+                return StubPenSyncRunner(stages: [.scanning, .syncing], outcome: .success(read), intents: intents)
+            },
+            library: coordinator,
+            destination: library.destination,
+            deletingReadStorage: .stub
+        )
+
+        // The user confirms cleanup, and then the pen has to be chosen. Asking which
+        // pen to use is not a read, so the confirmation the user gave for this sync
+        // must survive the question: losing it would run the read non-destructively
+        // and keep a pen copy the user asked to remove.
+        controller.confirmCleanupForThisSync()
+        XCTAssertFalse(controller.needsCleanupConfirmation)
+        controller.readPenData()
+        try await waitForAttemptToSettle(controller)
+
+        XCTAssertTrue(controller.isAwaitingChoice)
+        XCTAssertTrue(
+            controller.isCleanupConfirmedForThisSync,
+            "a pen choice must not discard the confirmation"
+        )
+        XCTAssertFalse(controller.needsCleanupConfirmation)
+
+        controller.choosePen(second)
+        try await waitForAttemptToSettle(controller)
+
+        XCTAssertEqual(intents.values.count, 2)
+        XCTAssertNotNil(intents.values[0], "the first attempt was confirmed and asked for deletion")
+        XCTAssertNotNil(
+            intents.values[1],
+            "the read the user chose must still be the confirmed deleting read"
+        )
+        let outcome = try XCTUnwrap(controller.outcome)
+        XCTAssertTrue(outcome.isDeletingRead)
+        XCTAssertEqual(
+            outcome.cleanup,
+            .acknowledgedPrefix(
+                packetCount: 1,
+                isComplete: true,
+                removalUncertain: false,
+                reachedEndPacket: true
+            )
+        )
+    }
+
     func testTheCleanupIntentCannotBeChangedWhileAnAttemptIsRunning() async throws {
         let library = try makeLibrary()
         defer { library.remove() }
@@ -928,12 +1073,14 @@ final class PenSyncControllerTests: XCTestCase {
         try await waitUntil(controller, is: .saving)
 
         // A tap while the read runs cannot reach that read, which already captured
-        // its intent, so it is ignored rather than applied to the next sync.
+        // its intent, so it is ignored rather than applied to the next sync. The
+        // read started unconfirmed, and the line says so rather than implying the
+        // deleting route is armed.
         XCTAssertTrue(controller.isCleanupIntended)
         XCTAssertFalse(controller.canChooseCleanup, "a running read withholds the choice")
         XCTAssertEqual(
             controller.cleanupIntentLine,
-            "Removing the pen's strokes when this read completes.",
+            "Keeping the pen's strokes for this read; cleanup was not confirmed.",
             "a running read's line names the read it already captured"
         )
         controller.retainPenDataForThisSync()
@@ -952,31 +1099,41 @@ final class PenSyncControllerTests: XCTestCase {
         XCTAssertTrue(controller.isCleanupIntended)
     }
 
-    func testCleanupStaysUnavailableWhileTheGateIsClosedAndExplainsTheSkip() async throws {
+    func testCleanupAvailabilityNamesTheTransferGateWhileTheCommandGateStaysClosed() async throws {
         let library = try makeLibrary()
         defer { library.remove() }
         let controller = makeController(
             library: library.importer,
             destination: library.destination,
+            deletingReadStorage: .unavailable,
             outcome: .success(TestRead.result(strokes: [TestRead.stroke()]))
         )
 
-        // Deletion is unavailable, and the reason names the closed gate.
+        // The deleting route is closed because no durable packet storage is
+        // available, and the reason names that transfer-specific blocker rather
+        // than the separate `0x25` command's scope.
         XCTAssertFalse(controller.isCleanupAvailable)
         let reason = try XCTUnwrap(controller.cleanupUnavailableReason)
-        XCTAssertTrue(reason.contains("deletion evidence gate"), reason)
+        XCTAssertTrue(reason.contains("durable packet storage"), reason)
+        XCTAssertFalse(reason.contains("0x25"), reason)
+        XCTAssertEqual(
+            controller.cleanupIntentLine,
+            "The next read keeps the pen's strokes because cleanup is unavailable."
+        )
 
         // The read still saves, the pen keeps its copy, and the shell says why.
         controller.readPenData()
         try await waitForAttemptToSettle(controller)
 
         let outcome = try XCTUnwrap(controller.outcome)
-        XCTAssertTrue(outcome.isSaved, "a closed gate must not stop the read being stored")
+        XCTAssertTrue(outcome.isSaved, "a closed route must not stop the read being stored")
         XCTAssertFalse(outcome.reclaimedPenCopy)
         guard case .skipped(let skipReason) = outcome.cleanup else {
             return XCTFail("expected a skipped cleanup, got \(outcome.cleanup)")
         }
-        XCTAssertEqual(skipReason, reason)
+        // The ordinary read's cleanup is the separate command, so its skip reason
+        // is the command gate's: the two routes are reported independently.
+        XCTAssertTrue(skipReason.contains("deletion evidence gate"), skipReason)
         XCTAssertTrue(outcome.cleanupNotice.contains("The pen kept its strokes"), outcome.cleanupNotice)
     }
 
@@ -1050,6 +1207,466 @@ final class PenSyncControllerTests: XCTestCase {
         XCTAssertTrue(outcome.cleanupNotice.contains("kept on the pen"), outcome.cleanupNotice)
     }
 
+    // MARK: - Deleting reads
+
+    func testNoExportRequestNeverRequestsADeletingReadAndSaysWhy() async throws {
+        let library = try makeLibrary()
+        defer { library.remove() }
+        let intents = DeletingReadRecorder()
+        let controller = makeController(
+            library: library.importer,
+            destination: NoExportDestination(),
+            intents: intents,
+            outcome: .success(TestRead.result(strokes: [TestRead.stroke()]))
+        )
+
+        // No export was requested, so there is nothing to fall back on if the
+        // pen's copy went away, and the reason names exactly that.
+        XCTAssertFalse(controller.isCleanupAvailable)
+        XCTAssertEqual(
+            controller.cleanupUnavailableReason,
+            PenDeletingReadRefusal.noExportRequested.reason
+        )
+
+        // Even an explicit confirmation cannot open the route without an export.
+        controller.confirmCleanupForThisSync()
+        XCTAssertFalse(controller.isCleanupConfirmedForThisSync)
+        controller.readPenData()
+        try await waitForAttemptToSettle(controller)
+
+        XCTAssertEqual(intents.values.count, 1)
+        XCTAssertNil(intents.values[0], "a no-export sync must request an ordinary read")
+        XCTAssertFalse(try XCTUnwrap(controller.outcome).isDeletingRead)
+    }
+
+    func testConfirmationAuthorizesOneDeletingReadAndTheNextSyncAsksAgain() async throws {
+        let library = try makeLibrary()
+        defer { library.remove() }
+        let intents = DeletingReadRecorder()
+        let read = TestRead.deletingResult(strokes: [TestRead.stroke()], packetCount: 1, isComplete: true)
+        let controller = makeController(
+            library: StubImportCoordinator(outcome: .saved(TestRead.save(), export: nil)),
+            destination: library.destination,
+            intents: intents,
+            outcome: .success(read)
+        )
+
+        XCTAssertTrue(controller.needsCleanupConfirmation)
+        controller.confirmCleanupForThisSync()
+        XCTAssertTrue(controller.isCleanupConfirmedForThisSync)
+        XCTAssertFalse(controller.needsCleanupConfirmation)
+
+        controller.readPenData()
+        try await waitForAttemptToSettle(controller)
+
+        // The confirmation is what authorized the deleting request, and it travelled
+        // with the read as a confirmation made for this sync.
+        let first = try XCTUnwrap(intents.values.first ?? nil)
+        XCTAssertTrue(first.confirmedForThisSync)
+        XCTAssertTrue(first.requestedExport)
+        XCTAssertTrue(first.durablePacketStorageAvailable)
+        XCTAssertTrue(try XCTUnwrap(controller.outcome).isDeletingRead)
+
+        // Consent is for one sync: the next read starts unconfirmed and asks again.
+        XCTAssertTrue(controller.needsCleanupConfirmation)
+        controller.readPenData()
+        try await waitForAttemptToSettle(controller)
+
+        XCTAssertEqual(intents.values.count, 2)
+        XCTAssertNil(intents.values[1], "a later sync must not inherit the confirmation")
+    }
+
+    /// The headless acceptance run applies its cleanup choice through the same calls
+    /// the menu makes, so a run only deletes when it confirmed cleanup for its sync.
+    ///
+    /// This is the checklist's vehicle for the physical deleting-read acceptance, so
+    /// a run that silently took the non-destructive path would produce a transcript
+    /// that looks like a passing deleting read.
+    func testAHeadlessRunOnlyDeletesWhenItConfirmedCleanup() async throws {
+        let library = try makeLibrary()
+        defer { library.remove() }
+        let read = TestRead.deletingResult(strokes: [TestRead.stroke()], packetCount: 1, isComplete: true)
+
+        // Intent only: the run must take the ordinary non-destructive read, which
+        // goes through the saving and exporting steps the gates hold open.
+        let unconfirmed = DeletingReadRecorder()
+        let unconfirmedLibrary = StubImportCoordinator(outcome: .saved(TestRead.save(), export: nil))
+        await unconfirmedLibrary.saving.open()
+        await unconfirmedLibrary.exporting.open()
+        let unconfirmedController = makeController(
+            library: unconfirmedLibrary,
+            destination: library.destination,
+            intents: unconfirmed,
+            outcome: .success(TestRead.result(strokes: [TestRead.stroke()]))
+        )
+        let unconfirmedOptions = PenAcceptanceOptions(
+            traceURL: URL(fileURLWithPath: "/tmp/a1-run.txt"),
+            cleanupMode: .deleteAfterAcknowledge,
+            confirmCleanup: false
+        )
+        unconfirmedOptions.applyCleanupChoice(to: unconfirmedController)
+
+        XCTAssertTrue(unconfirmedController.isCleanupIntended)
+        XCTAssertTrue(unconfirmedController.needsCleanupConfirmation)
+
+        unconfirmedController.readPenData()
+        try await waitForAttemptToSettle(unconfirmedController)
+
+        XCTAssertEqual(unconfirmed.values.count, 1)
+        XCTAssertNil(unconfirmed.values[0], "an unconfirmed run must not ask for a deleting read")
+        XCTAssertFalse(try XCTUnwrap(unconfirmedController.outcome).isDeletingRead)
+
+        // Intent and confirmation: the run takes the deleting path, whose
+        // publication is the coordinator's own `publish` rather than the saving and
+        // exporting steps.
+        let confirmed = DeletingReadRecorder()
+        let confirmedController = makeController(
+            library: StubImportCoordinator(outcome: .saved(TestRead.save(), export: nil)),
+            destination: library.destination,
+            intents: confirmed,
+            outcome: .success(read)
+        )
+        PenAcceptanceOptions(
+            traceURL: URL(fileURLWithPath: "/tmp/a1-run.txt"),
+            cleanupMode: .deleteAfterAcknowledge,
+            confirmCleanup: true
+        ).applyCleanupChoice(to: confirmedController)
+
+        XCTAssertFalse(confirmedController.needsCleanupConfirmation)
+
+        confirmedController.readPenData()
+        try await waitForAttemptToSettle(confirmedController)
+
+        let intent = try XCTUnwrap(confirmed.values.first ?? nil)
+        XCTAssertTrue(intent.confirmedForThisSync)
+        XCTAssertTrue(try XCTUnwrap(confirmedController.outcome).isDeletingRead)
+
+        // A run that asks for retention keeps the pen's copy whatever the flag says,
+        // which the parser refuses to combine with a confirmation.
+        let retained = DeletingReadRecorder()
+        let retainedLibrary = StubImportCoordinator(outcome: .saved(TestRead.save(), export: nil))
+        await retainedLibrary.saving.open()
+        await retainedLibrary.exporting.open()
+        let retainedController = makeController(
+            library: retainedLibrary,
+            destination: library.destination,
+            intents: retained,
+            outcome: .success(TestRead.result(strokes: [TestRead.stroke()]))
+        )
+        PenAcceptanceOptions(
+            traceURL: URL(fileURLWithPath: "/tmp/a1-run.txt"),
+            cleanupMode: .keepOnPen
+        ).applyCleanupChoice(to: retainedController)
+
+        XCTAssertFalse(retainedController.isCleanupIntended)
+
+        retainedController.readPenData()
+        try await waitForAttemptToSettle(retainedController)
+
+        XCTAssertEqual(retained.values.count, 1)
+        XCTAssertNil(retained.values[0], "a retaining run must not ask for a deleting read")
+        XCTAssertFalse(try XCTUnwrap(retainedController.outcome).isDeletingRead)
+    }
+
+    func testCompletedDeletingReadReportsTheAcknowledgedPrefix() async throws {
+        let library = try makeLibrary()
+        defer { library.remove() }
+        let read = TestRead.deletingResult(
+            strokes: [TestRead.stroke(), TestRead.stroke(x: 20)],
+            packetCount: 2,
+            isComplete: true
+        )
+        let controller = makeController(
+            library: StubImportCoordinator(outcome: .saved(TestRead.save(), export: nil)),
+            destination: library.destination,
+            outcome: .success(read)
+        )
+
+        controller.confirmCleanupForThisSync()
+        controller.readPenData()
+        try await waitForAttemptToSettle(controller)
+
+        let outcome = try XCTUnwrap(controller.outcome)
+        XCTAssertTrue(outcome.isDeletingRead)
+        XCTAssertFalse(outcome.isPartialDeletingRead)
+        XCTAssertTrue(outcome.isSaved)
+        XCTAssertEqual(
+            outcome.cleanup,
+            .acknowledgedPrefix(
+                packetCount: 2,
+                isComplete: true,
+                removalUncertain: false,
+                reachedEndPacket: true
+            )
+        )
+        XCTAssertTrue(outcome.reclaimedPenCopy)
+        XCTAssertTrue(outcome.cleanupNotice.contains("2 acknowledged packets"), outcome.cleanupNotice)
+        XCTAssertTrue(
+            outcome.cleanupNotice.contains("library copy remains available"),
+            outcome.cleanupNotice
+        )
+        XCTAssertTrue(
+            outcome.notice.contains("acknowledged packets were removed"),
+            outcome.notice
+        )
+        XCTAssertEqual(
+            controller.statusLabel,
+            "Complete",
+            "a deleting read that reached every end packet is a completed sync"
+        )
+    }
+
+    func testPartialDeletingReadReportsThePrefixAndOffersFreshReadAndRetry() async throws {
+        let library = try makeLibrary()
+        defer { library.remove() }
+        let read = TestRead.deletingResult(
+            strokes: [TestRead.stroke(), TestRead.stroke(x: 20)],
+            packetCount: 1,
+            isComplete: false,
+            reason: "the pen stopped sending"
+        )
+        let coordinator = StubImportCoordinator(
+            outcome: .saved(TestRead.save(), export: nil),
+            retryReport: PenExportReport(artifacts: [
+                PenExportArtifact(
+                    format: .svg,
+                    path: "/tmp/ncode-s3-o27-b700-p1.svg",
+                    byteCount: 1,
+                    status: .published
+                )
+            ]),
+            publishReport: PenExportReport(artifacts: [
+                PenExportArtifact(
+                    format: .svg,
+                    path: "/tmp/ncode-s3-o27-b700-p1.svg",
+                    byteCount: 1,
+                    status: .failed(reason: "the disk is full")
+                )
+            ])
+        )
+        let controller = makeController(
+            library: coordinator,
+            destination: library.destination,
+            outcome: .success(read)
+        )
+
+        controller.confirmCleanupForThisSync()
+        controller.readPenData()
+        try await waitForAttemptToSettle(controller)
+
+        let partial = try XCTUnwrap(controller.outcome)
+        XCTAssertTrue(partial.isPartialDeletingRead)
+        XCTAssertEqual(
+            controller.statusLabel,
+            "Partial",
+            "a partial deleting read must never read as a completed sync"
+        )
+        XCTAssertEqual(
+            partial.cleanup,
+            .acknowledgedPrefix(
+                packetCount: 1,
+                isComplete: false,
+                removalUncertain: false,
+                reachedEndPacket: false
+            )
+        )
+        XCTAssertTrue(
+            partial.cleanupNotice.contains("the pen may still hold the remainder"),
+            partial.cleanupNotice
+        )
+        XCTAssertTrue(partial.exportFailed, "the requested export did not publish")
+        XCTAssertTrue(controller.canRetryExport)
+
+        // A fresh read is offered, because the remainder is still on the pen, but no
+        // cleanup choice is: this completed read removed what it stored as it read it,
+        // so the retry only republishes the durable copy and a choice could only
+        // change a control that removes nothing.
+        XCTAssertFalse(controller.canChooseCleanup)
+        XCTAssertFalse(controller.isBusy)
+        XCTAssertFalse(
+            controller.needsCleanupConfirmation,
+            "a retry removes nothing, so it needs no confirmation either"
+        )
+
+        // The retry republishes the durable pages and never asks for a separate
+        // deletion command, because the deleting transfer already removed what it
+        // acknowledged.
+        controller.retryExport()
+        try await waitForAttemptToSettle(controller)
+
+        let retried = try XCTUnwrap(controller.outcome)
+        XCTAssertTrue(retried.exportSucceeded)
+        XCTAssertTrue(retried.isPartialDeletingRead, "a retry must not complete the read")
+        XCTAssertEqual(
+            retried.cleanup,
+            .acknowledgedPrefix(
+                packetCount: 1,
+                isComplete: false,
+                removalUncertain: false,
+                reachedEndPacket: false
+            )
+        )
+        let requested = await coordinator.requestedCleanupCount()
+        XCTAssertEqual(requested, 0, "a deleting batch must never request a separate deletion")
+    }
+
+    /// A transfer that reached its last packet whose completion could not be recorded
+    /// must not be reported as a short read.
+    ///
+    /// The two states share `isComplete == false`, so without the transfer's own fact
+    /// the shell would tell the user the pen may still hold a remainder when it holds
+    /// none, and would hide the storage failure that is the real cause.
+    func testAnUnrecordedCompletionIsNotReportedAsAShortRead() async throws {
+        let library = try makeLibrary()
+        defer { library.remove() }
+        let read = TestRead.deletingResult(
+            strokes: [TestRead.stroke(), TestRead.stroke(x: 20)],
+            packetCount: 2,
+            isComplete: false,
+            reachedEndPacket: true,
+            reason: "the read's completion could not be recorded: the disk is full"
+        )
+        let controller = makeController(
+            library: StubImportCoordinator(outcome: .saved(TestRead.save(), export: nil)),
+            destination: library.destination,
+            outcome: .success(read)
+        )
+
+        controller.confirmCleanupForThisSync()
+        controller.readPenData()
+        try await waitForAttemptToSettle(controller)
+
+        let outcome = try XCTUnwrap(controller.outcome)
+        XCTAssertTrue(outcome.isPartialDeletingRead, "the durable record says not complete")
+        XCTAssertEqual(controller.statusLabel, "Partial")
+
+        // The pen's copy is gone, and the reason names the storage failure rather than
+        // a transfer that stopped short.
+        XCTAssertTrue(
+            outcome.cleanupNotice.contains("the pen holds no remainder of it"),
+            outcome.cleanupNotice
+        )
+        XCTAssertFalse(
+            outcome.cleanupNotice.contains("the pen may still hold the remainder"),
+            outcome.cleanupNotice
+        )
+        XCTAssertTrue(
+            outcome.notice.contains("the read's completion could not be recorded"),
+            outcome.notice
+        )
+        XCTAssertFalse(
+            outcome.notice.contains("the pen may still hold the remainder"),
+            outcome.notice
+        )
+    }
+
+    func testUncertainAcknowledgementIsReportedAsUncertain() async throws {
+        let library = try makeLibrary()
+        defer { library.remove() }
+        let read = TestRead.deletingResult(
+            strokes: [TestRead.stroke()],
+            packetCount: 1,
+            isComplete: false,
+            acknowledgementUncertain: true,
+            reason: "the acknowledgement could not be sent"
+        )
+        let controller = makeController(
+            library: StubImportCoordinator(outcome: .saved(TestRead.save(), export: nil)),
+            destination: library.destination,
+            outcome: .success(read)
+        )
+
+        controller.confirmCleanupForThisSync()
+        controller.readPenData()
+        try await waitForAttemptToSettle(controller)
+
+        let outcome = try XCTUnwrap(controller.outcome)
+        XCTAssertEqual(
+            outcome.cleanup,
+            .acknowledgedPrefix(
+                packetCount: 1,
+                isComplete: false,
+                removalUncertain: true,
+                reachedEndPacket: false
+            )
+        )
+        XCTAssertTrue(
+            outcome.cleanupNotice.contains("acknowledgement was not confirmed"),
+            outcome.cleanupNotice
+        )
+        XCTAssertTrue(
+            outcome.notice.contains("acknowledgement was not confirmed"),
+            outcome.notice
+        )
+    }
+
+    func testARefusedDeletingRouteIsSavedNonDestructivelyAndReportedAsSkipped() async throws {
+        let library = try makeLibrary()
+        defer { library.remove() }
+        // The pen's identity closed the deleting route after the handshake, so the
+        // session read non-destructively and named the blocker.
+        let refusal = "the deleting-transfer evidence gate is closed for protocol 2.18"
+        let read = TestRead.refusedDeletingResult(
+            strokes: [TestRead.stroke(), TestRead.stroke(x: 20)],
+            refusal: refusal
+        )
+        let coordinator = StubImportCoordinator(
+            outcome: .saved(TestRead.save(), export: nil),
+            cleanup: .reclaimed(pageCount: 1)
+        )
+        // The stub holds its steps open for a test that watches the phases, so this
+        // test releases them before starting the read.
+        await coordinator.saving.open()
+        await coordinator.exporting.open()
+        let controller = makeController(
+            library: coordinator,
+            destination: library.destination,
+            outcome: .success(read)
+        )
+
+        controller.confirmCleanupForThisSync()
+        controller.readPenData()
+        try await waitForAttemptToSettle(controller)
+
+        let outcome = try XCTUnwrap(controller.outcome)
+        XCTAssertFalse(outcome.isDeletingRead, "the fallback is an ordinary read")
+        XCTAssertTrue(outcome.isSaved, "the read still reaches the library")
+        XCTAssertFalse(outcome.reclaimedPenCopy)
+        // The refusal names why the deleting route closed, not the command gate.
+        XCTAssertEqual(outcome.cleanup, .skipped(reason: refusal))
+        XCTAssertEqual(
+            outcome.cleanupNotice,
+            "The pen kept its strokes: \(refusal)",
+            "the notice must name the blocker that kept the read non-destructive"
+        )
+
+        // No separate deletion command was requested for the fallback: the read was
+        // never authorized to remove anything.
+        let requested = await coordinator.requestedCleanupCount()
+        XCTAssertEqual(requested, 0, "a refused deleting route must not request cleanup")
+    }
+
+    func testCancellingADeletingReadLeavesNoCompletedResult() async throws {
+        let library = try makeLibrary()
+        defer { library.remove() }
+        let controller = makeController(
+            library: StubImportCoordinator(outcome: .saved(TestRead.save(), export: nil)),
+            destination: library.destination,
+            outcome: .waitsForCancellation
+        )
+
+        controller.confirmCleanupForThisSync()
+        controller.readPenData()
+        try await waitUntil(controller, is: .syncing)
+
+        controller.cancel()
+
+        XCTAssertEqual(controller.phase, .idle)
+        XCTAssertNil(controller.outcome, "a cancelled deleting read claims nothing")
+        // The cancelled sync consumed its confirmation, so the next one asks again.
+        XCTAssertTrue(controller.needsCleanupConfirmation)
+    }
+
     // MARK: - Helpers
 
     private func makeLibrary(
@@ -1065,15 +1682,18 @@ final class PenSyncControllerTests: XCTestCase {
         destination: any PenExportDestinationProviding,
         stages: [PenSyncStage] = [.scanning, .connecting, .verifying, .syncing],
         cleanupPolicy: PenCleanupPolicy = PenCleanupPolicy(),
+        deletingReadStorage: PenDeletingReadStorage = .stub,
+        intents: DeletingReadRecorder? = nil,
         outcome: StubPenSyncRunner.Outcome
     ) -> PenSyncController {
         PenSyncController(
             runners: PenSyncRunnerFactory { _ in
-                StubPenSyncRunner(stages: stages, outcome: outcome)
+                StubPenSyncRunner(stages: stages, outcome: outcome, intents: intents)
             },
             library: library,
             destination: destination,
-            cleanupPolicy: cleanupPolicy
+            cleanupPolicy: cleanupPolicy,
+            deletingReadStorage: deletingReadStorage
         )
     }
 

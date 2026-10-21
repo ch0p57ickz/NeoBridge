@@ -1,5 +1,6 @@
 import Foundation
 import NeoBridgeMacCore
+import NeoCore
 import Synchronization
 
 /// Records the stages one runner reports, in order.
@@ -41,6 +42,23 @@ final class SelectionRecorder: @unchecked Sendable {
     }
 }
 
+/// Records the deleting-read intent each attempt was built with.
+///
+/// The intent is what proves the shell asked for a deleting transfer, or did not,
+/// so the recorder is how a shell test checks that a no-export or unconfirmed read
+/// never reaches the deleting route.
+final class DeletingReadRecorder: @unchecked Sendable {
+    private let store = Mutex<[PenDeletingReadIntent?]>([])
+
+    /// Every intent recorded so far, in order.
+    var values: [PenDeletingReadIntent?] { store.withLock { $0 } }
+
+    /// Records one intent.
+    func record(_ intent: PenDeletingReadIntent?) {
+        store.withLock { $0.append(intent) }
+    }
+}
+
 /// A runner that reports scripted stages and then produces a scripted outcome.
 ///
 /// The runner is what makes the shell testable without a radio: the controller
@@ -66,7 +84,16 @@ struct StubPenSyncRunner: PenSyncRunning {
     /// What the attempt ends with.
     let outcome: Outcome
 
-    func run(report: @escaping @Sendable (PenSyncStage) -> Void) async throws -> PenReadResult {
+    /// Records the deleting-read intent the attempt was built with, when a test
+    /// wants to check which route the shell requested.
+    var intents: DeletingReadRecorder? = nil
+
+    func run(
+        deletingRead: PenDeletingReadIntent?,
+        report: @escaping @Sendable (PenSyncStage) -> Void
+    ) async throws -> PenReadResult {
+        intents?.record(deletingRead)
+
         for stage in stages {
             report(stage)
             await Task.yield()

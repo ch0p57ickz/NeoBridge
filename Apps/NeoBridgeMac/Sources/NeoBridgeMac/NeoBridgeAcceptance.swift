@@ -39,6 +39,7 @@ enum NeoBridgeAcceptance {
             "run transferOption=\(options.transferOption.argumentName)"
                 + "(0x\(String(format: "%02X", options.transferOption.rawValue)))"
                 + " cleanup=\(options.cleanupMode.argumentName)"
+                + " confirmCleanup=\(options.confirmCleanup ? "true" : "false")"
                 + " abortAtPacket=\(options.abortAtPacket.map(String.init) ?? "none")"
         )
         let controller = PenSyncAppComposition.makeController(
@@ -47,14 +48,10 @@ enum NeoBridgeAcceptance {
             acceptance: options
         )
 
-        // The intent is set through the same API the menu uses, so a run that asks
-        // for retention takes the same path a person choosing it takes.
-        switch options.cleanupMode {
-        case .keepOnPen:
-            controller.retainPenDataForThisSync()
-        case .deleteAfterAcknowledge:
-            controller.intendCleanupForThisSync()
-        }
+        // The choice is applied through the same API the menu uses, so a run that asks
+        // for retention takes the same path a person choosing it takes, and a run
+        // that does not confirm cleanup takes the ordinary non-destructive read.
+        options.applyCleanupChoice(to: controller)
 
         controller.readPenData()
 

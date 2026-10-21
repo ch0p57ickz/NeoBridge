@@ -51,13 +51,29 @@ extension PenSyncStage {
 public protocol PenSyncRunning: Sendable {
     /// Scans, connects, and reads.
     ///
-    /// - Parameter report: Called as each stage begins. The callbacks arrive in
-    ///   stage order from the session's sequential transitions.
+    /// - Parameters:
+    ///   - deletingRead: This sync's request for a deleting read, or `nil` for an
+    ///     ordinary read. The session resolves it against the connected pen and
+    ///     sends `0x23` option `0x01` only when the policy authorizes it.
+    ///   - report: Called as each stage begins. The callbacks arrive in stage
+    ///     order from the session's sequential transitions.
     /// - Returns: The summary the shell presents and the complete transfer the
     ///   library commits.
     /// - Throws: A `PenBluetoothError` or `PenSessionError` describing the
     ///   failed step.
-    func run(report: @escaping @Sendable (PenSyncStage) -> Void) async throws -> PenReadResult
+    func run(
+        deletingRead: PenDeletingReadIntent?,
+        report: @escaping @Sendable (PenSyncStage) -> Void
+    ) async throws -> PenReadResult
+}
+
+extension PenSyncRunning {
+    /// Reads the pen without requesting a deleting transfer.
+    public func run(
+        report: @escaping @Sendable (PenSyncStage) -> Void
+    ) async throws -> PenReadResult {
+        try await run(deletingRead: nil, report: report)
+    }
 }
 
 /// Makes a fresh runner for each attempt.
@@ -98,6 +114,7 @@ public struct BluetoothPenSyncRunner: PenSyncRunning {
     private let setupTimeout: Duration
     private let timeouts: PenSessionTimeouts
     private let transferOption: OfflineReadTransferOption
+    private let packetBarrier: (any PenDeletingPacketBarrier)?
     private let abortAtPacket: Int?
     private let trace: PenTrafficLog?
 
@@ -138,6 +155,8 @@ public struct BluetoothPenSyncRunner: PenSyncRunning {
     ///   - transferOption: The `0x23` transfer option the session sends. It
     ///     defaults to the established non-destructive option; the acceptance run
     ///     varies it while the incremental-transfer experiment runs.
+    ///   - packetBarrier: The durable storage a deleting read commits each packet
+    ///     through. It is required for a deleting read and unused otherwise.
     ///   - abortAtPacket: When set, the attempt drops the link as that `0x24`
     ///     packet arrives, so the transfer fails part way on purpose. Only the
     ///     acceptance run sets it.
@@ -152,6 +171,7 @@ public struct BluetoothPenSyncRunner: PenSyncRunning {
         setupTimeout: Duration? = nil,
         timeouts: PenSessionTimeouts = .default,
         transferOption: OfflineReadTransferOption = .nextAndReserve,
+        packetBarrier: (any PenDeletingPacketBarrier)? = nil,
         abortAtPacket: Int? = nil,
         trace: PenTrafficLog? = nil
     ) {
@@ -163,11 +183,13 @@ public struct BluetoothPenSyncRunner: PenSyncRunning {
         self.setupTimeout = setupTimeout ?? Self.setupDeadline(for: selectionWindow)
         self.timeouts = timeouts
         self.transferOption = transferOption
+        self.packetBarrier = packetBarrier
         self.abortAtPacket = abortAtPacket
         self.trace = trace
     }
 
     public func run(
+        deletingRead: PenDeletingReadIntent?,
         report: @escaping @Sendable (PenSyncStage) -> Void
     ) async throws -> PenReadResult {
         let base = CoreBluetoothPenTransport(
@@ -204,6 +226,14 @@ public struct BluetoothPenSyncRunner: PenSyncRunning {
             timeouts: timeouts,
             transferOption: transferOption,
             queryPenState: true,
+            deletingRead: deletingRead,
+            packetBarrier: packetBarrier,
+            onDeletingPacketCommitted: { packetID, strokeCount in
+                // Recorded after the commit returned and before the packet's
+                // acknowledgement, so the transcript shows the ordering the
+                // deletion bound depends on.
+                trace?.recordPacketCommit(packetID: packetID, strokeCount: strokeCount)
+            },
             onStateChange: { state in
                 trace?.recordState(state.label)
                 guard let stage = PenSyncStage(state) else { return }
@@ -216,9 +246,10 @@ public struct BluetoothPenSyncRunner: PenSyncRunning {
             // The attempt owns the link from the moment it connects, so it also
             // releases it on success. A connected pen stops advertising, so a
             // reader that kept the link would make its own next read report "no
-            // pen found" and would keep the pen from its other owners. Nothing is
-            // deleted from the pen by disconnecting: the read path can only send a
-            // non-destructive transfer option, so the strokes stay on it.
+            // pen found" and would keep the pen from its other owners. Disconnecting
+            // removes nothing itself: an ordinary read sends only a non-destructive
+            // transfer option, and a deleting read removed exactly the packets it
+            // had already committed and acknowledged before this point.
             await transport.close()
             trace?.recordState("Disconnected")
             trace?.recordCompletion(result)

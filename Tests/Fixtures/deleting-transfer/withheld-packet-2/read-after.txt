@@ -1,0 +1,31 @@
+run transferOption=nextAndReserve(0x02) cleanup=deleteAfterAcknowledge abortAtPacket=none
+state Scanning for a pen
+state Connecting
+outbound C0012A00000000000000000000000000000000001112312E302E300000000000000000000000322E313800000000C1 command=0x01
+inbound 76 bytes
+state Verifying pen
+outbound C0040000C1 command=0x04
+inbound 70 bytes
+state Reading pen data
+outbound C0210400FFFFFFFFC1 command=0x21
+inbound 16 bytes
+outbound C02208001B000003BC020000C1 command=0x22
+inbound 20 bytes
+outbound C0230E0002001B000003BC02000000000000C1 command=0x23
+inbound 15 bytes
+inbound 509 bytes
+inbound 373 bytes
+outbound C0A4000300010000C1 command=0xA4
+state Complete
+state Disconnected
+version text=2.23 name=NWP-F151 firmware=3.00
+note Note 700 · section 3 · owner 27 strokes=5 dots=45 packets=1 listedPages=37 infoStrokeCount=5
+page page=37 section=3 owner=27 book=700 strokes=5 dots=45 x=3691..4289 y=704..852
+stroke page=37 index=0 dots=3 x=3691..3726 y=731..734 origin=1792600250432 t=24..58 fp=3126b9bb7ba51360
+stroke page=37 index=1 dots=12 x=3789..3878 y=724..837 origin=1792600250538 t=23..163 fp=614e07d9df729d65
+stroke page=37 index=2 dots=9 x=3877..3897 y=731..852 origin=1792600250777 t=23..115 fp=3834372b6bf478b4
+stroke page=37 index=3 dots=6 x=3846..3957 y=714..721 origin=1792600250978 t=23..81 fp=7ce607b1afc2be5c
+stroke page=37 index=4 dots=15 x=4073..4289 y=704..824 origin=1792600251231 t=24..185 fp=7e6b0664a1af2b9e
+result strokes=5 dots=45 pages=1 notes=1
+totals outboundFrames=6 outboundBytes=102 inboundChunks=7 inboundBytes=1079
+outboundCommands 0x01,0x04,0x21,0x22,0x23,0xA4

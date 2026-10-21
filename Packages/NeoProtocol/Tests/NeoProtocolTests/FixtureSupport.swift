@@ -188,6 +188,41 @@ enum FixtureSupport {
         outboundFrames(chunks).map(\.command)
     }
 
+    /// The `0x23` transfer option byte of every offline data request, in order.
+    ///
+    /// The option is the request payload's first byte, so a test can assert which
+    /// transfer a read asked for without indexing into raw frames.
+    static func outboundOptions(_ chunks: [[UInt8]]) -> [UInt8] {
+        outboundFrames(chunks)
+            .filter { $0.command == .offlineDataRequest1 }
+            .compactMap { $0.payload.first }
+    }
+
+    /// Replaces every occurrence of one byte sequence with another of equal length.
+    ///
+    /// - Precondition: The replacement has the same length as the needle, so a
+    ///   rewritten frame keeps its offsets.
+    static func replacing(
+        _ needle: [UInt8],
+        with replacement: [UInt8],
+        in bytes: [UInt8]
+    ) -> [UInt8] {
+        precondition(needle.count == replacement.count, "the replacement must not change the length")
+        guard !needle.isEmpty, bytes.count >= needle.count else { return bytes }
+
+        var result = bytes
+        var index = 0
+        while index <= result.count - needle.count {
+            if Array(result[index..<(index + needle.count)]) == needle {
+                result.replaceSubrange(index..<(index + needle.count), with: replacement)
+                index += needle.count
+            } else {
+                index += 1
+            }
+        }
+        return result
+    }
+
     /// The acknowledgement bodies of the frames a transport sent, in order.
     static func outboundAcknowledgements(_ chunks: [[UInt8]]) -> [SentAcknowledgement] {
         outboundFrames(chunks)

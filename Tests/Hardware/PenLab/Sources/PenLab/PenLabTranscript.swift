@@ -48,6 +48,13 @@ enum PenLabFailure: Error, CustomStringConvertible {
     /// A step's response reported a non-zero error code.
     case rejected(step: String, errorCode: UInt8)
 
+    /// A frame could not be built, because the evidence table does not classify the
+    /// command's framing.
+    case framing(String)
+
+    /// A requested abort never happened, because the transfer ended first.
+    case abortNotReached(requested: Int, packets: Int)
+
     var description: String {
         switch self {
         case .refused(let reason):
@@ -60,6 +67,12 @@ enum PenLabFailure: Error, CustomStringConvertible {
             return "\(step) got no response within \(seconds) seconds"
         case .rejected(let step, let errorCode):
             return "\(step) was refused with error code 0x\(String(format: "%02X", errorCode))"
+        case .framing(let reason):
+            return "framing failed: \(reason)"
+        case .abortNotReached(let requested, let packets):
+            return "the abort at packet \(requested) never happened: the transfer completed"
+                + " after \(packets) packet(s), so every packet was acknowledged and the"
+                + " pen removed everything it sent"
         }
     }
 

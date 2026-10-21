@@ -3,6 +3,7 @@ import NeoCore
 import NeoExport
 import NeoProtocol
 import NeoStorage
+import Synchronization
 
 /// Loads the repository's sanitized fixtures and builds the stores the scenarios
 /// use.
@@ -53,6 +54,16 @@ enum OutboundCommands {
             var decoder = PenFrameDecoder()
             guard case .frame(let frame)? = decoder.ingest(chunk).first else { return nil }
             return frame
+        }
+    }
+
+    /// Every offline-data transfer option a transport sent, in order.
+    ///
+    /// The option is the first payload byte of a `0x23`, so this is what proves a
+    /// non-deleting read never asked for option `0x01`.
+    static func options(_ chunks: [[UInt8]]) -> [UInt8] {
+        frames(chunks).compactMap { frame in
+            frame.command == .offlineDataRequest1 ? frame.payload.first : nil
         }
     }
 }
@@ -210,4 +221,84 @@ func openDeletionGate(target: PenDeletionTarget = .note) -> PenDeletionEvidence 
             uniqueKeysWithValues: PenDeletionCondition.allCases.map { ($0, .safe) }
         )
     )
+}
+
+/// An ordered log the durable commit and the outbound acknowledgement both write
+/// into.
+///
+/// One log for both sides makes the interleaving of a real packet commit and its
+/// `0xA4` a single sequence rather than two a scenario has to correlate by hand.
+final class OrderedLog: @unchecked Sendable {
+    private let store = Mutex<[String]>([])
+
+    /// Every event recorded so far, in order.
+    var values: [String] { store.withLock { $0 } }
+
+    /// Records one event.
+    func record(_ event: String) {
+        store.withLock { $0.append(event) }
+    }
+}
+
+/// A transport that yields scripted chunks and records each acknowledgement it was
+/// asked to send.
+///
+/// It models a pen that abandons a deleting transfer while the host is still
+/// committing the packet it just received: the packet's bytes arrived, the durable
+/// commit ran, and no acknowledgement reached the pen.
+final class AbandoningPenTransport: PenTransport, Sendable {
+    private struct State: Sendable {
+        var sent: [[UInt8]] = []
+        var isClosed = false
+    }
+
+    private let inbound: [[UInt8]]
+    private let abandonAcknowledgements: Bool
+    private let log: OrderedLog?
+    private let state = Mutex(State())
+
+    /// Creates a transport.
+    ///
+    /// - Parameters:
+    ///   - chunks: Inbound chunks, delivered in order.
+    ///   - abandonAcknowledgements: Whether every `0xA4` send fails, modelling a
+    ///     pen that stopped waiting.
+    ///   - log: An optional shared log the acknowledgements are recorded in.
+    init(chunks: [[UInt8]], abandonAcknowledgements: Bool = false, log: OrderedLog? = nil) {
+        self.inbound = chunks
+        self.abandonAcknowledgements = abandonAcknowledgements
+        self.log = log
+    }
+
+    /// Every chunk passed to `send(_:)`, in order.
+    var sentChunks: [[UInt8]] { state.withLock { $0.sent } }
+
+    func receive() -> AsyncThrowingStream<[UInt8], any Error> {
+        let chunks = inbound
+        return AsyncThrowingStream { continuation in
+            for chunk in chunks { continuation.yield(chunk) }
+            continuation.finish()
+        }
+    }
+
+    func send(_ bytes: [UInt8]) async throws {
+        state.withLock { $0.sent.append(bytes) }
+
+        var decoder = PenFrameDecoder()
+        guard case .frame(let frame)? = decoder.ingest(bytes).first else { return }
+        guard frame.command == .responseOfflineData, frame.payload.count >= 2 else { return }
+
+        // The acknowledgement's packet identifier is the payload's little-endian
+        // first field.
+        let packetID = UInt16(frame.payload[0]) | UInt16(frame.payload[1]) << 8
+        if abandonAcknowledgements {
+            log?.record("ack-abandoned(\(packetID))")
+            throw IntegrationTestError.connectionDropped
+        }
+        log?.record("ack(\(packetID))")
+    }
+
+    func close() async {
+        state.withLock { $0.isClosed = true }
+    }
 }

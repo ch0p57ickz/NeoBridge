@@ -31,8 +31,50 @@ public enum PenLibraryComposition {
     ///
     /// - Parameters:
     ///   - libraryURL: The database file to open or create.
-    ///   - policy: The pen cleanup policy. The default intends cleanup but its
-    ///     evidence gate is closed, so the pen's copy is retained.
+    ///   - policy: The pen cleanup policy. The default intends cleanup, and its
+    ///     two evidence records decide which deletion routes are open.
+    ///   - deletingReadsEnabled: Whether the deleting-transfer route may be used.
+    ///     A rollback configuration sets this to `false` while still reading and
+    ///     exporting the batches a newer build stored.
+    /// - Throws: `StorageError` when the file cannot be opened or its schema is
+    ///   newer than this build.
+    public static func makeAssembly(
+        libraryURL: URL,
+        policy: PenCleanupPolicy = PenCleanupPolicy(),
+        deletingReadsEnabled: Bool = true
+    ) throws -> PenLibraryAssembly {
+        let library = try SQLitePenLibrary(
+            url: libraryURL,
+            deletingReadsEnabled: deletingReadsEnabled
+        )
+        let coordinator = PenLibraryImporter(
+            store: library,
+            batches: library,
+            journal: library,
+            publisher: FilePenExportPublisher(),
+            policy: policy
+        )
+
+        // The barrier is the library itself: it owns the transaction each packet
+        // commits in, and its report says whether the deleting route is open.
+        let storage: PenDeletingReadStorage
+        if library.openReport.deletingReadsAllowed {
+            storage = PenDeletingReadStorage(barrier: library)
+        } else {
+            storage = PenDeletingReadStorage(
+                barrier: nil,
+                unavailableReason: library.openReport.deletingReadsUnavailableReason
+            )
+        }
+
+        return PenLibraryAssembly(coordinator: coordinator, deletingReadStorage: storage)
+    }
+
+    /// Opens the library and returns the verified importer over it.
+    ///
+    /// - Parameters:
+    ///   - libraryURL: The database file to open or create.
+    ///   - policy: The pen cleanup policy.
     /// - Throws: `StorageError` when the file cannot be opened or its schema is
     ///   newer than this build.
     public static func makeImporter(
@@ -47,6 +89,21 @@ public enum PenLibraryComposition {
             publisher: FilePenExportPublisher(),
             policy: policy
         )
+    }
+}
+
+/// The app's durable library: the coordinator the shell drives and the packet
+/// storage a deleting read commits through.
+public struct PenLibraryAssembly: Sendable {
+    /// The verified importer the shell stores and publishes through.
+    public let coordinator: any PenImportCoordinator
+
+    /// The durable packet storage a deleting read commits through.
+    public let deletingReadStorage: PenDeletingReadStorage
+
+    public init(coordinator: any PenImportCoordinator, deletingReadStorage: PenDeletingReadStorage) {
+        self.coordinator = coordinator
+        self.deletingReadStorage = deletingReadStorage
     }
 }
 

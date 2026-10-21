@@ -28,9 +28,14 @@ The package takes a path; the app chooses it. NeoBridge uses
 and lets the system create the directory. Tests and other callers pass a
 temporary path or `:memory:` for a throwaway library.
 
-The database is a single file with three siblings the write-ahead log creates and
-removes as it works: `library.sqlite-wal`, `library.sqlite-shm`. All four belong
-to the library; copying the file while the app runs needs all of them.
+The database is a single file with two siblings the write-ahead log creates and
+removes as it works: `library.sqlite-wal` and `library.sqlite-shm`. All three
+belong to the library; copying the file while the app runs needs all of them. A
+schema upgrade writes one more file beside them, a pre-migration backup named
+`library.sqlite.backup-v<version>`, which holds the database as it was before the
+upgrade. The library leaves that backup in place; it is replaced only when a later
+open has to migrate the same file again, and the replacement is written under a
+temporary name and moved into place only once it verifies.
 
 ## Schema
 
@@ -43,8 +48,9 @@ The schema version is recorded in `metadata.schema_version`, and
 | `pages` | One row per `(section, owner, book, page)`, unique on all four |
 | `strokes` | One row per stored stroke: its page, encoding version, fingerprint, deduplication flag, origin reliability and reported time, source, and canonical bytes |
 | `points` | One row per point, keyed by `(stroke_id, ordinal)` so point order is exact |
-| `batches` | Import progress: state, counts, and an insertion ordinal |
+| `batches` | Import progress: state, counts, an insertion ordinal, the transfer kind (`ordinary` or `deleting`), the completion (`inProgress`, `partial`, or `complete`), and how many packets were durably committed |
 | `batch_pages` | The pages a batch's strokes belong to, so publication can be retried |
+| `batch_packets` | One row per durably committed packet of a deleting transfer, in commit order |
 | `cleanup_journal` | Append-only cleanup states per batch |
 | `cleanup_requests` | The exact scope of a cleanup request: its batch, proven command, and pages |
 
@@ -60,15 +66,36 @@ do not collapse into one.
 
 ### Migration behavior
 
-On open, the library creates any missing table and reads `metadata.schema_version`.
+On open, the library reads the version the file records, if it records one, and
+then verifies the file's actual shape rather than trusting that version.
 
-- No version recorded: the schema is created and stamped with the current version.
-- Version older than the build: this build has no older schema to migrate from yet,
-  so the tables are created if missing and the version stays as recorded until a
-  migration exists.
+- No version and no library tables: a new file. The schema is created and stamped
+  with the current version, and no backup is written, because there is nothing to
+  copy.
+- Version older than the build, or a file that holds the old tables with no version
+  row: the upgrade is additive. It is preceded by a SQLite-consistent backup beside
+  the database, named `<database>.backup-v<version>`. The copy is built under a
+  temporary name and given that name only after it has been reopened read-only and its
+  version read back, so a partial or rejected copy never sits where the next open
+  would read it, and it is written `0o600` — stricter than the library file it copies,
+  which SQLite creates with the process umask. The added columns carry defaults, so a
+  legacy batch reads as an ordinary, complete read with no durable packets. The
+  version is then stamped with the current one.
+- A version row that is not a number: the library refuses to open with
+  `StorageError.unreadableSchemaVersion`. Reading it as an older file would migrate
+  a schema this build cannot identify.
 - Version newer than the build: the library refuses to open with
   `StorageError.unsupportedSchemaVersion`. The file is left untouched, because a
   newer file may hold columns this build would drop.
+- A file that recorded the current version without the columns the version implies:
+  the columns are added and the file is backed up like any other legacy file, so a
+  half-written record is repaired instead of being reported ready and then failing
+  on the first batch read.
+
+If backup creation or its read-back fails, the original is left untouched, the
+upgrade is abandoned, `PenLibraryOpenReport.deletingReadsAllowed` is `false`, and
+the report names the file and the failure. In-memory libraries take no backup,
+because they have no file to copy.
 
 WAL mode, foreign keys, and `synchronous = FULL` are set on every connection, so a
 committed batch survives a power loss without a repair step.
@@ -90,18 +117,47 @@ A publication is one file at a time: a failure leaves the committed strokes in
 place and reports each file's own outcome, so a retry finishes the set without
 importing the read again.
 
+A deleting transfer is durable packet by packet rather than at the end. Its batch
+is recorded as `committed` and `inProgress` before the first `0x23` packet, and each
+acknowledged packet's strokes and progress are committed in one flushed transaction
+before that packet's acknowledgement. A restart therefore reads the acknowledged
+prefix from `batch_packets` instead of guessing: the batch stays `inProgress` or
+`partial`, its committed pages remain exportable, and a fresh read starts a new
+batch for the remainder. Reliable-stroke fingerprints deduplicate what the fresh
+read replays, so a packet the pen never had acknowledged is not stored twice.
+
 ## Pen cleanup
 
-Cleanup is requested separately from the import, by
-`PenLibraryImporter.requestCleanup(_:request:)`, so it can be ordered after it.
-The ordering rule is what makes it safe: the pen's copy is reclaimed only for data
-whose complete transfer has committed durably **and** for which an export published
-in full. A batch that is not `published` is refused, so a read whose publication
-failed, was left partial, or was never requested keeps its pen copy: with nothing
-published, the library copy is the read's only copy, and the reason says so. A scope
-that shares a page with a batch that has not published is refused too, so a
-completed note is reclaimed only on its own pages and a later failed note keeps its
-strokes on the pen.
+The pen's copy is reclaimed by one of two routes, and they have different rules.
+
+A **deleting transfer** removes each packet from the pen as the transfer that reads
+it runs, so its bound is the acknowledgement rather than a command: the library
+commits a packet before the session acknowledges it, and `beginDeletingRead`,
+`commitDeletingPacket`, `finishDeletingRead`, and `failDeletingRead` are the barrier
+that enforces the order. Nothing is asked of the pen for a packet that was not
+committed first. `requestCleanup` refuses every deleting batch, including a
+`published + complete` one, because the transfer already removed what it stored.
+
+A read that ends before its first durable packet — a dropped link, a refused or
+malformed response, a failed first commit, or a cancellation — has no prefix to
+report and nothing to publish, so the session marks the batch it opened failed
+rather than leaving it in progress. `failDeletingRead` writes that state only for a
+deleting batch that is still `inProgress` with no packet, so an ordinary batch, a
+batch with a durable prefix, and a finished batch are untouched. The row is kept,
+because it is the durable record that the read was attempted.
+
+A separate **`0x25`/`0x27` deletion command** is requested independently of the
+import, by `PenLibraryImporter.requestCleanup(_:request:)`, so it can be ordered
+after it. The ordering rule is what makes it safe: the pen's copy is reclaimed only
+for data whose complete transfer has committed durably **and** for which an export
+published in full. A batch that is not `published` is refused, so a read whose
+publication failed, was left partial, or was never requested keeps its pen copy:
+with nothing published, the library copy is the read's only copy, and the reason
+says so. A scope that shares a page with a batch that has not published is refused
+too, so a completed note is reclaimed only on its own pages and a later failed note
+keeps its strokes on the pen. A batch with a completion other than `complete` is
+treated as incomplete even when it is `published`, so a partial deleting batch
+blocks a shared page from this route as well.
 
 The request is journaled in three states:
 
@@ -152,11 +208,15 @@ retains the pen's copy with a reason that names the batch's state and says the
 library copy is the read's only copy.
 
 `PenCleanupPolicy.mode` defaults to `deleteAfterAcknowledge`, which is an intent,
-not permission. `PenCleanupPolicy.deletionEnabled` derives from
-`PenDeletionEvidence`, and the record this build carries is the physical A1 trace of
-2026-10-20, which settles three conditions and records the deletion scope as
-`unsafe`, so no deletion command can be sent. A later change records the safe
-verdicts that would open the gate, and only a scope a trace proves can supply them.
+not permission. The two routes derive permission from two separate records.
+`PenCleanupPolicy.deletionEnabled` derives from `PenDeletionEvidence`, and the
+record this build carries is the physical A1 trace of 2026-10-20, which settles
+three conditions and records the deletion scope as `unsafe`, so no `0x25`/`0x27`
+deletion command can be sent. The deleting transfer derives from
+`PenDeletingTransferEvidence`, built from the 2026-10-21 runs, and needs a
+requested export, a per-sync confirmation, and durable packet storage on top of it.
+A later change records the safe verdicts that would open the command gate, and only
+a scope a trace proves can supply them.
 
 ## Building and testing
 

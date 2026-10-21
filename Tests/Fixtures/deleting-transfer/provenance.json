@@ -1,0 +1,68 @@
+{
+  "fixtureVersion": 1,
+  "id": "deleting-transfer-2026-10-21",
+  "captureDate": "2026-10-21",
+  "deviceModel": "NWP-F151",
+  "firmware": "3.00",
+  "observedProtocolVersion": "2.23",
+  "transferOption": "0x01",
+  "note": {
+    "section": 3,
+    "owner": 27,
+    "note": 700,
+    "listedPages": [36, 37]
+  },
+  "requestFrame": "C0230E0001001B000003BC02000000000000C1",
+  "info": {
+    "errorCode": 0,
+    "claimedStrokes": 18,
+    "uncompressedBytes": 2998,
+    "compressed": false
+  },
+  "baseline": "baseline.txt",
+  "baselineStrokeCount": 18,
+  "baselineDotCount": 157,
+  "pairs": [
+    {
+      "id": "withheld-packet-1",
+      "deleting": "withheld-packet-1/deleting.txt",
+      "readAfter": "withheld-packet-1/read-after.txt",
+      "packetsReceived": 1,
+      "acknowledgedPackets": 0,
+      "packets": [{ "packetID": 1, "strokes": 13, "isEnd": false }],
+      "expectedRemainingStrokes": 18,
+      "expectedRemovedStrokes": 0,
+      "observedRemainingStrokeCount": 18,
+      "observedRemainingDotCount": 157
+    },
+    {
+      "id": "withheld-packet-2",
+      "deleting": "withheld-packet-2/deleting.txt",
+      "readAfter": "withheld-packet-2/read-after.txt",
+      "packetsReceived": 2,
+      "acknowledgedPackets": 1,
+      "packets": [
+        { "packetID": 1, "strokes": 13, "isEnd": false },
+        { "packetID": 2, "strokes": 5, "isEnd": true }
+      ],
+      "expectedRemainingStrokes": 5,
+      "expectedRemovedStrokes": 13,
+      "observedRemainingStrokeCount": 5,
+      "observedRemainingDotCount": 45
+    }
+  ],
+  "rawSource": "Tests/Fixtures/raw/acceptance-2026-10-21-next-delete-rerun/",
+  "sanitization": {
+    "removed": [
+      "bluetoothAddress",
+      "serialNumber",
+      "authenticationMaterial"
+    ],
+    "notes": "Both transcripts record only framed bytes the host sent and the sizes of what arrived. The Bluetooth address is zeroed in the host's handshake request, which the PenLab transcript reproduces; the version response itself is not reproduced, only its error code. The advertised device name is the pen's public model name. Each stroke line keeps its page, index, dot count, bounding box, origin time, time span, and fingerprint, so per-stroke bounding boxes, dot counts, and origin times are retained; the point-by-point path behind each bounding box is not. No Bluetooth address, serial number, or authentication material appears."
+  },
+  "evidence": {
+    "protocolDocument": "docs/protocol-a1.md",
+    "section": "Deleting transfer option, 2026-10-21",
+    "transferEvidence": "PenDeletingTransferEvidence.physicalTrace2026_10_21"
+  }
+}

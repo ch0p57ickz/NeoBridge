@@ -72,14 +72,20 @@ public final class PenSyncController {
     /// The title of the action that keeps the pen's copy for the current read.
     public static let retainPenDataTitle = "Keep Strokes on the Pen for This Read"
 
-    /// What the shell says before a transfer about the pen's copy.
+    /// The title of the action that confirms cleanup for one read.
+    public static let confirmCleanupTitle = "Remove Acknowledged Packets for This Read"
+
+    /// What the shell says before a deleting transfer about the pen's copy.
     ///
-    /// The statement is about the intent, not a promise: the deletion runs only
-    /// after the read is stored and its files are written, and only when the
-    /// evidence gate is open. When the gate is closed, ``cleanupUnavailableReason``
-    /// says why.
+    /// The statement is about the deleting route the user is confirming, so it
+    /// names the order that makes the route safe: a packet is removed as the read
+    /// progresses, and only after the library has stored it. Publication comes
+    /// afterwards, so a failed export is retried from the library rather than
+    /// from the pen.
     public static let cleanupIntentStatement =
-        "Strokes are normally removed from the pen after they are saved and their files are written."
+        "If you confirm cleanup for this read, each packet saved to the local library is removed"
+        + " from the pen when the read acknowledges it. The files requested for this read are"
+        + " exported afterwards; if that export fails, retry it from the local library."
 
     /// What the shell is showing now.
     public private(set) var phase: Phase = .idle
@@ -123,8 +129,18 @@ public final class PenSyncController {
     private let library: any PenImportCoordinator
     private let destination: any PenExportDestinationProviding
     private let cleanupPolicy: PenCleanupPolicy
+    private let deletingReadStorage: PenDeletingReadStorage
     private var attempt: Task<Void, Never>?
     private var generation = 0
+
+    /// Whether the next read has this sync's cleanup confirmation.
+    ///
+    /// It is deliberately not durable: a confirmation applies to one read, so a
+    /// later sync starts unconfirmed and must ask again.
+    private var nextReadCleanupConfirmed = false
+
+    /// Whether the read in flight was confirmed for cleanup.
+    private var attemptCleanupConfirmed = false
 
     /// Creates a controller.
     ///
@@ -133,61 +149,143 @@ public final class PenSyncController {
     ///   - library: The verified importer that stores a read and publishes it.
     ///   - destination: The folder exports are written to.
     ///   - cleanupPolicy: The pen cleanup policy. Its mode is the intent a sync
-    ///     that makes no choice gets, and its evidence gate decides whether the
-    ///     pen's copy can be reclaimed at all.
+    ///     that makes no choice gets, and its two evidence records decide whether
+    ///     the command gate or the deleting-transfer route is open.
+    ///   - deletingReadStorage: The durable packet storage a deleting read commits
+    ///     through. The default has none, so a deleting read is refused rather
+    ///     than started without a barrier.
     public init(
         runners: PenSyncRunnerFactory,
         library: any PenImportCoordinator,
         destination: any PenExportDestinationProviding,
-        cleanupPolicy: PenCleanupPolicy = PenCleanupPolicy()
+        cleanupPolicy: PenCleanupPolicy = PenCleanupPolicy(),
+        deletingReadStorage: PenDeletingReadStorage = .unavailable
     ) {
         self.runners = runners
         self.library = library
         self.destination = destination
         self.cleanupPolicy = cleanupPolicy
+        self.deletingReadStorage = deletingReadStorage
         self.nextReadCleanupMode = cleanupPolicy.mode
         self.attemptCleanupMode = cleanupPolicy.mode
     }
 
-    /// Whether the pen's copy can be reclaimed while the evidence gate is open.
-    public var isCleanupAvailable: Bool { cleanupPolicy.deletionEnabled }
+    /// Whether a deleting transfer can be offered for a prospective read.
+    ///
+    /// The deleting route needs a requested export, version-matched
+    /// transfer evidence, and durable packet storage. The per-sync confirmation is
+    /// separate: this says the route is available, and
+    /// ``isCleanupConfirmedForThisSync`` says whether it is confirmed.
+    public var isCleanupAvailable: Bool { cleanupUnavailableReason == nil }
 
-    /// Why cleanup cannot run, or `nil` when it can.
+    /// Why a deleting transfer cannot be offered, or `nil` when it can.
+    ///
+    /// The reason names the transfer-specific blocker rather than the closed
+    /// `0x25` command scope, because the deleting route does not use that command.
     public var cleanupUnavailableReason: String? {
-        cleanupPolicy.skipReason(for: .deleteAfterAcknowledge)
+        guard destination.exportDirectory() != nil else {
+            return PenDeletingReadRefusal.noExportRequested.reason
+        }
+        guard deletingReadStorage.isAvailable else {
+            return PenDeletingReadRefusal.durableStorageUnavailable(
+                reason: deletingReadStorage.unavailableReason ?? "no writable library is available"
+            ).reason
+        }
+        guard cleanupPolicy.transferEvidence.isSafe else {
+            return cleanupPolicy.transferEvidence.refusal(
+                for: cleanupPolicy.transferEvidence.identity
+                    ?? PenDeletingTransferIdentity.physicalA1_2026_10_21
+            )
+        }
+        return nil
     }
 
     /// Whether the current sync intends to reclaim the pen's copy.
     public var isCleanupIntended: Bool { cleanupIntent == .deleteAfterAcknowledge }
 
+    /// Whether the shell must still ask for this sync's cleanup confirmation.
+    ///
+    /// A completed read whose files a retry can still publish needs none: the retry
+    /// only publishes from the library and removes nothing, so a confirmation would
+    /// authorize nothing and offering the button would offer a control that does
+    /// nothing.
+    public var needsCleanupConfirmation: Bool {
+        guard isCleanupIntended, isCleanupAvailable, canChooseCleanup else { return false }
+        guard !isRetryableCompletion else { return false }
+        return !isCleanupConfirmedForThisSync
+    }
+
+    /// Whether the sync the shell shows is confirmed for a deleting transfer.
+    public var isCleanupConfirmedForThisSync: Bool {
+        if isBusy || isRetryableCompletion { return attemptCleanupConfirmed }
+        return nextReadCleanupConfirmed
+    }
+
+    /// Confirms cleanup for one read.
+    ///
+    /// The confirmation is what authorizes the deleting route for the read it is
+    /// made against, and it is cleared when that read starts, so a later sync
+    /// cannot inherit it.
+    public func confirmCleanupForThisSync() {
+        guard canChooseCleanup, isCleanupAvailable, isCleanupIntended else { return }
+        if isRetryableCompletion {
+            // A retry only publishes from the library, so a confirmation would
+            // authorize nothing.
+            return
+        }
+        nextReadCleanupConfirmed = true
+    }
+
     /// Whether the shell offers a cleanup choice.
     ///
     /// A choice made while a read is in flight would not reach that read, which
     /// captured its intent when it started, so only that state withholds the choice.
-    /// Every offered choice is honoured: the retry of a completed read uses the one
-    /// made for it, and the next read uses any other.
-    public var canChooseCleanup: Bool { !isBusy }
+    /// A completed deleting read whose files a retry can still publish withholds it
+    /// too: that read removed the packets it stored as it went, so a retry only
+    /// republishes the durable copy and there is nothing left for a choice to keep or
+    /// remove. Every other offered choice is honoured: the retry of an ordinary
+    /// completed read uses the one made for it, and the next read uses any other.
+    public var canChooseCleanup: Bool {
+        if isBusy { return false }
+        return !isRetryableDeletingCompletion
+    }
+
+    /// Whether the completion shown is a deleting read a retry can still publish.
+    private var isRetryableDeletingCompletion: Bool {
+        if case .complete(let outcome) = phase {
+            return canRetryExport && outcome.isDeletingRead
+        }
+        return false
+    }
 
     /// A one-line statement of the intent the shell is showing.
     ///
     /// It names what the choice applies to, because that differs: a read that is
-    /// running already captured its intent, a completed read whose files can still be
-    /// published again hands the choice to its retry, and every other moment hands it
-    /// to the next read.
+    /// running already captured its intent and confirmation, a completed read
+    /// whose files can still be published again hands the choice to its retry,
+    /// and every other moment hands it to the next read. A retry never deletes, so
+    /// its line says so.
     public var cleanupIntentLine: String {
         if isBusy {
-            return isCleanupIntended
-                ? "Removing the pen's strokes when this read completes."
-                : "Keeping the pen's strokes for this read."
+            guard isCleanupIntended else {
+                return "Keeping the pen's strokes for this read."
+            }
+            return attemptCleanupConfirmed
+                ? "Removing each acknowledged packet from the pen as this read progresses."
+                : "Keeping the pen's strokes for this read; cleanup was not confirmed."
         }
         if isRetryableCompletion {
-            return isCleanupIntended
-                ? "Retry Export removes the pen's strokes once it publishes."
-                : "Retry Export keeps the pen's strokes."
+            return "Retry Export publishes files from the library and removes nothing from the pen."
         }
-        return isCleanupIntended
-            ? "The next read removes the pen's strokes after they are saved."
-            : "The next read keeps the pen's strokes."
+        guard isCleanupIntended else {
+            return "The next read keeps the pen's strokes."
+        }
+        guard isCleanupAvailable else {
+            return "The next read keeps the pen's strokes because cleanup is unavailable."
+        }
+        return isCleanupConfirmedForThisSync
+            ? "The next read removes each acknowledged packet after the library stores it."
+            : "The next read can remove acknowledged packets once you confirm cleanup for it."
     }
 
     /// Chooses retention.
@@ -247,7 +345,12 @@ public final class PenSyncController {
         case .saving: return "Saving to the library"
         case .exporting: return "Writing export files"
         case .choosingPen: return "Choose a pen"
-        case .complete: return "Complete"
+        case .complete(let outcome):
+            // A deleting read with no durably recorded completion is not a completed
+            // sync: what it holds is the durable prefix it acknowledged. The notice
+            // names whether the transfer stopped short or its completion could not be
+            // recorded.
+            return outcome.isPartialDeletingRead ? "Partial" : "Complete"
         case .failed: return "Failed"
         }
     }
@@ -305,8 +408,8 @@ public final class PenSyncController {
 
     /// Reads the pen the user chose after several matched.
     ///
-    /// The intent the user set survives the question, because the attempt had not
-    /// started when it was asked.
+    /// The intent the user set, and the confirmation given for it, survive the
+    /// question, because the attempt had not started when they were asked.
     ///
     /// - Parameter peripheral: A candidate from ``penCandidates``.
     public func choosePen(_ peripheral: PenPeripheral) {
@@ -323,9 +426,10 @@ public final class PenSyncController {
         guard isBusy || isAwaitingChoice else { return }
         attempt?.cancel()
         settle()
-        // The cancelled sync consumed its choice, so the next read starts from the
-        // policy's default again.
+        // The cancelled sync consumed its choice and confirmation, so the next
+        // read starts from the policy's default again.
         nextReadCleanupMode = cleanupPolicy.mode
+        nextReadCleanupConfirmed = false
         generation += 1
         phase = .idle
     }
@@ -365,7 +469,12 @@ public final class PenSyncController {
                 guard controller.generation == generation else { return }
 
                 let cleanup: PenCleanupOutcome
-                if report.succeeded {
+                if outcome.isDeletingRead {
+                    // A deleting batch is never the subject of a separate deletion
+                    // command, so the retry only republishes its files and the
+                    // read's own transfer outcome stands.
+                    cleanup = outcome.cleanup
+                } else if report.succeeded {
                     cleanup = await controller.requestCleanup(for: save.batchID, mode: mode)
                 } else if mode == .keepOnPen {
                     // The retry did not publish, so no deletion was requested and
@@ -392,15 +501,22 @@ public final class PenSyncController {
     private func start(selection: CoreBluetoothPenTransport.Selection) {
         guard !isBusy else { return }
 
-        // The read consumes the intent the shell was showing for it, and the shell
-        // goes back to the policy's default while the read runs: the choice was for
-        // this read, so a later one never inherits it.
+        // The read consumes the intent and the confirmation the shell was showing
+        // for it, and the shell goes back to the policy's default while the read
+        // runs: the choice was for this read, so a later one never inherits it.
         attemptCleanupMode = nextReadCleanupMode
+        attemptCleanupConfirmed = nextReadCleanupConfirmed
         nextReadCleanupMode = cleanupPolicy.mode
+        nextReadCleanupConfirmed = false
 
         generation += 1
         let generation = self.generation
         phase = .scanning
+
+        // A deleting read is requested only for a cleanup intent that this sync
+        // confirmed, with a requested export, version-matched evidence, and durable
+        // packet storage. Any other combination is an ordinary non-destructive read.
+        let deletingRead = deletingReadIntent()
 
         let runner = runners.makeRunner(selection: selection)
         attempt = Task { [weak self] in
@@ -416,7 +532,7 @@ public final class PenSyncController {
             }
 
             do {
-                let read = try await runner.run(report: report)
+                let read = try await runner.run(deletingRead: deletingRead, report: report)
                 try await controller.save(read, for: generation)
             } catch {
                 controller.fail(with: error, for: generation)
@@ -424,11 +540,35 @@ public final class PenSyncController {
         }
     }
 
+    /// The deleting read this sync should request, or `nil` for an ordinary read.
+    private func deletingReadIntent() -> PenDeletingReadIntent? {
+        guard attemptCleanupMode == .deleteAfterAcknowledge else { return nil }
+        guard attemptCleanupConfirmed else { return nil }
+        guard destination.exportDirectory() != nil else { return nil }
+        guard deletingReadStorage.isAvailable else { return nil }
+        return PenDeletingReadIntent(
+            policy: cleanupPolicy,
+            requestedExport: true,
+            confirmedForThisSync: true,
+            durablePacketStorageAvailable: true
+        )
+    }
+
     /// Commits the read, publishes its files, and requests cleanup.
+    ///
+    /// A deleting read already committed its packets through the storage barrier,
+    /// so it is published from the durable batch rather than imported a second
+    /// time, and it never requests a separate deletion command.
     private func save(_ read: PenReadResult, for generation: Int) async throws {
         guard self.generation == generation else { return }
 
         let directory = destination.exportDirectory()
+
+        if let deleting = read.deletingTransfer {
+            try await saveDeletingRead(read, deleting: deleting, directory: directory, for: generation)
+            return
+        }
+
         let request = directory.map {
             PenExportRequest(pages: read.transfer.pages, destinationDirectory: $0)
         }
@@ -450,7 +590,17 @@ public final class PenSyncController {
         // Cleanup is requested after the import, never before it: the importer
         // refuses a batch that is not stored and published, so the ordering rule
         // holds even if this call is reached too early.
-        let cleanup = await requestCleanup(for: outcome.save?.batchID, mode: attemptCleanupMode)
+        //
+        // A read whose deleting route closed after the handshake — a pen the
+        // transfer evidence does not cover — reports that blocker. Asking the
+        // importer would name the separate command gate instead, which is not what
+        // kept this read non-destructive.
+        let cleanup: PenCleanupOutcome
+        if let refusal = read.deletingReadRefusal, attemptCleanupMode == .deleteAfterAcknowledge {
+            cleanup = .skipped(reason: refusal)
+        } else {
+            cleanup = await requestCleanup(for: outcome.save?.batchID, mode: attemptCleanupMode)
+        }
 
         guard self.generation == generation else { return }
         settle()
@@ -462,6 +612,63 @@ public final class PenSyncController {
             cleanup: cleanup,
             destinationDirectory: directory,
             penState: read.penState
+        )
+        phase = .complete(presented)
+    }
+
+    /// Publishes a deleting read's durable batch and reports its acknowledged
+    /// prefix.
+    ///
+    /// The batch's packets were committed before their acknowledgements, so this
+    /// step only renders files from the stored rows. It never calls
+    /// `requestCleanup`: the deleting transfer is the cleanup, and a separate
+    /// `0x25`/`0x27` command for the same pages would take data the transfer never
+    /// covered.
+    private func saveDeletingRead(
+        _ read: PenReadResult,
+        deleting: PenDeletingTransferReport,
+        directory: String?,
+        for generation: Int
+    ) async throws {
+        var export: PenExportReport?
+        if let directory, !deleting.pages.isEmpty {
+            apply(.exporting, for: generation)
+            export = try await library.publish(
+                deleting.batchID,
+                request: PenExportRequest(
+                    pages: deleting.pages,
+                    destinationDirectory: directory
+                )
+            )
+        }
+
+        guard self.generation == generation else { return }
+        settle()
+
+        let save = PenLibrarySave(
+            batchID: deleting.batchID,
+            pages: deleting.pages,
+            insertion: PenStrokeInsertion(
+                addedStrokeCount: deleting.addedStrokeCount,
+                duplicateStrokeCount: deleting.duplicateStrokeCount
+            ),
+            strokeCount: deleting.committedStrokeCount,
+            dotCount: deleting.committedDotCount
+        )
+
+        let presented = PenReadOutcome(
+            summary: read.summary,
+            save: save,
+            export: export,
+            cleanup: .acknowledgedPrefix(
+                packetCount: deleting.committedPacketCount,
+                isComplete: deleting.isComplete,
+                removalUncertain: deleting.acknowledgementUncertain,
+                reachedEndPacket: deleting.reachedEndPacket
+            ),
+            destinationDirectory: directory,
+            penState: read.penState,
+            deletingTransfer: deleting
         )
         phase = .complete(presented)
     }
@@ -530,7 +737,8 @@ public final class PenSyncController {
             export: report,
             cleanup: cleanup,
             destinationDirectory: outcome.destinationDirectory,
-            penState: outcome.penState
+            penState: outcome.penState,
+            deletingTransfer: outcome.deletingTransfer
         )
         phase = .complete(updated)
     }
@@ -540,13 +748,16 @@ public final class PenSyncController {
 
         // Several matching pens is a question, not a failure: no pen is picked
         // silently, so the user answers it. No read has run yet, so the start that
-        // asked the question consumed nothing: the intent it captured is handed
-        // back to the shell, and the pen the user chooses uses it.
+        // asked the question consumed nothing: the intent it captured — and the
+        // confirmation the user gave for it — are handed back to the shell, and the
+        // pen the user chooses uses them. Restoring only the intent would silently
+        // discard the confirmation, and the confirmed read would keep the pen's copy.
         if let bluetoothError = error as? PenBluetoothError,
             case .multiplePensFound(_, let candidates) = bluetoothError
         {
             attempt = nil
             nextReadCleanupMode = attemptCleanupMode
+            nextReadCleanupConfirmed = attemptCleanupConfirmed
             phase = .choosingPen(candidates: candidates)
             return
         }

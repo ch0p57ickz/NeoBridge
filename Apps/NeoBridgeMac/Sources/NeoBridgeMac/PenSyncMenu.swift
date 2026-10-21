@@ -62,6 +62,9 @@ struct PenSyncMenu: View {
                 Button("Remove Them After a Successful Read") { controller.intendCleanupForThisSync() }
             }
         }
+        if controller.needsCleanupConfirmation {
+            Button(PenSyncController.confirmCleanupTitle) { controller.confirmCleanupForThisSync() }
+        }
         if let reason = controller.cleanupUnavailableReason {
             Text("Cleanup is unavailable: \(reason)")
         }

@@ -80,6 +80,132 @@ enum TestRead {
             transfer: PenReadTransfer(strokes: strokes, noteCount: 1)
         )
     }
+
+    /// A non-destructive read whose deleting route closed after the handshake.
+    ///
+    /// The session fell back to the ordinary option and named the blocker, so the
+    /// result carries strokes and a refusal instead of a deleting batch.
+    static func refusedDeletingResult(
+        strokes: [Stroke],
+        refusal: String,
+        noteCount: Int = 1
+    ) -> PenReadResult {
+        var read = result(strokes: strokes, noteCount: noteCount)
+        read = PenReadResult(
+            summary: read.summary,
+            transfer: read.transfer,
+            penState: read.penState,
+            deletingTransfer: nil,
+            deletingReadRefusal: refusal
+        )
+        return read
+    }
+
+    /// A library save, for a stub whose import outcome a test never reads.
+    static func save(batchID: UUID = UUID()) -> PenLibrarySave {
+        PenLibrarySave(
+            batchID: batchID,
+            pages: [page],
+            insertion: PenStrokeInsertion(addedStrokeCount: 1, duplicateStrokeCount: 0),
+            strokeCount: 1,
+            dotCount: 1
+        )
+    }
+
+    /// A deleting read's result, carrying the durable prefix the session reported.
+    ///
+    /// A deleting read commits its packets as the transfer runs, so its result
+    /// names the batch that already holds them rather than a transfer the library
+    /// still has to import.
+    ///
+    /// - Parameter isComplete: Whether the transfer reached every end packet *and* that
+    ///   completion was recorded.
+    /// - Parameter reachedEndPacket: Whether the transfer reached every end packet,
+    ///   whether or not the completion was recorded. It defaults to `isComplete`; pass
+    ///   `true` with `isComplete: false` for a transfer whose completion write failed.
+    static func deletingResult(
+        strokes: [Stroke],
+        packetCount: Int,
+        isComplete: Bool,
+        reachedEndPacket: Bool? = nil,
+        acknowledgementUncertain: Bool = false,
+        reason: String? = nil,
+        batchID: UUID = UUID()
+    ) -> PenReadResult {
+        let dotCount = strokes.reduce(0) { $0 + $1.points.count }
+        let pages = Set(strokes.map(\.page)).sorted(by: PageIdentity.canonicalOrder)
+        let note = PenSyncNoteSummary(
+            note: PenOfflineNote(section: 3, owner: 27, note: 700),
+            strokeCount: strokes.count,
+            dotCount: dotCount
+        )
+
+        return PenReadResult(
+            summary: PenSyncSummary(
+                strokeCount: strokes.count,
+                dotCount: dotCount,
+                distinctPageCount: pages.count,
+                notes: strokes.isEmpty ? [] : [note]
+            ),
+            transfer: PenReadTransfer(strokes: strokes, noteCount: strokes.isEmpty ? 0 : 1),
+            deletingTransfer: PenDeletingTransferReport(
+                batchID: batchID,
+                committedPacketCount: packetCount,
+                committedStrokeCount: strokes.count,
+                committedDotCount: dotCount,
+                addedStrokeCount: strokes.count,
+                duplicateStrokeCount: 0,
+                pages: pages,
+                isComplete: isComplete,
+                reachedEndPacket: reachedEndPacket ?? isComplete,
+                acknowledgementUncertain: acknowledgementUncertain,
+                reason: reason
+            )
+        )
+    }
+}
+
+/// A packet barrier that keeps the deleting route open for a shell test.
+///
+/// The shell tests never exercise the commit transaction itself — the storage
+/// tests do — so this barrier only has to be present and report cumulative
+/// progress, which is what makes ``PenDeletingReadStorage/isAvailable`` true.
+actor StubPacketBarrier: PenDeletingPacketBarrier {
+    private var packetCount = 0
+    private var strokeCount = 0
+
+    func beginDeletingRead(notes: [PenDeletingReadNote]) async throws -> UUID {
+        packetCount = 0
+        strokeCount = 0
+        return UUID()
+    }
+
+    func commitDeletingPacket(
+        _ packet: PenDeletingPacket
+    ) async throws -> PenDeletingPacketCommitResult {
+        packetCount += 1
+        strokeCount += packet.strokes.count
+        return PenDeletingPacketCommitResult(
+            committedPacketCount: packetCount,
+            committedStrokeCount: strokeCount,
+            committedDotCount: packet.strokes.reduce(0) { $0 + $1.points.count },
+            addedStrokeCount: packet.strokes.count,
+            duplicateStrokeCount: 0,
+            isEndPacket: packet.isEndPacket
+        )
+    }
+
+    func finishDeletingRead(batchID: UUID, isComplete: Bool) async throws {}
+
+    func failDeletingRead(batchID: UUID) async throws {}
+}
+
+extension PenDeletingReadStorage {
+    /// Packet storage backed by a stub barrier, so a shell test sees the deleting
+    /// route as available without exercising the commit transaction.
+    static var stub: PenDeletingReadStorage {
+        PenDeletingReadStorage(barrier: StubPacketBarrier())
+    }
 }
 
 /// A publisher whose per-format outcomes a test scripts.
@@ -247,6 +373,9 @@ actor StubImportCoordinator: PenImportCoordinator {
     /// The report a publication retry returns.
     let retryReport: PenExportReport
 
+    /// The report a deleting batch's publication returns.
+    let publishReport: PenExportReport
+
     /// How many cleanup requests the controller has made.
     private var cleanupRequestCount = 0
 
@@ -256,7 +385,8 @@ actor StubImportCoordinator: PenImportCoordinator {
         saving: Gate = Gate(),
         exporting: Gate = Gate(),
         retry: Gate = Gate(isOpen: true),
-        retryReport: PenExportReport = PenExportReport(artifacts: [])
+        retryReport: PenExportReport = PenExportReport(artifacts: []),
+        publishReport: PenExportReport = PenExportReport(artifacts: [])
     ) {
         self.outcome = outcome
         self.cleanup = cleanup
@@ -264,6 +394,7 @@ actor StubImportCoordinator: PenImportCoordinator {
         self.exporting = exporting
         self.retry = retry
         self.retryReport = retryReport
+        self.publishReport = publishReport
     }
 
     func importRead(
@@ -287,7 +418,7 @@ actor StubImportCoordinator: PenImportCoordinator {
     func commit(_ batchID: UUID) async throws {}
 
     func publish(_ batchID: UUID, request: PenExportRequest) async throws -> PenExportReport {
-        PenExportReport(artifacts: [])
+        publishReport
     }
 
     func requestCleanup(

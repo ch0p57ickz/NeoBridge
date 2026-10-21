@@ -139,6 +139,16 @@ public final class PenTrafficLog: Sendable {
         state.withLock { $0.lines.append(line) }
     }
 
+    /// Records one deleting packet's durable commit.
+    ///
+    /// The line is written after the storage transaction returned and before the
+    /// packet's outbound `0xA4`, so the transcript itself proves the ordering the
+    /// deletion bound depends on: no acknowledgement precedes a durable commit.
+    /// It carries no pen identifier.
+    public func recordPacketCommit(packetID: UInt16, strokeCount: Int) {
+        record("packetCommitDurable packetID=\(packetID) strokes=\(strokeCount)")
+    }
+
     /// The transcript, followed by the totals the deletion check reads.
     ///
     /// The final line lists every outbound command identifier in order, so a

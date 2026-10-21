@@ -184,7 +184,12 @@ Three further traps, all confirmed on hardware:
 - The `0xA3` counts are a lagging index and must not be treated as exact. Both
   sessions reported 6,918 strokes and 1,309,538 bytes, while the packet stream
   carried 6,920 strokes and 1,310,024 bytes: exactly two more stroke records and
-  their 27 dots. Count what arrives; the stream is authoritative.
+  their 27 dots. Count what arrives; the stream is authoritative. In the
+  deleting-transfer runs of 2026-10-21 the counts again described what the pen
+  held when the request arrived: 346, then 250, then 150 strokes in the first
+  three runs, each equal to the read that *preceded* that run and larger than the
+  read that followed it, and 18, 18, then 5 in the three of the re-run, where the
+  run that removed nothing makes the preceding and following reads equal instead.
 
 ## Command evidence table
 
@@ -237,7 +242,7 @@ sensitive fields removed and stays git-ignored.
 | Every decoded dot passes the pen's own checksum | Yes, 70,199 of 70,199 dots |
 | Decoded transfer | 604 packets, 6,920 strokes, 70,199 dots, in a single transfer that ended at transfer position `2` |
 | No deletion request sent | Yes, `0x25` and `0x27` were never sent |
-| Pen cleanup mode | That build requested no cleanup, so the pen kept its copy. Deletion is unreachable in every build: `PenCleanupPolicy.deletionEnabled` derives from the deletion evidence gate, whose recorded deletion-scope verdict is `unsafe` |
+| Pen cleanup mode | That build requested no cleanup, so the pen kept its copy. No `0x25` or `0x27` deletion command is reachable: `PenCleanupPolicy.deletionEnabled` derives from the deletion evidence gate, whose recorded deletion-scope verdict is `unsafe`. The deleting transfer (`0x23` option `0x01`) is a separate route with its own record, and it was not part of this run |
 | Evidence reviewed by | Jimmy, 2026-10-18 |
 
 ## Pen session flow
@@ -294,13 +299,14 @@ values, two of which leave the note's data in place:
 | `nextAndReserve` | `0x02` | Keep the note's data so a later read still finds it |
 | `nextAndDelete` | `0x01` | Delete the transferred data as part of the transfer |
 
-This build sends `nextAndReserve` (`0x02`) with `zipOption` none and a page count
-of zero, which is the option every completed physical read used.
+The ordinary read sends `nextAndReserve` (`0x02`) with `zipOption` none and a page
+count of zero, which is the option every completed physical read used.
 
 `PenRequest.offlineData(for:)` accepts only `OfflineReadTransferOption`, whose
 members are `notNextTransfer` and `nextAndReserve`. The deleting option is not a
-member of that type, so the read path has no route to it. `PenSessionTests` pins
-both bytes and asserts that the session sends the option it was built with.
+member of that type, so that overload has no route to it; the deleting read is the
+separate overload that takes a `PenDeletingReadAuthorization`. `PenSessionTests`
+pins both bytes and asserts that the session sends the option it was built with.
 
 ### Incremental transfer experiment, 2026-10-19
 
@@ -357,8 +363,16 @@ Conclusions:
   This is what the `interruptedTransferRetention` gate condition asks for, for this
   option on this pen; recording it as a verdict belongs to the deletion tasks, and
   the gate stays closed until all four conditions and a command scope are settled.
-- **`nextAndReserve` remains the only option this build may send**, and the only
-  one with completed-transfer evidence.
+- **`nextAndReserve` is the option the ordinary read sends.** It is the
+  option the 2026-10-19 experiment established, and the ordinary read path can frame
+  no other. The SDK's third value, `nextAndDelete` (`0x01`), deletes the data as the
+  transfer runs. It was sent on 2026-10-21 to measure what that means — both to a
+  completed transfer and to one interrupted at a chosen packet — and it does
+  stream a transfer to its end packet just as `nextAndReserve` does. That trace is
+  recorded in "Deleting transfer option, 2026-10-21", and it is the evidence behind
+  the deleting read's own record, which sends `0x01` only for the recorded pen
+  identity, with a requested export, a per-sync confirmation, and durable packet
+  storage, committing each packet before acknowledging it.
 
 The experiment read the pen twice with each option, so the cursor question is
 settled by repetition rather than by one read.
@@ -470,8 +484,8 @@ copy.
 
 One command is proven to what it scopes: `0x25` is note-scoped. No trace proves a page
 scope, because `0x27` is refused. The gate stays shut all the same, and not for want of
-a verdict: `deletionScope` is `unsafe`, so `deletionEnabled` stays false and no
-deletion is reachable.
+a verdict: `deletionScope` is `unsafe`, so `deletionEnabled` stays false and no deletion
+command is reachable.
 
 The scope verdict does not rest on the mark. A transcript shows the removal of the
 note's delivered pages, and the owner's account is that the mark written afterwards on
@@ -480,6 +494,210 @@ it accepts can separate a note's newer strokes from the ones a read already hold
 `PenDeletionEvidence.physicalTrace2026_10_20` is that record, and `PenCleanupPolicy`
 carries it, so the app reports the deletion scope — rather than a missing trace — as the
 reason it kept the pen's copy.
+
+## Deleting transfer option, 2026-10-21
+
+`0x23` carries a transfer option byte, and the SDK documents a value that deletes the
+transferred data as part of the transfer: `NextAndDelete` (`0x01`). The ordinary read
+cannot send it, because `OfflineReadTransferOption` has no deleting member and a `0x23`
+request built from it can only ask the pen to leave the data alone. The deleting read
+reaches it through the authorization-taking overload, and this trace is what that
+route's evidence record is built from.
+
+This run sent the deleting option with `Tests/Hardware/PenLab`, whose `next-delete`
+experiment drives the transfer itself: it sends the app's offline read order (`0x21`
+with the section-owner wildcard, then `0x22` for the note), then `0x23` with option
+`0x01`, then acknowledges each `0x24` packet the way the session does. Two differences
+from a session remain, and neither is the option: the lab skips the app's `0x04`
+pen-state step, and it does not resolve the section owner from the note list the way the
+session does, because the experiment is given its target on the command line.
+`--abort-at-packet N` withholds the acknowledgement for packet N and closes the link, so a
+run can see how much of what the transfer had already handed over stays on the pen when no
+further acknowledgement follows.
+
+| Field | Value |
+| --- | --- |
+| Date | 2026-10-21 |
+| Pen model | `NWP-F151` |
+| Pen firmware | `3.00` |
+| Reported protocol version | `2.23` |
+| Tool | `Tests/Hardware/PenLab`, `next-delete`, built by `Scripts/pen-lab-build.sh` |
+| Subject | note 700, section 3, owner 27 |
+| Transcripts | `Tests/Fixtures/raw/acceptance-2026-10-21-next-delete/` and, for the re-run below, `Tests/Fixtures/raw/acceptance-2026-10-21-next-delete-rerun/` |
+
+The request is the app's own read frame with the option byte changed, so nothing but the
+option differs from a read:
+
+| Command | Frame | Note |
+| --- | --- | --- |
+| `0x23` with `0x01` | `C0230E0001001B000003BC02000000000000C1` | a read sends `C0230E00`**`02`**`001B000003BC02000000000000C1` |
+
+Three runs made up the experiment, each followed by a normal `nextAndReserve` read, which
+is the only way to see what the pen still holds. Every run was accepted: the `0xA3` info
+arrived with error code `0x00` in all three, and its stroke count matched the inventory
+the read **before** the run measured — 346, then 250, then 150 — because the summary
+describes the transfer about to start. Each read **after** a run reported the reduced
+count, which is what the table below records.
+
+| Run | Transcripts | What it asked the pen | Started with | Pen held afterwards |
+| --- | --- | --- | --- | --- |
+| baseline read | `read-baseline.txt` | a normal read, to fix the starting inventory | — | 346 strokes, pages 36 and 37 |
+| abort at packet 10 | `next-delete-abort-10.txt`, `read-after-abort-10.txt` | option `0x01`, acknowledge packets 1-9, withhold packet 10's acknowledgement, close | 346 strokes | 250 strokes, page 37 only |
+| abort at packet 11 | `next-delete-abort-11.txt`, `read-after-abort-11.txt` | acknowledge packets 1-10, withhold packet 11's acknowledgement, close | 250 strokes | 150 strokes, page 37 only |
+| full transfer | `next-delete-full.txt`, `read-after-full.txt` | option `0x01`, acknowledge every packet and answer the end packet with Stop | 150 strokes | 0 strokes, no notes |
+
+| Run | Packets received | Packets acknowledged | Strokes received | Strokes removed |
+| --- | --- | --- | --- | --- |
+| abort at packet 10 | 10 | 1-9 | 110 | 96 |
+| abort at packet 11 | 11 | 1-10 | 112 | 100 |
+| full transfer | 15 | 1-15, the 15th carrying Stop | 150 | 150 |
+
+Received counts and removals are measured: the packets come from the transcripts, and the
+removals from the pen's own inventory before and after each run. The acknowledgement counts
+are derived rather than recorded: the archived transcripts predate the lab's `acknowledged=`
+field, so each count comes from the recorded packet count together with the `abortAtPacket`
+line the run printed, and only the withheld acknowledgement is named in the transcript
+itself. The lab records each step it sends by name and size, but the transfer's `0xA4`
+acknowledgements were not recorded.
+
+`next-delete-abort-10.txt` was recorded before the lab stopped repeating the frames its own
+steps had already consumed, so it carries two extra `inbound other` lines for the `0xA1`
+and `0xA2` discovery responses. The frames and the counts are unaffected; later transcripts
+in the directory do not carry them, and the lab now records `acknowledged=`, the stroke
+count of the packet it withholds, and the end packet's stroke count.
+
+`read-before.txt` is the failed scan that preceded the experiment: the pen was asleep and
+advertised nothing, so it is kept as the record of that attempt rather than as a read.
+
+### What the three runs show
+
+- **The deleting option streams like a read.** The pen answers `0xA3` and then sends one
+  `0x24` packet per acknowledgement, with `compressed=false`, exactly as it does for
+  `nextAndReserve`. Only what happens to the sent data differs.
+- **Removal trails the transfer rather than completing it.** In the first run the pen sent
+  110 strokes and 96 went; in the second it sent 112 and 100 went. About one packet's worth
+  of what the pen had handed over — 14 strokes, then 12 — stayed on the pen, and page 36 was
+  among what the first run had already exchanged when it disappeared. Which strokes the
+  residue is cannot be read from the transcripts, which carry no per-packet counts; the
+  amount is consistent with the withheld packet's own strokes remaining. The re-run below
+  records the per-packet counts and measures that equality exactly.
+- **Removal is not a whole-note operation.** After the first run the pen listed page 37
+  and not page 36, so the removal followed the transferred data rather than the note.
+- **A completed transfer removes the note itself.** The read after the full run found no
+  notes at all (`result strokes=0 dots=0 pages=0 notes=0`), so the note left the pen's
+  inventory together with its data.
+- **An abandoned deleting transfer leaves the pen healthy.** The run after each abort was
+  accepted immediately, with no power cycle. That is not what `notNextTransfer` did on
+  2026-10-19, where an abandoned request left the pen refusing every later `0x23` until
+  it was switched off and on.
+- **The library was untouched.** Two snapshots are archived beside the transcripts, one
+  taken before the runs and one, as a `sqlite3 .backup`, after them. They hold the same
+  content: 23 pages, 8,438 strokes, 88,175 points, and an empty cleanup journal. The batch
+  rows in the later snapshot record what each read reached — two pages for the 346-stroke
+  reads, page 37 for the 250- and 150-stroke reads — and the read after the full transfer
+  recorded none, because it found nothing to save. Every stroke the pen held while these
+  runs deleted from it stayed readable: the 250 the pen held after the first abort are among
+  page 37's 252, and the 94 it held on page 36 among that page's 266. The earlier snapshot
+  is a direct copy rather than a `sqlite3 .backup`, so it reflects the library's last
+  checkpoint; the totals it holds are the same as the later snapshot's.
+
+### Re-run with the packet counts recorded, 2026-10-21
+
+The first three runs could only report how much was removed in total, because the lab's
+transcripts carried no per-packet counts, and the identification of the residue with the
+withheld packet was an inference. The lab now records `acknowledged=`, the stroke count of
+the packet it withholds, and the end packet's stroke count, so the same experiment was run
+again against fresh handwriting: 18 strokes the pen's owner wrote on pages 36 and 37, which
+a read imported first.
+
+| Run | Transcripts | What it asked the pen | Pen held afterwards |
+| --- | --- | --- | --- |
+| baseline read | `read-baseline.txt` | a normal read, to import the new strokes | 18 strokes, pages 36 and 37 |
+| withhold packet 1 | `next-delete-abort-1.txt`, `read-after-abort-1.txt` | option `0x01`, acknowledge nothing, withhold packet 1's acknowledgement | 18 strokes, pages 36 and 37 |
+| withhold packet 2 | `next-delete-abort-2.txt`, `read-after-abort-2.txt` | acknowledge packet 1, withhold packet 2's | 5 strokes, page 37 only |
+| abort at packet 999 | `next-delete-abort-999.txt`, `read-after-full.txt` | option `0x01`, acknowledge every packet and answer the end packet with Stop, having asked for an abort that cannot happen | 0 strokes, no notes |
+
+| Run | Packets received | Packets acknowledged | Strokes received | Strokes removed |
+| --- | --- | --- | --- | --- |
+| withhold packet 1 | 1 (13 strokes) | none | 13 | 0 |
+| withhold packet 2 | 2 (13 + 5 strokes) | packet 1 | 18 | 13 |
+| abort at packet 999 | 1 (5 strokes) | packet 1, carrying Stop | 5 | 5 |
+
+Three things this measures rather than infers:
+
+- **No acknowledgement removes nothing.** With packet 1 withheld, the pen still held all 18
+  strokes, although it had already handed 13 of them over. So the pen does not delete a
+  packet when it sends it.
+- **Removal equals the acknowledged prefix.** The second run acknowledged packet 1, whose
+  recorded size was 13 strokes, and the pen's inventory fell from 18 to 5: exactly what was
+  acknowledged went, and the packet the pen had sent but not had acknowledged stayed. The
+  removal is bounded by the acknowledgements down to the stroke.
+- **Nothing unacknowledged went, not even the end packet.** Packet 2 was the transfer's last
+  packet, so withholding its acknowledgement also withheld the Stop, and the pen kept its 5
+  strokes. What the Stop contributes on its own is not separable from the acknowledgement
+  that carries it; the subsection below records that.
+
+The run also exercised the lab's refusal to report an abort it did not perform: with
+`--abort-at-packet 999` the transfer reached its end packet and was acknowledged in full, so
+the run failed with `the abort at packet 999 never happened: the transfer completed after 1
+packet(s), so every packet was acknowledged and the pen removed everything it sent` and
+exited 1. The read afterwards found the pen empty, which is what that message says happened.
+
+The library was unaffected by the deletions and kept the new strokes: 8,438 strokes and
+88,175 points before the runs, 8,456 and 88,332 after, with page 36 at 275 strokes and page
+37 at 261. The 18 new strokes were split evenly, 9 on page 36 and 9 on page 37; the pen
+removed page 36 entirely plus 4 of page 37's new strokes, and kept page 37's remaining 5.
+
+### What triggered the removal is not settled
+
+The runs show how much went, not which event removed it. A removal that waits for the
+transfer to end is excluded: neither aborted run of the first experiment sent a Stop, and
+both removed data anyway, and the re-run withheld the Stop itself and removed nothing of the
+packet it belonged to. Two triggers remain indistinguishable, because the pen sends a packet
+only after the previous acknowledgement, so in these runs the withheld acknowledgement is
+also the last packet transmitted:
+
+- the pen removes packet N once packet N is acknowledged, or
+- the pen removes packet N once it sends packet N+1.
+
+Both predict the same three outcomes, and the host may not be able to separate them: the
+pen sends the next packet as soon as the previous one is acknowledged, so there is no
+acknowledgement that leaves the following packet unsent. Telling them apart would take a
+read taken while the link is still open, or an observer outside the host, and one BLE link
+allows neither.
+
+What a host can rely on holds under either trigger, and the re-run measured it rather than
+assuming it: **the pen hands over a packet only after the previous one was acknowledged, so
+removed data was acknowledged data** — no acknowledgement removed nothing, and one
+acknowledgement removed exactly the strokes that packet carried. The design below depends on
+that invariant rather than on the trigger, and nothing here should be read as proving which
+trigger the firmware uses.
+
+### What this means for deletion after a sync
+
+The acknowledged `0x25` route is closed by `deletionScope`: it can only take a whole note,
+so it cannot leave a page's newer strokes behind. The deleting transfer option is not a
+narrower scope either — a completed transfer removed the whole note — but it puts the cut
+somewhere else: removal is bounded by what the host has acknowledged, so the host decides
+where that bound falls, packet by packet.
+
+That is the ordering the cleanup rule asks for, without needing a page-scoped command or a
+pen-reported revision to bound the window. A host that commits and flushes each packet
+before acknowledging it would satisfy "deletion ordered after confirmed storage" with this
+option, since the pen hands over a packet only after the previous acknowledgement, so it
+can never remove data the host has not already stored. The re-run puts that on measurement
+rather than on inference: withholding the first acknowledgement removed nothing, and
+acknowledging one 13-stroke packet removed exactly those 13 strokes.
+
+This is a design option that the change has since built on. Nothing here opens the
+command gate: the four conditions in the section below describe the acknowledged
+`0x25`/`0x27` path, and the *ordinary* read path still sends only `nextAndReserve`.
+The deleting transfer is a separate, authorized route — streaming commits, an option
+the read path may send only with a `PenDeletingReadAuthorization`, and evidence for
+the transfer's own conditions instead of the delete command's — and the shipped build
+takes it for the recorded identity, with a requested export, a per-sync confirmation,
+and durable packet storage. Until that change, this run was a design option; it is now
+the evidence the route's record is built from.
 
 ## Deletion evidence gate
 
@@ -508,6 +726,12 @@ gate on `deletionScope`. An unsafe verdict is not the same as a missing one, so 
 reason a build gives names the scope instead of claiming that no trace exists.
 `PenDeletionEvidence.physicalTrace2026_10_20` is that record, and
 `PenCleanupPolicy` carries it.
+
+The four conditions describe this acknowledged path. The 2026-10-21 deleting transfer
+option is a different route: it removes data while the transfer runs, so it has its own
+record with its own conditions, and admitting it neither opens this gate nor settles a
+condition here. See "Deleting transfer option, 2026-10-21" for what the option does, for
+the record that route is built from, and for the verdicts it currently carries.
 
 While the gate is closed, `CommandEvidenceRegistry.authorization(for:)` reports
 both commands as `.gated` and names the conditions that are not `safe`, so no
@@ -591,7 +815,7 @@ switched off and on again while a scan was already running.
 | Every decoded dot passes the pen's own checksum | Yes, no checksum or framing error over 3,053 notification chunks and 1,335,753 inbound bytes |
 | Acknowledgement pacing | Yes. 608 `0xA4` frames, one per `0x24` packet, operation `1` (Continue) through packet 607 and `0` (Stop) on packet 608 |
 | No deletion request sent | Yes. The outbound command list of every run contains only `0x01`, `0x21`, `0x22`, `0x23`, and `0xA4` |
-| Pen cleanup mode | That build requested no cleanup, so the pen kept its copy. Deletion is unreachable in every build: `PenCleanupPolicy.deletionEnabled` derives from the deletion evidence gate, whose recorded deletion-scope verdict is `unsafe` |
+| Pen cleanup mode | That build requested no cleanup, so the pen kept its copy. No `0x25` or `0x27` deletion command is reachable: `PenCleanupPolicy.deletionEnabled` derives from the deletion evidence gate, whose recorded deletion-scope verdict is `unsafe`. The deleting transfer (`0x23` option `0x01`) is a separate route with its own record, and it was not part of this run |
 | Link released after a read | Yes. Every completed read logged a Disconnected state, and each of four consecutive reads found the pen advertising again |
 
 The run's totals exceed the 6,920 strokes and 70,199 dots recorded on 2026-10-18
@@ -669,7 +893,7 @@ SVG, and Markdown), and exited zero.
 | Deterministic export | Yes, for the files written. All 66 targets published, none failed; every JSON file parsed and every SVG file was well-formed, and all 22 pages declared the same `viewBox="0 0 54.84 88.58"` canvas at `130.0mm x 210.0mm` |
 | No device identity in output | Yes. No exported file carries a pen model, firmware, serial number, or Bluetooth address |
 | No deletion request sent | Yes. The outbound command list contains only `0x01`, `0x21`, `0x22`, `0x23`, and `0xA4` |
-| Pen cleanup mode | That build requested no cleanup, so the pen kept its copy. Deletion is unreachable in every build: `PenCleanupPolicy.deletionEnabled` derives from the deletion evidence gate, whose recorded deletion-scope verdict is `unsafe` |
+| Pen cleanup mode | That build requested no cleanup, so the pen kept its copy. No `0x25` or `0x27` deletion command is reachable: `PenCleanupPolicy.deletionEnabled` derives from the deletion evidence gate, whose recorded deletion-scope verdict is `unsafe`. The deleting transfer (`0x23` option `0x01`) is a separate route with its own record, and it was not part of this run |
 
 The per-scenario rows are recorded under "Save-and-export acceptance" in
 `Tests/Hardware/README.md`. The byte counts match the files on disk, and the sanitized

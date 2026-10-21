@@ -168,6 +168,12 @@ public struct PenImportBatchRecord: Hashable, Sendable {
     /// The lifecycle state the batch reached.
     public let state: ImportBatchState
 
+    /// How the batch's strokes arrived.
+    public let kind: ImportTransferKind
+
+    /// How far the batch's transfer got, independently of its publication.
+    public let completion: ImportBatchCompletion
+
     /// The pages the batch's strokes belong to, in canonical order.
     public let pages: [PageIdentity]
 
@@ -177,25 +183,62 @@ public struct PenImportBatchRecord: Hashable, Sendable {
     /// Dots the batch carried.
     public let dotCount: Int
 
+    /// The packets a deleting transfer durably committed, in commit order.
+    ///
+    /// An ordinary batch has none. A deleting batch has one entry per
+    /// acknowledged packet, which is what lets a restart report the acknowledged
+    /// prefix rather than a completed read.
+    public let packets: [PenImportPacketProgress]
+
     public init(
         batchID: UUID,
         state: ImportBatchState,
+        kind: ImportTransferKind = .ordinary,
+        completion: ImportBatchCompletion = .complete,
         pages: [PageIdentity],
         strokeCount: Int,
-        dotCount: Int
+        dotCount: Int,
+        packets: [PenImportPacketProgress] = []
     ) {
         self.batchID = batchID
         self.state = state
+        self.kind = kind
+        self.completion = completion
         self.pages = pages
         self.strokeCount = strokeCount
         self.dotCount = dotCount
+        self.packets = packets
     }
 
-    /// Whether publication can still be attempted for this batch.
+    /// Whether the batch came from a deleting transfer.
+    public var isDeletingTransfer: Bool { kind == .deleting }
+
+    /// Whether at least one packet is durably committed.
+    public var hasDurablePackets: Bool { !packets.isEmpty }
+
+    /// Whether the transfer reached every discovered note's end packet.
+    public var isTransferComplete: Bool { completion == .complete }
+
+    /// Whether the batch can still be published from its stored rows.
     ///
     /// A committed batch whose publication failed, and a published batch whose
-    /// files were replaced afterwards, both qualify.
+    /// files were replaced afterwards, both qualify. A deleting batch qualifies
+    /// as soon as one packet is durable, even while its transfer is partial,
+    /// because the committed pages are already re-exportable.
     public var isPublicationRetryable: Bool {
-        state == .committed || state == .published
+        guard state == .committed || state == .published else { return false }
+        if kind == .deleting { return hasDurablePackets }
+        return true
+    }
+
+    /// Whether the batch's pages may not be reclaimed by a separate deletion
+    /// command yet.
+    ///
+    /// A deleting batch is never eligible for a separate command, and a batch
+    /// whose transfer is still `inProgress` or `partial` is incomplete even when
+    /// its publication succeeded, so a page it shares is not safe to remove.
+    public var blocksCommandDeletionScope: Bool {
+        if kind == .deleting { return true }
+        return state != .published || completion != .complete
     }
 }

@@ -191,6 +191,15 @@ struct PenSyncView: View {
                 }
             }
 
+            // The confirmation is what authorizes the deleting route for the
+            // sync it is made against, so it is offered only while that route is
+            // available and still unconfirmed.
+            if controller.needsCleanupConfirmation {
+                Button(PenSyncController.confirmCleanupTitle) {
+                    controller.confirmCleanupForThisSync()
+                }
+            }
+
             if let reason = controller.cleanupUnavailableReason {
                 Text("Cleanup is unavailable: \(reason)")
                     .font(.callout)

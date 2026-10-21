@@ -146,6 +146,16 @@ public actor PenLibraryImporter: PenImportCoordinator {
             return .retainedByChoice
         }
 
+        // A deleting transfer is not a separate command: its removal is already
+        // bounded by the acknowledgements it committed, so a `0x25`/`0x27` command
+        // for the same pages would delete data the transfer never covered.
+        guard !record.isDeletingTransfer else {
+            return .skipped(
+                reason: "this read already used transfer cleanup, so no separate"
+                    + " deletion command was sent"
+            )
+        }
+
         // A read that stored no page has nothing to reclaim, so no empty scope is
         // journaled and no empty deletion is ever sent.
         guard !record.pages.isEmpty else {
@@ -448,8 +458,13 @@ public actor PenLibraryImporter: PenImportCoordinator {
     ) async throws -> [PageIdentity] {
         let wanted = Set(pages)
         var shared = Set<PageIdentity>()
-        for state in ImportBatchState.allCases where state != .published {
-            for record in try await batches.batches(in: state) where record.batchID != batchID {
+        // Every state is examined, including `published`: a published batch whose
+        // transfer is still `inProgress` or `partial` — a deleting batch that has
+        // not stored the remainder — still holds pages a separate command must not
+        // remove, because the pen's copy is that read's only other copy.
+        for state in ImportBatchState.allCases {
+            for record in try await batches.batches(in: state)
+            where record.batchID != batchID && record.blocksCommandDeletionScope {
                 shared.formUnion(wanted.intersection(record.pages))
             }
         }
@@ -491,9 +506,12 @@ public actor PenLibraryImporter: PenImportCoordinator {
             PenImportBatchRecord(
                 batchID: existing.batchID,
                 state: batch.state,
+                kind: existing.kind,
+                completion: existing.completion,
                 pages: existing.pages,
                 strokeCount: existing.strokeCount,
-                dotCount: existing.dotCount
+                dotCount: existing.dotCount,
+                packets: existing.packets
             )
         )
     }
@@ -528,8 +546,10 @@ extension StorageError {
     fileprivate var isUnreadableCleanupRecord: Bool {
         switch self {
         case .unreadableCleanupState, .unreadableCleanupScope: return true
-        case .cannotOpenDatabase, .statementFailed, .unsupportedSchemaVersion, .batchNotReady,
-            .collectedStrokesUnavailable:
+        case .cannotOpenDatabase, .statementFailed, .unsupportedSchemaVersion,
+            .unreadableSchemaVersion, .batchNotReady, .collectedStrokesUnavailable,
+            .migrationBackupFailed, .unreadableBatchState, .unreadableBatchCompletion,
+            .deletingReadsUnavailable:
             return false
         }
     }

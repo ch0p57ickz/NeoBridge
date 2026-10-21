@@ -73,6 +73,246 @@ public struct ImportBatch: Sendable, Hashable {
     }
 }
 
+/// How one batch's strokes arrived.
+///
+/// The kind is orthogonal to ``ImportBatchState``, which stays the publication
+/// lifecycle. An ordinary batch is stored in one commit; a deleting batch is
+/// stored packet by packet as its transfer runs, so its publication and its
+/// completion can disagree.
+public enum ImportTransferKind: String, Hashable, Sendable, Codable, CaseIterable {
+    /// A complete read committed in one transaction.
+    case ordinary
+
+    /// A deleting `0x23` transfer committed one acknowledged packet at a time.
+    case deleting
+}
+
+/// How far a batch's transfer got, independently of its publication.
+///
+/// A deleting batch reaches `committed` on its first durable packet and may
+/// publish while still incomplete, so completion is its own durable field:
+/// `inProgress` while the transfer runs, `partial` when it stopped before every
+/// note's end packet, and `complete` only when every discovered note ended.
+public enum ImportBatchCompletion: String, Hashable, Sendable, Codable, CaseIterable {
+    /// The transfer has not finished and has not been abandoned.
+    case inProgress
+
+    /// The transfer stopped before every note's end packet.
+    case partial
+
+    /// Every discovered note reached its end packet.
+    case complete
+}
+
+/// One packet a deleting transfer durably committed.
+public struct PenImportPacketProgress: Hashable, Sendable, Codable {
+    /// The pen's section-owner identifier for the packet's note.
+    public let sectionOwnerID: UInt32
+
+    /// The pen's note identifier.
+    public let noteID: UInt32
+
+    /// The pen's packet identifier within the transfer.
+    public let packetID: UInt16
+
+    /// Strokes the packet carried.
+    public let strokeCount: Int
+
+    /// Whether the packet declared itself the transfer's last.
+    public let isEndPacket: Bool
+
+    public init(
+        sectionOwnerID: UInt32,
+        noteID: UInt32,
+        packetID: UInt16,
+        strokeCount: Int,
+        isEndPacket: Bool
+    ) {
+        self.sectionOwnerID = sectionOwnerID
+        self.noteID = noteID
+        self.packetID = packetID
+        self.strokeCount = strokeCount
+        self.isEndPacket = isEndPacket
+    }
+}
+
+/// One note a deleting read plans to cover.
+public struct PenDeletingReadNote: Hashable, Sendable {
+    /// The pen's section-owner identifier.
+    public let sectionOwnerID: UInt32
+
+    /// The pen's note identifier.
+    public let noteID: UInt32
+
+    public init(sectionOwnerID: UInt32, noteID: UInt32) {
+        self.sectionOwnerID = sectionOwnerID
+        self.noteID = noteID
+    }
+}
+
+/// One accepted packet a deleting transfer hands to durable storage.
+///
+/// The packet is the unit the pen bounds its removal by, so it is also the unit
+/// the library commits: the whole packet's strokes, its progress, and its end
+/// marker go into one transaction that returns only after a durable sync, and the
+/// session acknowledges the packet only once that call has returned.
+public struct PenDeletingPacket: Hashable, Sendable {
+    /// The batch this packet belongs to.
+    public let batchID: UUID
+
+    /// The pen's section-owner identifier for the packet's note.
+    public let sectionOwnerID: UInt32
+
+    /// The pen's note identifier.
+    public let noteID: UInt32
+
+    /// The pen's packet identifier.
+    public let packetID: UInt16
+
+    /// Every stroke the packet carried.
+    public let strokes: [Stroke]
+
+    /// Whether this packet declared itself the transfer's last.
+    public let isEndPacket: Bool
+
+    public init(
+        batchID: UUID,
+        sectionOwnerID: UInt32,
+        noteID: UInt32,
+        packetID: UInt16,
+        strokes: [Stroke],
+        isEndPacket: Bool
+    ) {
+        self.batchID = batchID
+        self.sectionOwnerID = sectionOwnerID
+        self.noteID = noteID
+        self.packetID = packetID
+        self.strokes = strokes
+        self.isEndPacket = isEndPacket
+    }
+
+    /// The distinct pages the packet's strokes belong to, in canonical order.
+    public var pages: [PageIdentity] {
+        var seen = Set<PageIdentity>()
+        return strokes
+            .map(\.page)
+            .filter { seen.insert($0).inserted }
+            .sorted(by: PageIdentity.canonicalOrder)
+    }
+}
+
+/// What one durable packet commit left in the batch.
+///
+/// The counts are what this batch added to the library, not what the pen handed
+/// over: a fresh read that replays a packet the pen never had acknowledged finds
+/// those strokes already stored, so the replay adds nothing and the batch that
+/// stores the remainder reports only its own strokes. That is what keeps a
+/// reported save honest after a crash.
+public struct PenDeletingPacketCommitResult: Hashable, Sendable {
+    /// Packets committed for the batch so far, including this one.
+    public let committedPacketCount: Int
+
+    /// Strokes this batch added to the library so far, including this one's.
+    public let committedStrokeCount: Int
+
+    /// Dots in the strokes this batch added so far.
+    public let committedDotCount: Int
+
+    /// Strokes this packet added.
+    public let addedStrokeCount: Int
+
+    /// Reliable strokes this packet recognized as already stored.
+    public let duplicateStrokeCount: Int
+
+    /// Whether this packet declared itself the transfer's last.
+    public let isEndPacket: Bool
+
+    public init(
+        committedPacketCount: Int,
+        committedStrokeCount: Int,
+        committedDotCount: Int,
+        addedStrokeCount: Int,
+        duplicateStrokeCount: Int,
+        isEndPacket: Bool
+    ) {
+        self.committedPacketCount = committedPacketCount
+        self.committedStrokeCount = committedStrokeCount
+        self.committedDotCount = committedDotCount
+        self.addedStrokeCount = addedStrokeCount
+        self.duplicateStrokeCount = duplicateStrokeCount
+        self.isEndPacket = isEndPacket
+    }
+}
+
+/// The durable packet storage a deleting read commits through.
+///
+/// The value is what the app composes and hands to a deleting read: the barrier
+/// when a writable library is available, and the reason it is not when it is not.
+/// A deleting read is refused rather than narrowed when the storage is absent.
+public struct PenDeletingReadStorage: Sendable {
+    /// The barrier each packet is committed through, or `nil` when unavailable.
+    public let barrier: (any PenDeletingPacketBarrier)?
+
+    /// Why no barrier is available, or `nil` when one is.
+    public let unavailableReason: String?
+
+    public init(
+        barrier: (any PenDeletingPacketBarrier)?,
+        unavailableReason: String? = nil
+    ) {
+        self.barrier = barrier
+        self.unavailableReason = unavailableReason
+    }
+
+    /// A configuration with no durable packet storage.
+    public static let unavailable = PenDeletingReadStorage(barrier: nil)
+
+    /// Whether a deleting read can commit its packets.
+    public var isAvailable: Bool { barrier != nil }
+}
+
+/// The storage barrier a deleting transfer commits each packet through.
+///
+/// The session awaits this before it builds or sends a packet's `0xA4`, so a
+/// packet is only ever acknowledged after its strokes and progress are durable.
+/// A failure, a cancellation, or an unavailable database leaves the packet
+/// unacknowledged, which is what keeps the pen from removing data the library
+/// does not hold.
+public protocol PenDeletingPacketBarrier: Sendable {
+    /// Opens a deleting batch for a read and returns its identifier.
+    func beginDeletingRead(notes: [PenDeletingReadNote]) async throws -> UUID
+
+    /// Commits one accepted packet's strokes and progress in one durable
+    /// transaction.
+    ///
+    /// - Returns: The batch's cumulative progress, once the commit has returned
+    ///   after a durable sync.
+    func commitDeletingPacket(_ packet: PenDeletingPacket) async throws
+        -> PenDeletingPacketCommitResult
+
+    /// Marks the batch's completion once the transfer has stopped.
+    ///
+    /// - Parameter isComplete: Whether every discovered note reached its end
+    ///   packet. `false` leaves the batch `partial`.
+    func finishDeletingRead(batchID: UUID, isComplete: Bool) async throws
+
+    /// Marks the batch failed because the read that opened it ended before its
+    /// first durable packet.
+    ///
+    /// A deleting read opens its batch before the first `0x23`, so a read that ends
+    /// without committing a packet — a dropped link, a refused or malformed
+    /// response, a failed first commit, or a cancellation at the first inbound wait
+    /// — leaves a batch that can never publish and claims a transfer that has
+    /// ended. The row is marked rather than removed, because the journal and a later
+    /// diagnosis need to see that the read was attempted.
+    ///
+    /// An implementation MUST leave every other batch exactly as it is: an ordinary
+    /// batch, a batch with a durable packet, and a batch whose read already
+    /// finished are all outside this call's meaning, so calling it for them writes
+    /// nothing, and a second call for the same batch is a no-op.
+    func failDeletingRead(batchID: UUID) async throws
+}
+
 /// A storage boundary for assembled strokes.
 ///
 /// An insert is one transaction: either every stroke of the call is stored or

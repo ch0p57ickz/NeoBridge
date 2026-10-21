@@ -47,6 +47,95 @@ final class PenAcceptanceOptionsTests: XCTestCase {
         XCTAssertEqual(options.transferOption, .notNextTransfer)
         XCTAssertEqual(options.cleanupMode, .keepOnPen)
         XCTAssertEqual(options.abortAtPacket, 120)
+        XCTAssertFalse(options.confirmCleanup)
+    }
+
+    /// Confirming cleanup is its own key, because it is the act that authorizes a
+    /// deleting transfer: asking for the intent must not authorize removal.
+    func testTheConfirmationIsSeparateFromTheIntent() throws {
+        let confirmed = try XCTUnwrap(
+            try options([
+                PenAcceptanceOptions.traceEnvironmentKey: "/tmp/a1-run.txt",
+                PenAcceptanceOptions.cleanupModeEnvironmentKey: "cleanup",
+                PenAcceptanceOptions.confirmCleanupEnvironmentKey: "true",
+            ])
+        )
+        XCTAssertEqual(confirmed.cleanupMode, .deleteAfterAcknowledge)
+        XCTAssertTrue(confirmed.confirmCleanup)
+
+        // The intent on its own leaves the run unconfirmed, so it takes the
+        // non-destructive read.
+        let intendedOnly = try XCTUnwrap(
+            try options([
+                PenAcceptanceOptions.traceEnvironmentKey: "/tmp/a1-run.txt",
+                PenAcceptanceOptions.cleanupModeEnvironmentKey: "cleanup",
+            ])
+        )
+        XCTAssertFalse(intendedOnly.confirmCleanup)
+    }
+
+    func testAcceptsEveryDocumentedConfirmationSpelling() throws {
+        for (text, confirmed) in [
+            ("true", true), ("TRUE", true), (" yes ", true), ("1", true),
+            ("false", false), ("No", false), (" 0 ", false),
+        ] {
+            let options = try XCTUnwrap(
+                try options([
+                    PenAcceptanceOptions.traceEnvironmentKey: "/tmp/a1-run.txt",
+                    PenAcceptanceOptions.confirmCleanupEnvironmentKey: text,
+                ])
+            )
+            XCTAssertEqual(options.confirmCleanup, confirmed, "\(text) means \(confirmed)")
+        }
+    }
+
+    func testRefusesAnUnreadableConfirmation() throws {
+        for text in ["confirm", "maybe", "2"] {
+            XCTAssertThrowsError(
+                try options([
+                    PenAcceptanceOptions.traceEnvironmentKey: "/tmp/a1-run.txt",
+                    PenAcceptanceOptions.confirmCleanupEnvironmentKey: text,
+                ]),
+                "\(text) is not a yes or a no"
+            ) { error in
+                let parseError = error as? PenAcceptanceOptions.ParseError
+                XCTAssertEqual(parseError, .invalidConfirmCleanup(text))
+                XCTAssertTrue(
+                    parseError?.message.contains("true, yes, 1, false, no, 0") == true,
+                    "the message has to name every accepted spelling"
+                )
+            }
+        }
+    }
+
+    /// A confirmation with retention would confirm nothing, so the run is refused
+    /// rather than reported as one that confirmed cleanup.
+    func testRefusesAConfirmationWithRetention() throws {
+        XCTAssertThrowsError(
+            try options([
+                PenAcceptanceOptions.traceEnvironmentKey: "/tmp/a1-run.txt",
+                PenAcceptanceOptions.cleanupModeEnvironmentKey: "keep",
+                PenAcceptanceOptions.confirmCleanupEnvironmentKey: "true",
+            ])
+        ) { error in
+            let parseError = error as? PenAcceptanceOptions.ParseError
+            XCTAssertEqual(parseError, .confirmationWithoutIntent)
+            XCTAssertTrue(
+                parseError?.message.contains(PenAcceptanceOptions.cleanupModeEnvironmentKey) == true,
+                "the message names the key that contradicts the confirmation"
+            )
+        }
+
+        // An explicit "no" is not a contradiction, so it is accepted.
+        let refused = try XCTUnwrap(
+            try options([
+                PenAcceptanceOptions.traceEnvironmentKey: "/tmp/a1-run.txt",
+                PenAcceptanceOptions.cleanupModeEnvironmentKey: "keep",
+                PenAcceptanceOptions.confirmCleanupEnvironmentKey: "false",
+            ])
+        )
+        XCTAssertFalse(refused.confirmCleanup)
+        XCTAssertEqual(refused.cleanupMode, .keepOnPen)
     }
 
     /// The option can be named by its byte as well as by its case name, so a
@@ -193,6 +282,7 @@ final class PenAcceptanceOptionsTests: XCTestCase {
                 PenAcceptanceOptions.exportDirectoryEnvironmentKey: "",
                 PenAcceptanceOptions.transferOptionEnvironmentKey: "",
                 PenAcceptanceOptions.cleanupModeEnvironmentKey: "",
+                PenAcceptanceOptions.confirmCleanupEnvironmentKey: "",
                 PenAcceptanceOptions.abortAtPacketEnvironmentKey: "",
             ])
         )
@@ -200,6 +290,7 @@ final class PenAcceptanceOptionsTests: XCTestCase {
         XCTAssertNil(options.exportDirectory)
         XCTAssertEqual(options.transferOption, .nextAndReserve)
         XCTAssertEqual(options.cleanupMode, .deleteAfterAcknowledge)
+        XCTAssertFalse(options.confirmCleanup)
         XCTAssertNil(options.abortAtPacket)
     }
 }

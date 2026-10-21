@@ -16,6 +16,13 @@ public enum StorageError: Error, Hashable, Sendable {
     /// would drop.
     case unsupportedSchemaVersion(found: Int, supported: Int)
 
+    /// The recorded schema version is not a number.
+    ///
+    /// The database is left untouched: a version this build cannot read is
+    /// refused rather than treated as an older file, because reading it as
+    /// "older" would migrate a file whose schema is unknown.
+    case unreadableSchemaVersion(found: String, supported: Int)
+
     /// A batch is unknown, or is not in a state that allows the requested step.
     case batchNotReady(batchID: UUID, state: ImportBatchState?)
 
@@ -39,6 +46,29 @@ public enum StorageError: Error, Hashable, Sendable {
     /// same scope.
     case unreadableCleanupState(batchID: UUID)
 
+    /// The pre-migration backup could not be created or verified.
+    ///
+    /// The original database is left untouched and the migration is aborted, so a
+    /// build that cannot back up never writes a new schema over data it could not
+    /// copy first.
+    case migrationBackupFailed(path: String, message: String)
+
+    /// A recorded batch state could not be read back.
+    ///
+    /// The row holds a state this build does not understand, so it is refused
+    /// rather than mapped to a state that would misreport what happened to the
+    /// batch.
+    case unreadableBatchState(batchID: UUID)
+
+    /// A recorded batch completion could not be read back.
+    case unreadableBatchCompletion(batchID: UUID)
+
+    /// Deleting reads are unavailable in this library.
+    ///
+    /// Either the migration that adds the streaming tables could not be backed
+    /// up, or this configuration disables the deleting route.
+    case deletingReadsUnavailable(reason: String)
+
     /// A human-readable message for the app's error row.
     public var message: String {
         switch self {
@@ -49,6 +79,9 @@ public enum StorageError: Error, Hashable, Sendable {
         case .unsupportedSchemaVersion(let found, let supported):
             return "The stroke library was written by a newer version of NeoBridge"
                 + " (schema \(found), this build understands \(supported))."
+        case .unreadableSchemaVersion(let found, let supported):
+            return "The stroke library records a schema version this build cannot read"
+                + " (\(found), this build understands \(supported)), so it was left as it was."
         case .batchNotReady(_, let state):
             let described = state.map { " in state \($0.rawValue)" } ?? " that is unknown"
             return "This read cannot be exported again: its stored batch is\(described)."
@@ -59,6 +92,17 @@ public enum StorageError: Error, Hashable, Sendable {
         case .unreadableCleanupState:
             return "A recorded cleanup request has a state this build cannot read,"
                 + " so no deletion was sent for it."
+        case .migrationBackupFailed(let path, let message):
+            return "The stroke library at \(path) could not be backed up before it was"
+                + " upgraded (\(message)), so it was left as it was and deleting reads stay off."
+        case .unreadableBatchState(let batchID):
+            return "The stored read \(batchID.uuidString) has a state this build cannot read,"
+                + " so it is refused rather than reported as another state."
+        case .unreadableBatchCompletion(let batchID):
+            return "The stored read \(batchID.uuidString) has a completion this build cannot read,"
+                + " so it is refused rather than reported as a completed read."
+        case .deletingReadsUnavailable(let reason):
+            return "Deleting reads are unavailable: \(reason)"
         }
     }
 }
@@ -75,9 +119,49 @@ final class SQLiteConnection {
     /// Opens a database file, creating it when it does not exist.
     ///
     /// - Parameter path: The file path, or `:memory:` for an in-memory database.
-    init(path: String) throws {
+    convenience init(path: String) throws {
+        try self.init(
+            path: path,
+            flags: SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX
+        )
+    }
+
+    /// Opens an existing database file for reading only, treating it as immutable.
+    ///
+    /// The file is named through a URI with `immutable=1`, so SQLite reads the file
+    /// itself and neither looks for a write-ahead log nor creates one. That matters
+    /// for a copy of a WAL-mode database: the copy carries the source's WAL header,
+    /// and such a file cannot be opened read-only any other way. Nothing is written,
+    /// which is what makes this the right way to verify a backup.
+    ///
+    /// - Parameter path: The file path. It must already exist.
+    convenience init(immutableReadingOnly path: String) throws {
+        try self.init(
+            path: "file:" + SQLiteConnection.uriEncoded(path) + "?immutable=1",
+            flags: SQLITE_OPEN_READONLY | SQLITE_OPEN_URI | SQLITE_OPEN_FULLMUTEX
+        )
+    }
+
+    /// Percent-encodes a file path for SQLite's URI filename syntax.
+    ///
+    /// Only the unreserved characters and `/` are left as they are; every other
+    /// byte becomes `%XX`. A path holding `?`, `#`, `%`, or a space then names one
+    /// file instead of being read as URI syntax.
+    private static func uriEncoded(_ path: String) -> String {
+        let unreserved = Set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~/")
+        var encoded = ""
+        for byte in path.utf8 {
+            if byte < 0x80, let scalar = UnicodeScalar(UInt32(byte)), unreserved.contains(Character(scalar)) {
+                encoded.append(Character(scalar))
+            } else {
+                encoded += String(format: "%%%02X", byte)
+            }
+        }
+        return encoded
+    }
+
+    private init(path: String, flags: Int32) throws {
         var handle: OpaquePointer?
-        let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX
         let result = sqlite3_open_v2(path, &handle, flags, nil)
 
         guard result == SQLITE_OK, let handle else {
@@ -129,6 +213,43 @@ final class SQLiteConnection {
         } catch {
             try? execute("ROLLBACK")
             throw error
+        }
+    }
+
+    /// Copies the whole database into a new file with SQLite's online backup API.
+    ///
+    /// The backup reads the source through the same connection the library uses,
+    /// so it captures committed WAL content and cannot see a half-written
+    /// transaction. That is what makes it a consistent pre-migration copy rather
+    /// than a file copy that might miss the write-ahead log.
+    ///
+    /// - Parameter path: The destination file path. An existing file is replaced.
+    func backup(to path: String) throws {
+        var destination: OpaquePointer?
+        let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX
+        let opened = sqlite3_open_v2(path, &destination, flags, nil)
+        guard opened == SQLITE_OK, let destination else {
+            let message = destination.map { String(cString: sqlite3_errmsg($0)) }
+                ?? "sqlite3_open_v2 failed with code \(opened)"
+            if let destination { sqlite3_close_v2(destination) }
+            throw StorageError.statementFailed(sql: "backup", message: message)
+        }
+        defer { sqlite3_close_v2(destination) }
+
+        guard let backup = sqlite3_backup_init(destination, "main", handle, "main") else {
+            throw StorageError.statementFailed(
+                sql: "backup",
+                message: String(cString: sqlite3_errmsg(destination))
+            )
+        }
+        defer { sqlite3_backup_finish(backup) }
+
+        let step = sqlite3_backup_step(backup, -1)
+        guard step == SQLITE_DONE else {
+            throw StorageError.statementFailed(
+                sql: "backup",
+                message: String(cString: sqlite3_errmsg(destination))
+            )
         }
     }
 }

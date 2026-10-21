@@ -1,3 +1,4 @@
+import NeoProtocol
 import XCTest
 
 @testable import PenLab
@@ -121,7 +122,7 @@ final class PenLabInvocationTests: XCTestCase {
 
     func testDeleteNoteSendsTheNoteFrameAndNamesItsSubject() throws {
         let invocation = try parse(["delete-note", "--note", "700"])
-        let steps = invocation.steps()
+        let steps = try invocation.steps()
 
         XCTAssertEqual(steps.count, 1)
         XCTAssertEqual(steps[0].name, "delete-note-0x25")
@@ -133,7 +134,7 @@ final class PenLabInvocationTests: XCTestCase {
 
     func testProbeSendsBothCommandsAndTakesTheFirstNoteForThePageCommand() throws {
         let invocation = try parse(["probe", "--note", "700", "--note", "701"])
-        let steps = invocation.steps()
+        let steps = try invocation.steps()
 
         XCTAssertEqual(steps.map(\.request), [0x25, 0x27])
         XCTAssertEqual(steps.map(\.response), [0xA5, 0xA7])
@@ -146,5 +147,114 @@ final class PenLabInvocationTests: XCTestCase {
             steps[1].scope.contains("700") && !steps[1].scope.contains("701"),
             "0x27 names one note, so the probe uses the first: \(steps[1].scope)"
         )
+    }
+
+    // MARK: - The deleting transfer option
+
+    func testNextDeleteNeedsExactlyOneNote() {
+        XCTAssertNotNil(refusal(["next-delete"]))
+        XCTAssertNotNil(refusal(["next-delete", "--note", "700", "--note", "701"]))
+        XCTAssertNil(refusal(["next-delete", "--note", "700"]))
+    }
+
+    func testNextDeleteRefusesAPageList() {
+        // The transfer asks the pen for the whole note, so a page list would print a
+        // subject the request does not carry.
+        XCTAssertNotNil(refusal(["next-delete", "--note", "700", "--page", "1"]))
+    }
+
+    func testAbortAtPacketIsRefusedForACommandExperiment() {
+        XCTAssertNotNil(refusal(["delete-note", "--note", "700", "--abort-at-packet", "5"]))
+        XCTAssertNotNil(refusal(["probe", "--note", "700", "--abort-at-packet", "5"]))
+        XCTAssertNil(refusal(["next-delete", "--note", "700", "--abort-at-packet", "5"]))
+    }
+
+    func testAnAbortPacketNumberThatIsNotACountIsRefused() {
+        for text in ["0", "-1", "nan", "1.5", "1000001"] {
+            XCTAssertNotNil(
+                refusal(["next-delete", "--note", "700", "--abort-at-packet", text]),
+                "--abort-at-packet \(text) must be refused"
+            )
+        }
+        XCTAssertNil(refusal(["next-delete", "--note", "700", "--abort-at-packet", "40"]))
+    }
+
+    func testNextDeleteSendsDiscoveryStepsInTheAppOrderAndDeletesWithItsTransfer() throws {
+        let invocation = try parse(["next-delete", "--note", "700", "--abort-at-packet", "40"])
+        let steps = try invocation.steps()
+        let transfer = try XCTUnwrap(invocation.transfer())
+
+        // The steps are the app's offline read order — the wildcard note list, then the
+        // page list — so an outcome cannot come from a different sequence of requests
+        // around the transfer.
+        XCTAssertEqual(steps.map(\.request), [0x21, 0x22])
+        XCTAssertEqual(steps.map(\.response), [0xA1, 0xA2])
+        XCTAssertEqual(PenLabFrames.hex(steps[0].frame), "C0210400FFFFFFFFC1")
+        XCTAssertEqual(PenLabFrames.hex(steps[1].frame), "C02208001B000003BC020000C1")
+
+        // The transfer is the app's own `0x23` request with the option byte changed
+        // from 0x02 to 0x01: same everything else.
+        XCTAssertEqual(PenLabFrames.hex(transfer.request), "C0230E0001001B000003BC02000000000000C1")
+        XCTAssertEqual(transfer.abortAtPacket, 40)
+        XCTAssertTrue(transfer.scope.contains("700"), transfer.scope)
+
+        let reading = try XCTUnwrap(
+            PenRequest.offlineData(
+                sectionOwnerId: PenLabFrames.sectionOwnerId(section: 3, owner: 27),
+                noteId: 700,
+                transferOption: .nextAndReserve,
+                compressionOption: .none
+            )
+        )
+        XCTAssertEqual(
+            reading.count,
+            transfer.request.count,
+            "the deleting transfer differs from the reading one only in its option byte"
+        )
+        XCTAssertEqual(
+            Array(reading[5...]),
+            Array(transfer.request[5...]),
+            "the bytes after the option byte must be the same request"
+        )
+        XCTAssertEqual(transfer.request[4], 0x01, "the option byte is NextAndDelete")
+        XCTAssertEqual(reading[4], 0x02)
+    }
+
+    func testACommandExperimentHasNoTransfer() throws {
+        XCTAssertNil(try parse(["delete-note", "--note", "700"]).transfer())
+        XCTAssertNil(try parse(["probe", "--note", "700"]).transfer())
+        XCTAssertNil(try parse(["delete-page", "--note", "700", "--page", "1"]).transfer())
+    }
+
+    /// A hand-built invocation with no note is refused rather than trapping.
+    ///
+    /// `parse` is the only supported constructor and it requires a note, so this cannot
+    /// happen in a run. It is asserted because the alternative is a crash in the one tool
+    /// allowed to delete pen data, on the day it is pointed at hardware.
+    func testAnInvocationWithNoNoteIsRefusedRatherThanTrapping() {
+        let invocation = PenLabInvocation(
+            experiment: .transferDelete,
+            section: 3,
+            owner: 27,
+            notes: [],
+            pages: [],
+            timeout: 15,
+            shouldSend: false,
+            traceURL: nil,
+            abortAtPacket: nil
+        )
+
+        XCTAssertThrowsError(try invocation.steps()) { error in
+            XCTAssertEqual(
+                (error as? PenLabFailure)?.description,
+                "refused: this experiment needs at least one --note"
+            )
+        }
+        XCTAssertThrowsError(try invocation.transfer()) { error in
+            XCTAssertEqual(
+                (error as? PenLabFailure)?.description,
+                "refused: this experiment needs at least one --note"
+            )
+        }
     }
 }

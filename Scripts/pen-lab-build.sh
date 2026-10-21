@@ -2,9 +2,10 @@
 #
 # Build PenLab and assemble the bundle it needs.
 #
-# PenLab is the physical-A1 experiment tool for the two deletion commands the app
-# refuses to frame (`0x25` and `0x27`). It lives in Tests/Hardware/PenLab and is
-# not part of any app target, so no shipped binary can reach it.
+# PenLab is the physical-A1 experiment tool that sends what the app refuses to frame:
+# the two deletion commands (`0x25` and `0x27`) and a `0x23` transfer with the deleting
+# transfer option. It lives in Tests/Hardware/PenLab and is not part of any app target,
+# so no shipped binary can reach it.
 #
 # Usage:
 #   Scripts/pen-lab-build.sh [--configuration release|debug]

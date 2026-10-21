@@ -1,0 +1,51 @@
+run transferOption=nextAndReserve(0x02) cleanup=deleteAfterAcknowledge abortAtPacket=none
+state Scanning for a pen
+state Connecting
+outbound C0012A00000000000000000000000000000000001112312E302E300000000000000000000000322E313800000000C1 command=0x01
+inbound 76 bytes
+state Verifying pen
+outbound C0040000C1 command=0x04
+inbound 70 bytes
+state Reading pen data
+outbound C0210400FFFFFFFFC1 command=0x21
+inbound 16 bytes
+outbound C02208001B000003BC020000C1 command=0x22
+inbound 24 bytes
+outbound C0230E0002001B000003BC02000000000000C1 command=0x23
+inbound 15 bytes
+inbound 509 bytes
+inbound 509 bytes
+inbound 509 bytes
+inbound 509 bytes
+inbound 133 bytes
+outbound C0A4000300010001C1 command=0xA4
+inbound 509 bytes
+inbound 373 bytes
+outbound C0A4000300020000C1 command=0xA4
+state Complete
+state Disconnected
+version text=2.23 name=NWP-F151 firmware=3.00
+note Note 700 · section 3 · owner 27 strokes=18 dots=157 packets=2 listedPages=36,37 infoStrokeCount=18
+page page=36 section=3 owner=27 book=700 strokes=9 dots=77 x=2703..3536 y=661..885
+stroke page=36 index=0 dots=9 x=2784..2819 y=742..873 origin=1792600246393 t=26..142 fp=027b4882e8222cb6
+stroke page=36 index=1 dots=7 x=2703..2895 y=713..749 origin=1792600246680 t=23..92 fp=76b5fb617c856c4f
+stroke page=36 index=2 dots=14 x=2901..3006 y=758..885 origin=1792600246967 t=23..183 fp=8b6145a0641ea9ab
+stroke page=36 index=3 dots=7 x=2888..2988 y=774..827 origin=1792600247261 t=23..92 fp=df43f6f358c45a98
+stroke page=36 index=4 dots=4 x=2928..2980 y=756..774 origin=1792600247420 t=23..69 fp=317eaeabad5f683b
+stroke page=36 index=5 dots=15 x=2998..3111 y=741..881 origin=1792600247574 t=24..185 fp=141aa2521aff504a
+stroke page=36 index=6 dots=8 x=3167..3208 y=748..862 origin=1792600247846 t=23..105 fp=f6fa31d20764e165
+stroke page=36 index=7 dots=6 x=3132..3280 y=710..757 origin=1792600248050 t=24..81 fp=395d1d5dbf39fc72
+stroke page=36 index=8 dots=7 x=3491..3536 y=661..822 origin=1792600248330 t=23..92 fp=c195e14db562307d
+page page=37 section=3 owner=27 book=700 strokes=9 dots=80 x=3499..4289 y=704..858
+stroke page=37 index=0 dots=10 x=3569..3583 y=745..858 origin=1792600249666 t=23..150 fp=17860d2d16c84c7a
+stroke page=37 index=1 dots=7 x=3499..3619 y=730..731 origin=1792600249925 t=24..92 fp=ec151a2e68bf8f27
+stroke page=37 index=2 dots=12 x=3650..3735 y=726..827 origin=1792600250068 t=23..150 fp=c96ceb2caf4ba4cb
+stroke page=37 index=3 dots=6 x=3663..3750 y=737..770 origin=1792600250305 t=23..80 fp=4aa870818ed0d725
+stroke page=37 index=4 dots=3 x=3691..3726 y=731..734 origin=1792600250432 t=24..58 fp=3126b9bb7ba51360
+stroke page=37 index=5 dots=12 x=3789..3878 y=724..837 origin=1792600250538 t=23..163 fp=614e07d9df729d65
+stroke page=37 index=6 dots=9 x=3877..3897 y=731..852 origin=1792600250777 t=23..115 fp=3834372b6bf478b4
+stroke page=37 index=7 dots=6 x=3846..3957 y=714..721 origin=1792600250978 t=23..81 fp=7ce607b1afc2be5c
+stroke page=37 index=8 dots=15 x=4073..4289 y=704..824 origin=1792600251231 t=24..185 fp=7e6b0664a1af2b9e
+result strokes=18 dots=157 pages=2 notes=1
+totals outboundFrames=7 outboundBytes=111 inboundChunks=12 inboundBytes=3252
+outboundCommands 0x01,0x04,0x21,0x22,0x23,0xA4,0xA4

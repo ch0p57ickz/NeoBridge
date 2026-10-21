@@ -20,10 +20,16 @@ import NeoProtocol
 /// | ``exportDirectoryEnvironmentKey`` | Commits the read to the library and publishes files there. | unset; the read stores without exporting |
 /// | ``transferOptionEnvironmentKey`` | The `0x23` transfer option the read sends. | `nextAndReserve` |
 /// | ``cleanupModeEnvironmentKey`` | The cleanup intent the run starts with. | the policy default, cleanup |
+/// | ``confirmCleanupEnvironmentKey`` | Whether the run confirms cleanup for its sync, which is what authorizes a deleting transfer. | unset; not confirmed, so the read is non-destructive |
 /// | ``abortAtPacketEnvironmentKey`` | Drops the link when that `0x24` packet arrives. | unset; the transfer runs to its end |
 ///
 /// A value that cannot be understood is refused rather than ignored, so a run that
 /// was meant to test one option cannot silently test another.
+///
+/// The intent and the confirmation are separate keys on purpose. A deleting transfer
+/// needs both, because the confirmation is the user's act and not a consequence of
+/// intending cleanup: a run that sets only ``cleanupModeEnvironmentKey`` takes the
+/// ordinary non-destructive read, exactly as a person who has not confirmed it does.
 public struct PenAcceptanceOptions: Hashable, Sendable {
     /// The environment variable that selects the headless run and names its
     /// transcript.
@@ -41,6 +47,12 @@ public struct PenAcceptanceOptions: Hashable, Sendable {
     /// The environment variable that chooses the cleanup intent for the run.
     public static let cleanupModeEnvironmentKey = "NEOBRIDGE_ACCEPTANCE_CLEANUP"
 
+    /// The environment variable that confirms cleanup for the run's sync.
+    ///
+    /// It is what authorizes a deleting transfer, and it is a separate key from the
+    /// intent so that asking for the intent cannot silently authorize removal.
+    public static let confirmCleanupEnvironmentKey = "NEOBRIDGE_ACCEPTANCE_CONFIRM_CLEANUP"
+
     /// The environment variable that interrupts the transfer.
     public static let abortAtPacketEnvironmentKey = "NEOBRIDGE_ACCEPTANCE_ABORT_AT_PACKET"
 
@@ -56,6 +68,9 @@ public struct PenAcceptanceOptions: Hashable, Sendable {
     /// The cleanup intent the run starts with.
     public let cleanupMode: PenCleanupMode
 
+    /// Whether the run confirms cleanup for its sync.
+    public let confirmCleanup: Bool
+
     /// The arriving `0x24` packet that drops the link, or `nil` for a full
     /// transfer.
     public let abortAtPacket: Int?
@@ -67,6 +82,12 @@ public struct PenAcceptanceOptions: Hashable, Sendable {
 
         /// The cleanup mode is not one this build has.
         case unknownCleanupMode(String)
+
+        /// The confirmation flag is not a yes or a no.
+        case invalidConfirmCleanup(String)
+
+        /// The run confirmed cleanup while asking to keep the pen's strokes.
+        case confirmationWithoutIntent
 
         /// The packet number is not a positive whole number.
         case invalidAbortAtPacket(String)
@@ -84,6 +105,17 @@ public struct PenAcceptanceOptions: Hashable, Sendable {
                 let accepted = PenCleanupMode.acceptedArguments.joined(separator: ", ")
                 return "\(PenAcceptanceOptions.cleanupModeEnvironmentKey)=\(value)"
                     + " is not a cleanup mode; use one of \(accepted)"
+            case .invalidConfirmCleanup(let value):
+                let accepted = PenAcceptanceOptions.confirmCleanupArguments
+                    .map(\.spelling)
+                    .joined(separator: ", ")
+                return "\(PenAcceptanceOptions.confirmCleanupEnvironmentKey)=\(value)"
+                    + " is not a yes or a no; use one of \(accepted)"
+            case .confirmationWithoutIntent:
+                return "\(PenAcceptanceOptions.confirmCleanupEnvironmentKey) confirms cleanup,"
+                    + " but \(PenAcceptanceOptions.cleanupModeEnvironmentKey) asks to keep the pen's"
+                    + " strokes, so nothing would be confirmed; ask for cleanup or drop the"
+                    + " confirmation"
             case .invalidAbortAtPacket(let value):
                 return "\(PenAcceptanceOptions.abortAtPacketEnvironmentKey)=\(value)"
                     + " is not a packet number; use a positive whole number"
@@ -99,6 +131,7 @@ public struct PenAcceptanceOptions: Hashable, Sendable {
     ///     exporting.
     ///   - transferOption: The `0x23` transfer option the read sends.
     ///   - cleanupMode: The cleanup intent the run starts with.
+    ///   - confirmCleanup: Whether the run confirms cleanup for its sync.
     ///   - abortAtPacket: The arriving `0x24` packet that drops the link, or `nil`
     ///     for a full transfer.
     public init(
@@ -106,12 +139,14 @@ public struct PenAcceptanceOptions: Hashable, Sendable {
         exportDirectory: String? = nil,
         transferOption: OfflineReadTransferOption = .nextAndReserve,
         cleanupMode: PenCleanupMode = .deleteAfterAcknowledge,
+        confirmCleanup: Bool = false,
         abortAtPacket: Int? = nil
     ) {
         self.traceURL = traceURL
         self.exportDirectory = exportDirectory
         self.transferOption = transferOption
         self.cleanupMode = cleanupMode
+        self.confirmCleanup = confirmCleanup
         self.abortAtPacket = abortAtPacket
     }
 
@@ -163,25 +198,81 @@ public struct PenAcceptanceOptions: Hashable, Sendable {
             abortAtPacket = nil
         }
 
+        let confirmCleanup: Bool
+        if let text = Self.value(Self.confirmCleanupEnvironmentKey, in: environment) {
+            guard let confirmed = Self.confirmCleanupArguments
+                .first(where: { $0.spelling == text.trimmingCharacters(in: .whitespaces).lowercased() })
+            else {
+                throw ParseError.invalidConfirmCleanup(text)
+            }
+            confirmCleanup = confirmed.confirmed
+        } else {
+            confirmCleanup = false
+        }
+
+        guard !(confirmCleanup && cleanupMode == .keepOnPen) else {
+            throw ParseError.confirmationWithoutIntent
+        }
+
         self.init(
             traceURL: URL(fileURLWithPath: tracePath),
             exportDirectory: Self.value(Self.exportDirectoryEnvironmentKey, in: environment),
             transferOption: transferOption,
             cleanupMode: cleanupMode,
+            confirmCleanup: confirmCleanup,
             abortAtPacket: abortAtPacket
         )
     }
+
+    /// Every spelling the confirmation key accepts, paired with what it means.
+    ///
+    /// A yes or a no has to be spelled out, because an unreadable value is refused:
+    /// a run that meant to confirm and misspelled it would otherwise take the
+    /// ordinary non-destructive read and look like a successful deleting read.
+    public static let confirmCleanupArguments: [(spelling: String, confirmed: Bool)] = [
+        ("true", true),
+        ("yes", true),
+        ("1", true),
+        ("false", false),
+        ("no", false),
+        ("0", false),
+    ]
 
     /// A variable's value, or `nil` when it is unset or empty.
     ///
     /// An empty value counts as unset rather than as a mistake, because a shell
     /// variable that expanded to nothing did not ask for anything. The `run` line at
-    /// the head of every transcript records the option, cleanup intent, and abort the
-    /// run actually used, so a run that fell back to a default is visible in the
-    /// record even when the operator did not notice the missing value.
+    /// the head of every transcript records the option, cleanup intent, confirmation,
+    /// and abort the run actually used, so a run that fell back to a default is
+    /// visible in the record even when the operator did not notice the missing value.
     private static func value(_ key: String, in environment: [String: String]) -> String? {
         guard let value = environment[key], !value.isEmpty else { return nil }
         return value
+    }
+}
+
+extension PenAcceptanceOptions {
+    /// Applies the run's cleanup choice to a controller.
+    ///
+    /// It goes through the same two calls the menu makes, so a headless run cannot
+    /// reach a state the interface does not have: the intent first, and the
+    /// confirmation — which is what authorizes a deleting transfer — only when the
+    /// run asked for it. A run that sets the intent without confirming therefore
+    /// takes the ordinary non-destructive read, exactly as a person who has not
+    /// confirmed cleanup does.
+    ///
+    /// - Parameter controller: The controller the run will read through.
+    @MainActor
+    public func applyCleanupChoice(to controller: PenSyncController) {
+        switch cleanupMode {
+        case .keepOnPen:
+            controller.retainPenDataForThisSync()
+        case .deleteAfterAcknowledge:
+            controller.intendCleanupForThisSync()
+            if confirmCleanup {
+                controller.confirmCleanupForThisSync()
+            }
+        }
     }
 }
 

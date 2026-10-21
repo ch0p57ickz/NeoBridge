@@ -2,12 +2,14 @@
 
 A menu-bar app that reads offline strokes from a Neo Smartpen A1 over Bluetooth,
 saves them to a durable local library, and writes deterministic page files to a
-folder you choose. Each read intends to remove its verified data from the pen once
-it is saved and its files are written, and you can keep the strokes on the pen for
-one read instead. Deletion is unreachable in this build: the pen's copy is retained
-because the physical A1 trace of 2026-10-20 recorded the deletion scope as unsafe —
-the command the pen accepts removes a note's stored data as a whole, including
-strokes no read had imported.
+folder you choose. Each read intends to remove its verified data from the pen, and
+you can keep the strokes on the pen for one read instead. For the recorded pen
+identity, a read you have confirmed, that requests an export, and that has a
+writable library removes each packet from the pen as it reads it — after the library
+has stored that packet, so what is removed is what is already saved. The
+`0x25`/`0x27` deletion commands are unreachable: the physical A1 trace of 2026-10-20
+recorded that command's deletion scope as unsafe, because the command removes a
+note's stored data as a whole, including strokes no read had imported.
 
 ## What the app is made of
 
@@ -79,11 +81,15 @@ split across two notifications still decodes, and that behavior has a test.
 The inbound stream finishes when the pen disconnects normally and throws when
 the connection is interrupted. A stream that finishes before the session has
 received an end-position packet is an incomplete transfer, never a completed
-result, whichever way the transport classified the disconnect.
+result, whichever way the transport classified the disconnect. A deleting read
+that stops that way is presented as **Partial** rather than as a completion: the
+packets it durably committed stay in the library, and the pen may still hold the
+remainder.
 
 An attempt also releases the pen when it ends, whether it succeeded or failed.
-Disconnecting sends no deletion request: the request used the next-and-reserve
-option, so the strokes stay on the pen. Holding the link would be worse than
+Disconnecting removes nothing itself: an ordinary read sent only a non-destructive
+transfer option, and a deleting read removed exactly the packets it had already
+committed and acknowledged. Holding the link would be worse than
 untidy — a connected pen stops advertising, so the app's own next read would
 report that no pen was found, and the pen would stay unavailable to its other
 owners.
@@ -163,12 +169,17 @@ incremental:
 | --- | --- | --- |
 | `NEOBRIDGE_ACCEPTANCE_TRANSFER_OPTION` | The `0x23` transfer option the read sends: `notNextTransfer`, `nextAndReserve`, or the option byte in decimal or hexadecimal. | `nextAndReserve`, the established non-destructive option |
 | `NEOBRIDGE_ACCEPTANCE_CLEANUP` | The cleanup intent the run starts with: `keepOnPen` or `deleteAfterAcknowledge`, also as `keep` and `cleanup`. The intent is set through the same method the menu calls. | the policy default, cleanup |
+| `NEOBRIDGE_ACCEPTANCE_CONFIRM_CLEANUP` | Whether the run confirms cleanup for its sync, as `true`/`yes`/`1` or `false`/`no`/`0`. The confirmation is what authorizes a deleting transfer, so it is a separate key: asking for the intent alone takes the ordinary non-destructive read. | unset, not confirmed |
 | `NEOBRIDGE_ACCEPTANCE_ABORT_AT_PACKET` | Drops the pen link when that `0x24` packet arrives, so the transfer fails part way on purpose. The packet is not delivered, so the read assembles one fewer packet than the number. | unset, the transfer runs to its end |
 
 A value that cannot be understood is refused: the process prints the accepted
 values and exits 2 rather than running a different experiment than the one asked
-for. `nextAndDelete` (`0x01`) is refused, because the read path may not ask the pen
-to delete during a transfer.
+for. `NEOBRIDGE_ACCEPTANCE_TRANSFER_OPTION=nextAndDelete` (`0x01`) is refused,
+because that key cannot select the deleting option; a deleting run asks for it with
+`NEOBRIDGE_ACCEPTANCE_CLEANUP=cleanup` together with
+`NEOBRIDGE_ACCEPTANCE_CONFIRM_CLEANUP=true`. A confirmation combined with
+`NEOBRIDGE_ACCEPTANCE_CLEANUP=keep` is refused too, because it would confirm
+nothing.
 
 ```bash
 NEOBRIDGE_ACCEPTANCE_TRACE=/tmp/a1-run.txt \
@@ -246,65 +257,109 @@ The pen's copy of a read is the app's third outcome, reported separately from th
 save and the export, because it says nothing about whether the library copy is
 safe.
 
+There are two cleanup routes, and the app can only use one of them:
+
+- The **deleting transfer**, which the app uses. A read that requests an export,
+  has the user's confirmation for that sync, matches the recorded pen identity, and
+  has durable packet storage asks the pen to remove each packet as part of the
+  transfer that reads it. The library commits a packet before the app acknowledges
+  it, so what is removed is what is already stored.
+- The separate **`0x25`/`0x27` deletion commands**, which the app cannot send. The
+  session supplies no deletion sender, so no such frame is built, and the command
+  evidence record's deletion-scope verdict is `unsafe`.
+
 ### What the app intends by default
 
-- Every read intends cleanup. Before a transfer the menu and the window say
-  "Strokes are normally removed from the pen after they are saved and their files
-  are written."
-- The controller keeps two intents: the one the next read will use, and the one the
-  read in flight — or the completed read a **Retry Export** can still finish —
-  already captured. The line under the statement names which of the two is on
-  screen, so the buttons always say what the choice applies to.
+- Every read intends cleanup. The menu and the window show the statement the
+  confirmation is about: "If you confirm cleanup for this read, each packet saved to
+  the local library is removed from the pen when the read acknowledges it. The files
+  requested for this read are exported afterwards; if that export fails, retry it
+  from the local library."
+- Cleanup still needs a confirmation for each sync. The line under the statement
+  names which transfer the choice applies to, so the buttons always say what they
+  apply to.
 - **Keep Strokes on the Pen for This Read** retains the pen's copy for the transfer
   the line names: the retry of a read whose files failed, or the next read. The
   transfer that consumes the choice uses it once, so the default intent is presented
   again afterwards.
-- **Remove Them After a Successful Read** restores the default intent for the same
-  transfer.
-- Neither button appears while a read is running: a running read captured its intent
-  when it started, so a later choice could not reach it. Asking which pen to use is
-  not a read, so a choice made before that question still holds for the pen you pick.
+- **Remove Them After a Successful Read** restores the default cleanup intent for
+  the same transfer.
+- **Remove Acknowledged Packets for This Read** confirms cleanup for one read. It is
+  what authorizes the deleting transfer, it is offered only while cleanup is
+  intended, available, and still unconfirmed, and it is cleared when that read
+  starts, so a later sync cannot inherit it. It is not offered while a completed
+  read's files can still be published again, because a retry publishes from the
+  library and removes nothing.
+- Neither the retain nor the remove button appears while a read is running: a
+  running read captured its intent when it started, so a later choice could not
+  reach it. Asking which pen to use is not a read, so a choice made before that
+  question still holds for the pen you pick. Neither appears after a deleting read
+  whose files still need publishing either: that read removed the packets it stored
+  as it read them, so its **Retry Export** only republishes the durable copy and a
+  choice there could keep nothing.
 
 ### When cleanup actually runs
 
-Cleanup is requested only after the read is stored and published, and only for the
-read's own verified scope:
+A deleting transfer runs only when all four of its preconditions hold. Three of
+them are decided before the app connects, and the fourth — the pen's identity — is
+checked against the handshake:
 
-- The transfer must have completed and committed durably to the library.
-- An export must have published in full. A read whose files failed or only partly
-  published keeps its pen data, and so does a read saved with no export folder
-  chosen: with nothing published, the library copy is the read's only copy, so the
-  pen's copy is retained and the app names the batch's state.
-- The read must have stored at least one page. The app never asks for cleanup of an
-  empty read — it reports that no stroke was found instead — and the library
-  refuses an empty scope as well.
-- The read must be the only one touching its pages: a page that a sync which has
-  not completed also touches is retained, so a later failed note keeps its strokes
-  on the pen even after an earlier note completes.
-- The deletion evidence gate must be open. It is closed in this build, so the pen's
-  copy is retained and the app says why.
+- The sync requests an export. The pen's copy leaves as the read progresses, so the
+  library plus the requested files is the user's path back to the data; a read with
+  no export folder chosen follows the ordinary retention rule instead.
+- The user confirmed cleanup for this sync.
+- The connected pen matches the recorded identity: NWP-F151, firmware 3.00,
+  protocol 2.23, uncompressed. A different identity takes the ordinary
+  non-destructive read and the app names the blocker, because the pen's identity is
+  only known after the handshake.
+- A writable library is available to commit packets to.
 
-### While the gate is closed
+Each packet is committed and flushed before its acknowledgement, so a packet that
+is removed from the pen is already stored. The export happens afterwards, so a
+failed export is retried from the library and never re-reads the pen.
 
-**Cleanup is unavailable** appears while the deletion evidence gate is closed,
-naming the blocking condition, and the read still runs: it saves, publishes, and
-reports the skip. The
-gate is data, not a switch. `PenDeletionEvidence` holds a verdict for each safety
-condition — payload framing, exact deletion scope, response meaning, and
-interrupted-transfer retention — and `PenCleanupPolicy.deletionEnabled` derives
-from those verdicts, so opening the gate is a change to the recorded evidence
-rather than an edit to a boolean. The record this build carries is the physical A1
-trace of 2026-10-20, which settles three conditions and refuses the fourth, so the
-line names the deletion scope. The app never supplies a deletion sender, so no
-deletion frame is built at all.
+A deleting read that ends before its first packet — a dropped link, a refused or
+malformed response, a failed first commit, or a cancel — saved nothing and asked the
+pen for nothing, so it leaves the batch it had opened marked failed. The row stays in
+the library as the record that a read was attempted; it can never publish, because
+publication needs a durable packet. A read that stops after some packets is the
+partial case above, not this one.
+
+The route is enabled. Its evidence comes from the 2026-10-21 runs, which were
+driven by PenLab rather than by this app, and its ordering and refusal behavior are
+covered by the portable tests against fake transports; the app's own end-to-end
+deleting read against a pen is the acceptance run `Tests/Hardware/README.md` still
+lists as outstanding.
+
+The separate `0x25`/`0x27` commands have their own stricter rule — a completed,
+fully published read of the read's own verified scope, with the command evidence
+gate open — and it is not satisfied in this build, so the pen's copy is never
+reclaimed that way.
+
+### While a precondition is missing
+
+**Cleanup is unavailable** appears while the deleting route cannot run, naming the
+missing precondition: no export folder chosen, no writable library, or transfer
+evidence that does not cover the connected pen. The read still runs; it saves,
+publishes, and reports the skip.
+
+The command gate is data, not a switch. `PenDeletionEvidence` holds a verdict for
+each safety condition — payload framing, exact deletion scope, response meaning, and
+interrupted-transfer retention — and `PenCleanupPolicy.deletionEnabled` derives from
+those verdicts, so opening it is a change to the recorded evidence rather than an
+edit to a boolean. The record this build carries is the physical A1 trace of
+2026-10-20, which settles three conditions and refuses the fourth, so the line names
+the deletion scope. The transfer route has its own record,
+`PenDeletingTransferEvidence`, built from the 2026-10-21 runs.
 
 ### What the app reports
 
 | Outcome | What the app says |
 | --- | --- |
 | Retained by choice | "The pen's strokes were kept on the pen because retention was chosen for this read." |
+| Acknowledged packet prefix | "Removed the acknowledged packet prefix from the pen: N acknowledged packets. The library copy remains available.", or, when the read has no recorded completion, "Removed only the acknowledged packet prefix from the pen: …" followed by either "The read stopped before the end, so the pen may still hold the remainder." or, when the transfer reached its last packet, "The transfer reached the last packet, so the pen holds no remainder of it; the read's completion could not be recorded, so it is reported as incomplete." A last acknowledgement that was not confirmed adds that the pen's copy of that packet is uncertain. |
 | Reclaimed | "Reclaimed N pages from the pen. The library copy remains available." |
-| Skipped, with the blocking condition | "The pen kept its strokes: …", naming the gate condition, the export that never published in full, or the missing pen link |
+| Skipped, with the blocking condition | "The pen kept its strokes: …", naming the missing precondition, the command gate condition, the export that never published in full, or the missing pen link |
 | Outstanding | "A deletion request is outstanding: … The library copy is unaffected and the request is not repeated automatically." |
 
 A request whose effect is unknown stays outstanding in the library's journal, and it
@@ -326,14 +381,15 @@ Dock icon, and closing the window leaves the menu-bar item in place.
 | **Cancel Read** | An attempt is running | Stops the scan or the read and returns to idle |
 | A numbered pen entry, such as `Neosmartpen_A1 (pen 1)` | Two or more pens matched | Reads the pen you pick |
 | Result line | A read completed | Shows strokes, dots, and distinct pages, plus a notice of what was saved and written |
-| Cleanup outcome line | A read completed | Says what happened to the pen's copy: retained by choice, reclaimed, skipped with its blocking condition, or outstanding |
+| Cleanup outcome line | A read completed | Says what happened to the pen's copy. A deleting read shows the acknowledged packet prefix, that retention was chosen, or a skip with its blocking condition; the separate command route's reclaimed and outstanding outcomes are the ones this build cannot produce, because no deletion command is sent |
 | Per-file failure line | At least one file could not be written | Names the file and the reason |
 | **Retry Export** | A read saved but a file failed | Republishes the stored read's files |
-| Cleanup statement line | Always | "Strokes are normally removed from the pen after they are saved and their files are written." |
-| Cleanup intent line | Always | Names the intent on screen and what the choice applies to: "Removing the pen's strokes when this read completes.", "Retry Export keeps the pen's strokes.", or "The next read removes the pen's strokes after they are saved." |
-| **Keep Strokes on the Pen for This Read** | No attempt is running and cleanup is the intent on screen | Retains the pen's copy for the transfer the intent line names |
-| **Remove Them After a Successful Read** | No attempt is running and retention is the intent on screen | Restores the default cleanup intent for the transfer the intent line names |
-| Cleanup-unavailable line | The deletion evidence gate is closed | "Cleanup is unavailable: …", naming the condition that is not safe |
+| Cleanup statement line | Always | The statement the confirmation is about: "If you confirm cleanup for this read, each packet saved to the local library is removed from the pen when the read acknowledges it. The files requested for this read are exported afterwards; if that export fails, retry it from the local library." |
+| Cleanup intent line | Always | Names the intent on screen and what the choice applies to: "Removing each acknowledged packet from the pen as this read progresses.", "Keeping the pen's strokes for this read; cleanup was not confirmed.", "Retry Export publishes files from the library and removes nothing from the pen.", "The next read can remove acknowledged packets once you confirm cleanup for it.", or the same line with "keeps the pen's strokes" when retention was chosen or cleanup is unavailable |
+| **Keep Strokes on the Pen for This Read** | No attempt is running, cleanup is the intent on screen, and no deleting read's retry is pending | Retains the pen's copy for the transfer the intent line names |
+| **Remove Them After a Successful Read** | No attempt is running, retention is the intent on screen, and no deleting read's retry is pending | Restores the default cleanup intent for the transfer the intent line names |
+| **Remove Acknowledged Packets for This Read** | No attempt is running, cleanup is intended and available, this sync is not yet confirmed, and no deleting read's retry is pending | Confirms cleanup for one read, which is what authorizes the deleting transfer |
+| Cleanup-unavailable line | The deleting route cannot run | "Cleanup is unavailable: …", naming the missing precondition: no export folder chosen, no writable library, or transfer evidence that does not cover the connected pen |
 | **Choose Export Folder…** | Always | Picks the folder page files are written into and remembers it |
 | Export-folder line | Always | Shows the chosen folder, or that no folder is chosen |
 | Failure line | A read failed | Shows the human-readable error |
@@ -355,21 +411,25 @@ The window shows one state at a time.
 | Writing export files | A spinner and the publication step |
 | Choose a pen | One button per matching pen, numbered rather than addressed |
 | Complete | Strokes, dots, and distinct pages; the notes read; a notice of what was saved and written; what happened to the pen's copy; and one line per file with its result (written, already up to date, or failed) |
+| Partial | The same counts and lines as Complete, for a deleting read with no recorded completion: the notice says whether the read stopped before the end and the pen may still hold the remainder, or that the transfer reached its last packet and the completion could not be recorded |
 | Failed | The error, a diagnostic when a transfer stopped after some packets, and a statement that no counts are shown because the read did not complete |
 
-Partial counts are diagnostics only. A transfer that stops early is presented as
-a failure, so a partial read is never labelled a completed sync. Retry is the
-same **Read and Save Pen Data** command: every attempt builds a new transport and
-a new session, so a retry starts a new scan rather than resuming the old one.
+A partial read is never labelled a completed sync. An ordinary transfer that stops
+early is presented as a failure; a deleting read that stops early is presented as
+**Partial**, because what it holds is the durable prefix it acknowledged while the
+pen may still hold the rest. In both cases the partial counts are diagnostics
+rather than a result. Retry is the same **Read and Save Pen Data** command: every
+attempt builds a new transport and a new session, so a retry starts a new scan
+rather than resuming the old one.
 
 ## What this version does not do
 
-- No deletion. Cleanup is the intent, but the pen's copy is retained: the session
-  sends no `0x25` or `0x27` command, the evidence table gates both behind the
+- No `0x25` or `0x27` deletion command. The session supplies no deletion sender,
+  so no such frame is built, the evidence table gates both behind the command
   deletion evidence, and `PenCleanupPolicy.deletionEnabled` derives from that
-  evidence, whose recorded deletion-scope verdict is `unsafe`. The app supplies no
-  deletion sender, so no deletion frame is built. Strokes stay on the pen after a
-  read, and the app says why.
+  evidence, whose recorded deletion-scope verdict is `unsafe`. The deleting transfer
+  is the only route the app has, and it removes only the packets the library has
+  already stored.
 - No connection codes or authentication beyond the SDK's default sixteen zero
   bytes. A pen that rejects that code fails with a clear message, and the app
   does not guess another.

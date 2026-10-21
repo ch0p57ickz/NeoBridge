@@ -67,6 +67,7 @@ enum PenSyncAppComposition {
         let destination: any PenExportDestinationProviding = exportDirectory.map {
             FixedExportDestination(directory: $0)
         } ?? BookmarkedExportDestination()
+        let library = makeLibrary()
 
         return PenSyncController(
             runners: PenSyncRunnerFactory { selection in
@@ -74,33 +75,47 @@ enum PenSyncAppComposition {
                     central: central,
                     selection: selection,
                     transferOption: acceptance?.transferOption ?? .nextAndReserve,
+                    packetBarrier: library.deletingReadStorage.barrier,
                     abortAtPacket: acceptance?.abortAtPacket,
                     trace: trace
                 )
             },
-            library: makeLibrary(),
-            destination: destination
+            library: library.coordinator,
+            destination: destination,
+            deletingReadStorage: library.deletingReadStorage
         )
     }
 
-    /// Opens the durable library, or a coordinator that reports why it could not.
-    private static func makeLibrary() -> any PenImportCoordinator {
+    /// Opens the durable library, or an assembly that reports why it could not.
+    private static func makeLibrary() -> PenLibraryAssembly {
         let url: URL
         do {
             url = try PenLibraryComposition.defaultLibraryURL()
         } catch {
-            return UnavailableImportCoordinator(
-                libraryPath: "Application Support/NeoBridge/library.sqlite",
+            return unavailableAssembly(
+                path: "Application Support/NeoBridge/library.sqlite",
                 reason: String(describing: error)
             )
         }
 
         do {
-            return try PenLibraryComposition.makeImporter(libraryURL: url)
+            return try PenLibraryComposition.makeAssembly(libraryURL: url)
         } catch {
             let message = (error as? StorageError)?.message ?? String(describing: error)
-            return UnavailableImportCoordinator(libraryPath: url.path, reason: message)
+            return unavailableAssembly(path: url.path, reason: message)
         }
+    }
+
+    /// An assembly whose coordinator refuses every read and whose deleting route
+    /// is closed, for a library that could not be opened.
+    private static func unavailableAssembly(path: String, reason: String) -> PenLibraryAssembly {
+        PenLibraryAssembly(
+            coordinator: UnavailableImportCoordinator(libraryPath: path, reason: reason),
+            deletingReadStorage: PenDeletingReadStorage(
+                barrier: nil,
+                unavailableReason: reason
+            )
+        )
     }
 }
 

@@ -1,23 +1,38 @@
+import NeoCore
+
 /// How the pen should treat the note after a `0x23` transfer completes.
 ///
 /// Values come from `REQ.OfflineTransOption` in Neo iOS SDK 3.0
 /// (`NISDK3/Classes/Model/RequestStruct.swift`).
 ///
 /// The enum carries every value the SDK defines, including the deleting one, so
-/// the wire table stays complete. It is not what the read path sends: the session
-/// sends an ``OfflineReadTransferOption``, which has no deleting member, so a
-/// `0x23` request the session builds can never ask the pen to delete during the
-/// transfer.
+/// the wire table stays complete. It is not what the ordinary read sends: that
+/// path sends an ``OfflineReadTransferOption``, which has no deleting member, so
+/// the request it builds cannot ask the pen to delete during the transfer. The
+/// deleting value is reachable only through the authorization-taking overload
+/// ``PenRequest/offlineData(for:deletingRead:)``.
 public enum OfflineTransferOption: UInt8, Hashable, Sendable {
     /// `NotNextTransfer` (0): leave the note's data untouched.
     case notNextTransfer = 0
 
     /// `NextAndDelete` (1): delete the note's data after the transfer.
     ///
-    /// Excluded from the read path by ``OfflineReadTransferOption``. Deleting
-    /// during the transfer would remove the pen's copy before the host has
-    /// committed anything, so the deletion this build can perform travels on the
-    /// acknowledged path instead.
+    /// Not a member of ``OfflineReadTransferOption``, so the ordinary read cannot
+    /// send it. The deleting read reaches it through
+    /// ``PenRequest/offlineData(for:deletingRead:)`` and only with a
+    /// ``PenDeletingReadAuthorization``, because deleting during the transfer
+    /// without a commit before each acknowledgement would remove the pen's copy
+    /// before the host had stored it. The deleting read commits a packet before
+    /// acknowledging it, which is what bounds the removal to data the host already
+    /// holds.
+    ///
+    /// A physical A1 trace on 2026-10-21 measured what the option actually does: an
+    /// aborted transfer leaves about one packet's worth of what the pen had already
+    /// handed over on the pen, and a completed transfer removes the note itself. The
+    /// invariant a host can rely on is that the pen hands over a packet only after the
+    /// previous acknowledgement, so what it removes is bounded by what the host has
+    /// acknowledged. See "Deleting transfer option, 2026-10-21" in
+    /// `docs/protocol-a1.md`.
     case nextAndDelete = 1
 
     /// `NextAndReserve` (2): keep the note's data so a later read still finds it.
@@ -26,9 +41,11 @@ public enum OfflineTransferOption: UInt8, Hashable, Sendable {
 
 /// The `0x23` transfer options the offline read path may send.
 ///
-/// The type exists so the read path has no route to a deleting option: it has no
-/// `nextAndDelete` member, so `PenRequest.offlineData(for:)` cannot be asked to
-/// delete during a transfer even by a mistake at a call site.
+/// The type exists so the ordinary read has no route to a deleting option: it has
+/// no `nextAndDelete` member, so this type cannot be asked to delete during a
+/// transfer even by a mistake at a call site. The deleting read is the separate
+/// overload that takes a ``PenDeletingReadAuthorization``, which only the cleanup
+/// policy creates.
 ///
 /// Two physical A1 reads on 2026-10-19 established the non-destructive behavior
 /// of ``nextAndReserve``: a second read of note 700 returned all 8062 strokes
@@ -178,8 +195,9 @@ public enum PenRequest {
 
     /// Builds the `0x23` request for a discovered note.
     ///
-    /// The transfer option is an ``OfflineReadTransferOption``, so the read path
-    /// cannot ask the pen to delete during the transfer. The default is
+    /// The transfer option is an ``OfflineReadTransferOption``, so this overload
+    /// cannot ask the pen to delete during the transfer; the deleting route is the
+    /// separate overload that takes an authorization. The default is
     /// `nextAndReserve`: the physical A1 kept every stroke across two reads with
     /// that option, which establishes its non-destructive behavior. No trace has
     /// established an option that returns only new strokes, so this is the
@@ -198,6 +216,33 @@ public enum PenRequest {
             noteId: note.note,
             transferOption: transferOption.option,
             compressionOption: compressionOption
+        )
+    }
+
+    /// Builds the deleting `0x23` request for a discovered note.
+    ///
+    /// The deleting option is not reachable from ``OfflineReadTransferOption``, so
+    /// this overload is the only route to `0x01` in the read path. It takes a
+    /// ``PenDeletingReadAuthorization``, which only
+    /// ``PenCleanupPolicy/deletingReadAuthorization(pen:requestedExport:confirmedForThisSync:durablePacketStorageAvailable:)``
+    /// creates, so a request cannot be built for an unconfirmed or
+    /// evidence-less read.
+    ///
+    /// The compression option is always `none`: the recorded 2026-10-21 trace
+    /// measured an uncompressed response, and a compressed packet is refused by
+    /// the transfer assembler before it could be acknowledged.
+    ///
+    /// Source of the behavior: `docs/protocol-a1.md`, "Deleting transfer option,
+    /// 2026-10-21".
+    public static func offlineData(
+        for note: PenOfflineNote,
+        deletingRead authorization: PenDeletingReadAuthorization
+    ) -> [UInt8]? {
+        return offlineData(
+            sectionOwnerId: note.sectionOwnerId,
+            noteId: note.note,
+            transferOption: .nextAndDelete,
+            compressionOption: .none
         )
     }
 

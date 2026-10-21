@@ -106,18 +106,21 @@ transcript, so it can be kept. Raw captures still belong in
 
 ### Varying the attempt
 
-Three more environment variables vary how the headless run reads the pen, so one
-built binary runs the transfer-option experiment and the interrupted-transfer case
-as well as an ordinary read:
+Four more environment variables vary how the headless run reads the pen, so one
+built binary runs the transfer-option experiment, the interrupted-transfer case,
+and the app's own deleting read as well as an ordinary read:
 
 | Variable | Effect | Default |
 | --- | --- | --- |
 | `NEOBRIDGE_ACCEPTANCE_TRANSFER_OPTION` | The `0x23` transfer option: `notNextTransfer`, `nextAndReserve`, or the option byte in decimal or hexadecimal. | `nextAndReserve` |
 | `NEOBRIDGE_ACCEPTANCE_CLEANUP` | The cleanup intent: `keepOnPen` or `deleteAfterAcknowledge`, also as `keep` and `cleanup`. | the policy default, cleanup |
+| `NEOBRIDGE_ACCEPTANCE_CONFIRM_CLEANUP` | Whether the run confirms cleanup for its sync: `true`/`yes`/`1` or `false`/`no`/`0`. | unset, not confirmed, so the read is non-destructive |
 | `NEOBRIDGE_ACCEPTANCE_ABORT_AT_PACKET` | Drops the pen link when that `0x24` packet arrives, so the transfer fails part way. The packet is not delivered, and the transcript's abort line reports exactly how many packets were dropped, so the read's assembled count is never left to be inferred. | unset |
 
 A value that cannot be understood exits 2 with the accepted values rather than
-running a different experiment than the one asked for.
+running a different experiment than the one asked for. That includes a
+confirmation combined with `keep`, which would confirm nothing: intending cleanup
+is not the same act as confirming it, so a run needs both keys to delete.
 
 > **Careful with `notNextTransfer`.** It is kept in the checklist because tasks 1.1
 > and 1.3 need it, but the 2026-10-19 run recorded it as transferring nothing: the
@@ -330,19 +333,74 @@ archived under `Tests/Fixtures/raw/acceptance-2026-10-19-transfer-option/`.
 | An interrupted transfer loses nothing | `PenSessionTests`, `BluetoothPenSyncRunnerTests` | A read that stops before the end packet is followed by a read that returns every stroke, including any no read has imported yet | **Pass.** `opt02-abort` failed after 99 assembled packets; `opt02-abort-recovery` returned all 8,092 identities, including the 5 that no read had imported. |
 | Neither option deletes | `PenSessionTests` | No `0x25` or `0x27` appears in any transcript of the experiment | **Pass.** Every transcript's `outboundCommands` line lists only `0x01`, `0x04`, `0x21`, `0x22`, `0x23`, and `0xA4`. |
 
-## pen cleanup
+## Deleting transfer acceptance (deleting transfer option, 2026-10-21)
 
-These rows need a real A1 **and** the deletion evidence gate open. The gate is
-closed in this build, and the 2026-10-20 deletion experiment is why: it traced a
-deletion command's payload framing, scope, response meaning, and
-interrupted-transfer retention, and it recorded the **deletion scope** as unsafe
-rather than pending. A deletion request cannot be sent by the app, so the rows that
-need one stay unchecked.
+The cleanest way to delete after a sync would be to let the pen remove data as part of the
+transfer that reads it. This run measured what that costs: `0x23` with `NextAndDelete`
+(`0x01`), driven by PenLab's `next-delete` experiment, once to its end packet and twice
+aborted before it, then repeated against fresh handwriting with the lab recording each
+withheld packet's own size. The run, the frames, the counts, and the conclusions are in the
+"Deleting transfer option, 2026-10-21" section of `docs/protocol-a1.md`; the baseline reads,
+the transcripts, the read that followed each run, and library snapshots from before and after
+are archived under `Tests/Fixtures/raw/acceptance-2026-10-21-next-delete/` and
+`Tests/Fixtures/raw/acceptance-2026-10-21-next-delete-rerun/`.
 
 | Scenario | Automated coverage | The hardware run must confirm | Pass / Fail |
 | --- | --- | --- | --- |
-| Default cleanup after a verified import and export | `OfflineSessionIntegrationTests`, `PenLibraryImporterTests` | The pen receives exactly one deletion command for the read's own pages, and its response is proven to mean that scope was removed | **Unverified.** The gate is closed, so the app sends no deletion. The lab's own `0x25` run confirmed the response means a completed removal, and it is recorded in `docs/protocol-a1.md`. |
-| Library and published copies survive deletion | `OfflineSessionIntegrationTests`, `FilePublicationTests` | Every deleted page is still readable in the library and can be published again | **Partly verified.** The lab's delete removed note 700's 22 pages from the pen, and the library snapshots taken before and after it both list all 22, so the deleted data is still readable and the earlier exports still exist. Publishing a deleted page again from the app is untested, because the app's cleanup path still cannot run. |
+| The deleting option is accepted and streams like a read | `PenLabInvocationTests` pins the frame; `DeletingReadSessionTests` pins that option `0x01` is unreachable without all four preconditions; `DeletingReadIntegrationTests` drives the option over the real library | The `0xA3` info arrives with error code 0 and one `0x24` packet follows each acknowledgement | **Pass.** The first experiment's three runs answered `0xA3` with `error=0x00`, `compressed=false`, and streamed one packet per acknowledgement; each info reported the inventory the read before it had measured (346, 250, 150), which is what the pen held when the transfer started. The re-run's three answered 18, 18, and 5 the same way. |
+| Removal trails the transfer | `DeletingReadSessionTests` pins the commit-before-acknowledgement order this row measures the pen's half of | A packet whose acknowledgement is withheld is still on the pen when it is read | **Pass.** Withholding packet 10's acknowledgement left 250 of the pen's 346 strokes; withholding packet 11's left 150 of 250. Both removals are smaller than what the pen had already sent — about one packet's worth, 14 strokes and then 12 — which is consistent with the withheld packet's data remaining. Those transcripts carry no per-packet counts, which is what the re-run row below fixes. |
+| A completed transfer removes the note | none | The read afterwards finds the note gone | **Pass.** The full run received 15 packets, 150 strokes, `complete=true`, `stopSent=true`, and the read afterwards reported `strokes=0 dots=0 pages=0 notes=0`. |
+| An abandoned deleting transfer leaves the pen usable | none | A later `0x23` is accepted without a power cycle | **Pass.** The run after each abort was accepted immediately. `notNextTransfer` on 2026-10-19 was not: it left the pen refusing every `0x23` until it was switched off and on. |
+| Removal equals the acknowledged prefix | `DeletingReadIntegrationTests` pins that each packet is durable before its acknowledgement; the pen's own removal bound is what this row measures | Acknowledging a packet removes that packet's strokes and nothing more, measured with the packet's own size recorded | **Pass (re-run).** With no acknowledgement, the pen kept all 18 strokes it had begun to hand over. Acknowledging one packet whose recorded size was 13 strokes took the pen's inventory from 18 to 5, and the packet the pen had sent but not had acknowledged stayed. Because the pen sends a packet only after the previous acknowledgement, this is the invariant a streaming commit relies on: `Tests/Fixtures/raw/acceptance-2026-10-21-next-delete-rerun/`. |
+| An abort that cannot fire fails loudly | `PenLabInvocationTests` pins the option and the abort number; the refusal path itself needs a pen | A requested abort that never happens is reported, not passed off as success | **Pass (re-run).** `--abort-at-packet 999` completed the transfer, acknowledged every packet including the Stop, printed `the abort at packet 999 never happened: the transfer completed after 1 packet(s), so every packet was acknowledged and the pen removed everything it sent`, and exited 1. The read afterwards found the pen empty, which is what the message says happened. |
+| The library and its exports are unaffected | `OfflineSessionIntegrationTests`, `FilePublicationTests` | The library holds every stroke the pen removed, and the published files stay readable | **Pass.** In the first experiment, snapshots taken before the runs and after them (archived beside the transcripts) hold the same 23 pages, 8,438 strokes, and 88,175 points, and every stroke the pen held while the runs deleted from it stayed readable: the 150 the pen held after the second abort are among page 37's 252 strokes, as are the 250 it held after the first, and page 36's 266 include the 94 it held. The re-run added the 18 strokes written for it (8,456 strokes and 88,332 points after, page 36 at 275 and page 37 at 261) and lost none of them: the pen kept 5 of page 37's 9, and page 36's 9 are among the library's 275. The read after each full transfer found nothing, so it saved nothing. Every page the pen removed, including all of note 700, is still readable and still exported under `~/Junk/NeoBridge`. |
+
+Sending `0x01` deletes pen data during the transfer, so the app sends it only under the
+transfer record: for the recorded pen identity, with a requested export, a confirmation
+for that sync, and durable packet storage, committing each packet before acknowledging
+it. The two deletion commands stay out of reach — the command gate is closed on scope.
+This experiment measured the option and did not change the command gate; it is the
+evidence behind the transfer route's own record.
+
+### The app's own deleting read (task 4.4)
+
+Every row above was driven by PenLab, which frames the option itself. No run has
+exercised the app's own end-to-end deleting read against a pen yet, so this is the
+run that closes that gap. It needs the pen seeded with known content and the four
+preconditions satisfied, which the headless path takes from its environment:
+
+```bash
+NEOBRIDGE_ACCEPTANCE_TRACE=/tmp/a1-deleting.txt \
+NEOBRIDGE_EXPORT_DIRECTORY=/tmp/a1-deleting-exports \
+NEOBRIDGE_ACCEPTANCE_CLEANUP=cleanup \
+NEOBRIDGE_ACCEPTANCE_CONFIRM_CLEANUP=true \
+  Apps/NeoBridgeMac/.build/bundle/NeoBridgeMac.app/Contents/MacOS/NeoBridgeMac
+```
+
+`NEOBRIDGE_ACCEPTANCE_CLEANUP=cleanup` on its own sets the intent and leaves the
+confirmation unset, which takes the ordinary non-destructive read. The transcript's
+`run` line records both, so a run that did not confirm is visible as one that kept
+the pen's copy. The run must confirm that a `packetCommitDurable` line follows each
+packet's commit and precedes its `0xA4`, that no `0x25` or `0x27` appears, that a
+read afterwards retains the unacknowledged remainder, and that the pen answers
+without a power cycle. Commit timing is measured at the same time: how long the pen
+tolerates between its packet and the host's acknowledgement is still an open
+question, and no portable test can answer it.
+
+## pen cleanup
+
+These rows need a real A1 **and** the command deletion evidence gate open. That gate
+is closed in this build, and the 2026-10-20 deletion experiment is why: it traced a
+deletion command's payload framing, scope, response meaning, and
+interrupted-transfer retention, and it recorded the **deletion scope** as unsafe
+rather than pending. A separate deletion command cannot be sent by the app, so the
+rows that need one stay unchecked. The deleting transfer is a different route, with
+its own evidence record and its own rows in the section above.
+
+| Scenario | Automated coverage | The hardware run must confirm | Pass / Fail |
+| --- | --- | --- | --- |
+| Default cleanup after a verified import and export | `OfflineSessionIntegrationTests`, `PenLibraryImporterTests` | The pen receives exactly one deletion command for the read's own pages, and its response is proven to mean that scope was removed | **Unverified.** The command gate is closed, so the app sends no deletion command. The lab's own `0x25` run confirmed the response means a completed removal, and it is recorded in `docs/protocol-a1.md`. |
+| Library and published copies survive deletion | `OfflineSessionIntegrationTests`, `FilePublicationTests` | Every deleted page is still readable in the library and can be published again | **Partly verified.** The lab's delete removed note 700's 22 pages from the pen, and the library snapshots taken before and after it both list all 22, so the deleted data is still readable and the earlier exports still exist. Publishing a deleted page again from the app is untested, because the app's command cleanup path still cannot run. |
 | Newer unverified strokes are untouched | `PenLibraryImporterTests`, `OfflineSessionIntegrationTests` | Strokes written after the read, on the same page or note, remain on the pen | **Fail.** A mark was written on page 1 of note 700 and left unread, so the page held delivered strokes and an undelivered one together. After the command, page 1 was gone from the pen with both. The note-scoped command removes a note's stored data as a whole, and the pen refuses the page-scoped command (`0x27` → `0x05`), so no command it accepts can leave newer strokes behind. This is the row that closes the gate. |
 | Retaining mode sends no deletion through the whole stack | `PenSessionTests`, `PenLibraryImporterTests`, `NeoBridgeMacCoreTests` | A headless retaining run's `outboundCommands` line contains no `0x25` or `0x27` | **Pass.** The retaining run recorded `cleanup=keepOnPen` on its `run` line, completed with 8,092 strokes and 0 duplicates, and its `outboundCommands` line lists only `0x01`, `0x04`, `0x21`, `0x22`, `0x23`, and `0xA4`. |
 
@@ -372,9 +430,21 @@ LAB=Tests/Hardware/PenLab/.build/bundle/PenLab.app/Contents/MacOS/PenLab
 The invocation is:
 
 ```text
-PenLab <probe|delete-note|delete-page> [--section n] [--owner n] [--note n] [--page n]
-       [--trace path] [--timeout seconds] [--send]
+PenLab <probe|delete-note|delete-page|next-delete> [--section n] [--owner n]
+       [--note n] [--page n] [--abort-at-packet n] [--trace path]
+       [--timeout seconds] [--send]
 ```
+
+`next-delete` is the one experiment that does not send a single frame and wait: it sends
+`0x23` with the deleting transfer option (`0x01`) and drives the transfer, acknowledging
+each `0x24` packet and answering the end packet with Stop. It sends the app's offline read
+order first — `0x21` with the section-owner wildcard, then `0x22` for the note — so the
+requests around the transfer are the app's, apart from the app's `0x04` pen-state step and
+a section owner the app resolves from the note list and the lab takes from the command
+line. `--abort-at-packet n` withholds the acknowledgement for packet `n` and closes the
+link, which is how a run sees what an interrupted deleting transfer leaves behind. An
+abort that never fires — a packet number past the transfer's length — is a failure, not a
+quiet success: every packet was acknowledged, so the pen removed everything it sent.
 
 Nothing is sent without `--send`; without it the tool prints the frames it would send
 and stops. The tool never reads the pen first, so it cannot check that its target
@@ -382,12 +452,26 @@ exists — it removes what it is told to remove, or reports the pen's refusal. I
 transcript names the subject of each step, and it records a payload only for an
 `0xA5` or `0xA7` answer, because the version response carries the pen's Bluetooth
 address. The exit status is 0 when every step was answered with error code 0, 1 when
-a step was refused or went unanswered, and 2 for a refused invocation.
+a step was refused or went unanswered or a requested abort never fired, and 2 for a
+refused invocation. An aborted `next-delete` run exits 0: the abort is the experiment,
+and the transcript says which packet went unacknowledged and what the transfer had
+carried by then.
 
-The 2026-10-20 transcripts are archived under
-`Tests/Fixtures/raw/acceptance-2026-10-20-deletion/`, and the run, the frames, and the
-verdicts are recorded in the "Deletion experiment, 2026-10-20" section of
-`docs/protocol-a1.md`.
+Nothing shows what a deleting transfer or a deletion command removed except a read
+afterwards, which is the app's acceptance mode rather than a lab step:
+
+```bash
+NEOBRIDGE_ACCEPTANCE_TRACE=/tmp/a1-after.txt \
+  Apps/NeoBridgeMac/.build/bundle/NeoBridgeMac.app/Contents/MacOS/NeoBridgeMac
+```
+
+The transcripts are archived per experiment:
+`Tests/Fixtures/raw/acceptance-2026-10-20-deletion/` for the two commands,
+`Tests/Fixtures/raw/acceptance-2026-10-21-next-delete/` for the deleting transfer
+option, and `Tests/Fixtures/raw/acceptance-2026-10-21-next-delete-rerun/` for the
+re-run that recorded the per-packet counts. Each experiment's run, frames, and
+conclusions are recorded in `docs/protocol-a1.md` — "Deletion experiment, 2026-10-20"
+and "Deleting transfer option, 2026-10-21".
 
 ## After the run
 

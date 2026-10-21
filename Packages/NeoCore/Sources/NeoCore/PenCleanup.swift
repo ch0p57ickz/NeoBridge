@@ -231,6 +231,267 @@ public struct PenDeletionEvidence: Hashable, Sendable {
     }
 }
 
+/// The pen identity a deleting transfer's evidence was recorded against.
+///
+/// A transfer verdict is only ever about the pen and response shape a trace
+/// measured. An identity that differs in any field — an unknown model, a new
+/// firmware, another protocol version, or a compressed response — is not covered
+/// by the record, so the route closes rather than extending the record by
+/// assumption.
+public struct PenDeletingTransferIdentity: Hashable, Sendable, Codable {
+    /// The pen's advertised device name.
+    public let deviceName: String
+
+    /// The pen's firmware version string.
+    public let firmwareVersion: String
+
+    /// The protocol version text the pen reported.
+    public let protocolVersion: String
+
+    /// Whether the transfer's `0x24` packets were compressed.
+    public let isCompressed: Bool
+
+    public init(
+        deviceName: String,
+        firmwareVersion: String,
+        protocolVersion: String,
+        isCompressed: Bool
+    ) {
+        self.deviceName = deviceName
+        self.firmwareVersion = firmwareVersion
+        self.protocolVersion = protocolVersion
+        self.isCompressed = isCompressed
+    }
+
+    /// The identity the 2026-10-21 physical A1 trace recorded.
+    ///
+    /// `docs/protocol-a1.md`, "Deleting transfer option, 2026-10-21": pen model
+    /// `NWP-F151`, firmware `3.00`, reported protocol version `2.23`, and every
+    /// transfer `compressed=false`.
+    public static let physicalA1_2026_10_21 = PenDeletingTransferIdentity(
+        deviceName: "NWP-F151",
+        firmwareVersion: "3.00",
+        protocolVersion: "2.23",
+        isCompressed: false
+    )
+
+    /// A short phrase naming the identity, for a message.
+    public var summary: String {
+        "\(deviceName) firmware \(firmwareVersion) protocol \(protocolVersion)"
+            + (isCompressed ? " compressed" : " uncompressed")
+    }
+}
+
+/// The evidence gate behind the deleting `0x23` transfer route.
+///
+/// It mirrors ``PenDeletionEvidence`` but for the transfer option: the record
+/// carries the identity it was measured against plus one verdict per
+/// ``PenDeletionCondition``, so the route opens only when every condition is
+/// `safe` *and* the connected pen matches the recorded identity exactly.
+public struct PenDeletingTransferEvidence: Hashable, Sendable {
+    /// The identity the trace was recorded against, or `nil` while unsettled.
+    public let identity: PenDeletingTransferIdentity?
+
+    private let verdicts: [PenDeletionCondition: PenDeletionEvidence.Verdict]
+
+    /// Creates a record.
+    ///
+    /// - Parameters:
+    ///   - identity: The pen and response shape the trace measured, or `nil`.
+    ///   - verdicts: One verdict per condition. A condition left out is `pending`.
+    public init(
+        identity: PenDeletingTransferIdentity? = nil,
+        verdicts: [PenDeletionCondition: PenDeletionEvidence.Verdict] = [:]
+    ) {
+        self.identity = identity
+        self.verdicts = verdicts
+    }
+
+    /// The record a build with no physical deleting-transfer trace holds.
+    public static let unestablished = PenDeletingTransferEvidence()
+
+    /// The record the physical A1 trace of 2026-10-21 establishes.
+    ///
+    /// `docs/protocol-a1.md`, "Deleting transfer option, 2026-10-21", settles
+    /// every condition against `NWP-F151` firmware `3.00` protocol `2.23` with
+    /// uncompressed packets:
+    ///
+    /// - the SDK's option `0x01` formed the documented `0x23` request and the
+    ///   `0xA3` accepted it with error `0x00`, `compressed=false`, and one `0x24`
+    ///   per `0xA4`, so `payloadFraming` is `safe`;
+    /// - with packet 1 withheld the pen removed nothing while 13 strokes had been
+    ///   handed over, and acknowledging that 13-stroke packet took the inventory
+    ///   from 18 to 5 — exactly the acknowledged prefix — so `deletionScope` is
+    ///   `safe` for the acknowledgement-bounded scope;
+    /// - `0xA3` error `0x00` proved acceptance of the request rather than
+    ///   completed removal, and the paired reads measured the resulting inventory,
+    ///   so `responseMeaning` is `safe`;
+    /// - each aborted run left the unacknowledged remainder readable and the next
+    ///   normal read was accepted without a power cycle, so
+    ///   `interruptedTransferRetention` is `safe`.
+    ///
+    /// What the trace does *not* settle is the pen's internal removal trigger;
+    /// the acknowledgement bound is what the record authorizes, never an
+    /// unproven trigger.
+    public static let physicalTrace2026_10_21 = PenDeletingTransferEvidence(
+        identity: .physicalA1_2026_10_21,
+        verdicts: [
+            .payloadFraming: .safe,
+            .deletionScope: .safe,
+            .responseMeaning: .safe,
+            .interruptedTransferRetention: .safe
+        ]
+    )
+
+    /// The verdict recorded for a condition.
+    public func verdict(for condition: PenDeletionCondition) -> PenDeletionEvidence.Verdict {
+        verdicts[condition] ?? .pending
+    }
+
+    /// Whether every condition is `safe` and an identity is recorded.
+    public var isSafe: Bool {
+        guard identity != nil else { return false }
+        return PenDeletionCondition.allCases.allSatisfy { verdict(for: $0).permitsDeletion }
+    }
+
+    /// The conditions that are not `safe`, in the canonical order.
+    public var blockingConditions: [PenDeletionCondition] {
+        PenDeletionCondition.allCases.filter { !verdict(for: $0).permitsDeletion }
+    }
+
+    /// Whether the record authorizes a transfer against this identity.
+    public func authorizes(_ candidate: PenDeletingTransferIdentity) -> Bool {
+        isSafe && identity == candidate
+    }
+
+    /// Why the record refuses a transfer against this identity, or `nil` when it
+    /// authorizes one.
+    ///
+    /// - Parameter candidate: The identity the connected pen reported.
+    public func refusal(for candidate: PenDeletingTransferIdentity) -> String? {
+        var reasons: [String] = []
+        guard let recorded = identity else {
+            reasons.append("no trace has established the deleting transfer's behavior")
+            return "the deleting-transfer evidence gate is closed: " + reasons.joined(separator: "; ")
+        }
+        if recorded != candidate {
+            reasons.append(
+                "the recorded trace covers \(recorded.summary), not \(candidate.summary)"
+            )
+        }
+        for condition in blockingConditions {
+            reasons.append("\(condition.summary) is \(verdict(for: condition).rawValue)")
+        }
+        guard !reasons.isEmpty else { return nil }
+        return "the deleting-transfer evidence gate is closed: " + reasons.joined(separator: "; ")
+    }
+}
+
+/// Why a deleting read was refused before it could be authorized.
+///
+/// Every case is one of the four preconditions a deleting transfer needs, named
+/// so the shell can explain which one is missing.
+public enum PenDeletingReadRefusal: Error, Hashable, Sendable {
+    /// This sync requested no export, so there is no file publication to fall
+    /// back on.
+    case noExportRequested
+
+    /// The user has not confirmed cleanup for this sync.
+    case notConfirmedForThisSync
+
+    /// The deleting-transfer evidence is closed for the connected pen.
+    case evidenceClosed(reason: String)
+
+    /// No writable durable library is available to commit packets to.
+    case durableStorageUnavailable(reason: String)
+
+    /// A one-line statement of the refusal, for the shell.
+    public var reason: String {
+        switch self {
+        case .noExportRequested:
+            return "cleanup is unavailable because this read requested no export"
+        case .notConfirmedForThisSync:
+            return "cleanup needs your confirmation for this read"
+        case .evidenceClosed(let reason):
+            return reason
+        case .durableStorageUnavailable(let reason):
+            return "cleanup needs durable packet storage, which is unavailable: \(reason)"
+        }
+    }
+}
+
+/// An authorization to open one deleting offline read.
+///
+/// The type is the only route to `0x23` option `0x01`. It can be created only by
+/// ``PenCleanupPolicy/deletingReadAuthorization(pen:requestedExport:confirmedForThisSync:durablePacketStorageAvailable:)``,
+/// which requires a requested export, an explicit confirmation for this sync,
+/// version-matched transfer evidence, and durable packet storage.
+///
+/// The connected pen's identity is only known after the handshake, so the session
+/// resolves its ``PenDeletingReadIntent`` against the identity the handshake
+/// reported. The policy compares that identity with the one its evidence was
+/// recorded against and refuses the read when they differ, so ``requiredIdentity``
+/// is always the identity the connected pen reported, and an authorization can
+/// never widen the identity its evidence covers.
+public struct PenDeletingReadAuthorization: Hashable, Sendable {
+    /// The pen and response shape the authorization's evidence covers, and the
+    /// identity the handshake reported for the connected pen.
+    public let requiredIdentity: PenDeletingTransferIdentity
+
+    /// Creates an authorization. Only ``PenCleanupPolicy`` may do so.
+    init(requiredIdentity: PenDeletingTransferIdentity) {
+        self.requiredIdentity = requiredIdentity
+    }
+}
+
+/// A sync's request to open a deleting offline read.
+///
+/// The intent is what the shell hands to a read before the pen's identity is
+/// known: it carries the four preconditions the policy checks, and the session
+/// resolves it against the identity the handshake reported. The ordinary read API
+/// never receives a deleting transfer option, so the deleting value stays
+/// unreachable from a generic read.
+public struct PenDeletingReadIntent: Hashable, Sendable {
+    /// The policy whose evidence and identity check authorize the read.
+    public let policy: PenCleanupPolicy
+
+    /// Whether this sync asked for files to be written.
+    public let requestedExport: Bool
+
+    /// Whether the user confirmed cleanup for this sync.
+    public let confirmedForThisSync: Bool
+
+    /// Whether a writable durable library is available to commit packets to.
+    public let durablePacketStorageAvailable: Bool
+
+    public init(
+        policy: PenCleanupPolicy,
+        requestedExport: Bool,
+        confirmedForThisSync: Bool,
+        durablePacketStorageAvailable: Bool
+    ) {
+        self.policy = policy
+        self.requestedExport = requestedExport
+        self.confirmedForThisSync = confirmedForThisSync
+        self.durablePacketStorageAvailable = durablePacketStorageAvailable
+    }
+
+    /// Resolves the intent against a connected pen's identity.
+    ///
+    /// - Parameter pen: The identity the handshake reported.
+    /// - Returns: The authorization, or the precondition that refused it.
+    public func authorization(
+        for pen: PenDeletingTransferIdentity
+    ) -> Result<PenDeletingReadAuthorization, PenDeletingReadRefusal> {
+        policy.deletingReadAuthorization(
+            pen: pen,
+            requestedExport: requestedExport,
+            confirmedForThisSync: confirmedForThisSync,
+            durablePacketStorageAvailable: durablePacketStorageAvailable
+        )
+    }
+}
+
 /// The pen cleanup policy a library is built with.
 public struct PenCleanupPolicy: Hashable, Sendable {
     /// The intent the policy applies when a sync makes no choice of its own.
@@ -243,18 +504,25 @@ public struct PenCleanupPolicy: Hashable, Sendable {
     /// The evidence behind the deletion commands.
     public let evidence: PenDeletionEvidence
 
+    /// The evidence behind the deleting `0x23` transfer option.
+    public let transferEvidence: PenDeletingTransferEvidence
+
     /// Creates a policy.
     ///
     /// - Parameters:
     ///   - mode: The default intent for a sync.
-    ///   - evidence: The recorded deletion evidence. It defaults to the physical A1
-    ///     trace, which keeps the gate closed.
+    ///   - evidence: The recorded command-deletion evidence. It defaults to the
+    ///     physical A1 trace, which keeps the command gate closed.
+    ///   - transferEvidence: The recorded deleting-transfer evidence. It defaults
+    ///     to the physical A1 trace of 2026-10-21.
     public init(
         mode: PenCleanupMode = .deleteAfterAcknowledge,
-        evidence: PenDeletionEvidence = .physicalTrace2026_10_20
+        evidence: PenDeletionEvidence = .physicalTrace2026_10_20,
+        transferEvidence: PenDeletingTransferEvidence = .physicalTrace2026_10_21
     ) {
         self.mode = mode
         self.evidence = evidence
+        self.transferEvidence = transferEvidence
     }
 
     /// Whether the app may send a deletion request to the pen.
@@ -280,6 +548,56 @@ public struct PenCleanupPolicy: Hashable, Sendable {
         guard mode == .deleteAfterAcknowledge else { return nil }
         guard deletionEnabled else { return evidence.blockingReason }
         return nil
+    }
+
+    /// Whether the deleting-transfer route is open for a pen identity.
+    ///
+    /// The command gate and the transfer gate are independent: this asks only
+    /// about the transfer record, so an open command gate never authorizes a
+    /// deleting transfer and vice versa.
+    public func transferDeletionEnabled(for pen: PenDeletingTransferIdentity) -> Bool {
+        transferEvidence.authorizes(pen)
+    }
+
+    /// Why the deleting-transfer route is closed for a pen identity, or `nil`
+    /// when it is open.
+    public func transferDeletionRefusal(for pen: PenDeletingTransferIdentity) -> String? {
+        transferEvidence.refusal(for: pen)
+    }
+
+    /// Authorizes one deleting offline read, or says which precondition is
+    /// missing.
+    ///
+    /// The four preconditions are checked in the order the shell presents them:
+    /// an export request, this sync's confirmation, the version-matched evidence,
+    /// and durable packet storage. A missing precondition refuses the deleting
+    /// route; it never narrows to a less safe transfer.
+    ///
+    /// - Parameters:
+    ///   - pen: The identity the connected pen reported.
+    ///   - requestedExport: Whether this sync asked for files to be written.
+    ///   - confirmedForThisSync: Whether the user confirmed cleanup for this sync.
+    ///   - durablePacketStorageAvailable: Whether a writable durable library is
+    ///     available to commit each packet to before its acknowledgement.
+    /// - Returns: The authorization, or the precondition that refused it.
+    public func deletingReadAuthorization(
+        pen: PenDeletingTransferIdentity,
+        requestedExport: Bool,
+        confirmedForThisSync: Bool,
+        durablePacketStorageAvailable: Bool
+    ) -> Result<PenDeletingReadAuthorization, PenDeletingReadRefusal> {
+        guard requestedExport else { return .failure(.noExportRequested) }
+        guard confirmedForThisSync else { return .failure(.notConfirmedForThisSync) }
+        if let reason = transferEvidence.refusal(for: pen) {
+            return .failure(.evidenceClosed(reason: reason))
+        }
+        guard durablePacketStorageAvailable else {
+            return .failure(.durableStorageUnavailable(reason: "no writable library is available"))
+        }
+        guard let identity = transferEvidence.identity else {
+            return .failure(.evidenceClosed(reason: transferEvidence.refusal(for: pen) ?? "no evidence"))
+        }
+        return .success(PenDeletingReadAuthorization(requiredIdentity: identity))
     }
 }
 
@@ -365,6 +683,32 @@ public enum PenCleanupOutcome: Hashable, Sendable {
     /// The pen confirmed removal of the recorded scope.
     case reclaimed(pageCount: Int)
 
+    /// A deleting transfer removed only the packet prefix it durably committed
+    /// and acknowledged.
+    ///
+    /// The scope is the acknowledged prefix, never a whole note: the pen's
+    /// internal removal trigger is not settled by any trace, so the outcome names
+    /// the acknowledgement bound rather than claiming completed reclamation.
+    ///
+    /// - Parameters:
+    ///   - packetCount: The acknowledged packets whose strokes were committed
+    ///     first.
+    ///   - isComplete: Whether the transfer reached every note's end packet *and*
+    ///     that completion was recorded durably.
+    ///   - removalUncertain: Whether the last packet's acknowledgement was not
+    ///     confirmed, leaving the pen's copy of that packet unknown.
+    ///   - reachedEndPacket: Whether the transfer reached every note's end packet and
+    ///     Stop was sent, whether or not that completion was recorded. It is `true`
+    ///     with ``isComplete`` `false` when the transfer finished but the durable
+    ///     record of it could not be written, and the two together are what keeps the
+    ///     report from blaming a storage failure on a short transfer.
+    case acknowledgedPrefix(
+        packetCount: Int,
+        isComplete: Bool,
+        removalUncertain: Bool,
+        reachedEndPacket: Bool
+    )
+
     /// Cleanup was intended but did not run, and this says why. The pen's copy is
     /// untouched.
     case skipped(reason: String)
@@ -375,8 +719,11 @@ public enum PenCleanupOutcome: Hashable, Sendable {
 
     /// Whether the pen's copy was reclaimed.
     public var isReclaimed: Bool {
-        if case .reclaimed = self { return true }
-        return false
+        switch self {
+        case .reclaimed: return true
+        case .acknowledgedPrefix(let packetCount, _, _, _): return packetCount > 0
+        case .retainedByChoice, .skipped, .outstanding: return false
+        }
     }
 
     /// A one-line statement of the outcome, for the menu and the window.
@@ -387,6 +734,34 @@ public enum PenCleanupOutcome: Hashable, Sendable {
         case .reclaimed(let pageCount):
             return "Reclaimed \(pageCount) page\(pageCount == 1 ? "" : "s") from the pen."
                 + " The library copy remains available."
+        case .acknowledgedPrefix(
+            let packetCount,
+            let isComplete,
+            let removalUncertain,
+            let reachedEndPacket
+        ):
+            let packets = "\(packetCount) acknowledged packet\(packetCount == 1 ? "" : "s")"
+            let statement: String
+            if isComplete {
+                statement = "Removed the acknowledged packet prefix from the pen: \(packets)."
+                    + " The library copy remains available."
+            } else if reachedEndPacket {
+                // The transfer finished, so the pen holds no remainder of it: the read
+                // is incomplete because its own record could not be written, and saying
+                // otherwise would blame the pen for a storage failure.
+                statement = "Removed only the acknowledged packet prefix from the pen: \(packets)."
+                    + " The transfer reached the last packet, so the pen holds no remainder of it;"
+                    + " the read's completion could not be recorded, so it is reported as incomplete."
+            } else {
+                statement = "Removed only the acknowledged packet prefix from the pen: \(packets)."
+                    + " The read stopped before the end, so the pen may still hold the remainder."
+            }
+            var reported = statement
+            if removalUncertain {
+                reported += " The last packet's acknowledgement was not confirmed, so the pen's"
+                    + " copy of it is uncertain."
+            }
+            return reported
         case .skipped(let reason):
             return "The pen kept its strokes: \(reason)"
         case .outstanding(let reason):

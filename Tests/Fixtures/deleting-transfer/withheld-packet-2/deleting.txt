@@ -1,0 +1,37 @@
+run pen-lab
+run experiment next-delete
+run section 3 owner 27
+run notes 700
+run pages none
+run timeout 15.0 seconds
+run send true
+run the pen is not read first, so no step checks that its target exists
+run next-delete transfer option 0x01 (NextAndDelete)
+run next-delete abortAtPacket 2
+plan next-delete-0x21 scope=every requestable note, to reach note 700
+plan next-delete-0x21 request=0x21 expects=0xA1 frame=C0210400FFFFFFFFC1
+plan next-delete-0x22 scope=the page list of note 700
+plan next-delete-0x22 request=0x22 expects=0xA2 frame=C02208001B000003BC020000C1
+plan next-delete-0x23 scope=every stroke note 700 holds, removed by the pen as the transfer runs
+plan next-delete-0x23 request=0x23 transferOption=0x01 frame=C0230E0001001B000003BC02000000000000C1
+plan next-delete abortAtPacket=2
+link connected name=Neosmartpen_A1
+link handshake request=C0012A00000000000000000000000000000000001112312E302E300000000000000000000000322E313800000000C1
+link handshake answered error=0x00
+send next-delete-0x21 bytes=9
+response next-delete-0x21 command=A1 error=0x00 milliseconds=30 framing=evidence
+response next-delete-0x21 body=A1000A0001001B000003BC020000 declaredLength=10
+response next-delete-0x21 payload=01001B000003BC020000
+response next-delete-0x21 no decoded meaning
+send next-delete-0x22 bytes=13
+response next-delete-0x22 command=A2 error=0x00 milliseconds=26 framing=evidence
+response next-delete-0x22 body=A20012001B000003BC02000002002400000025000000 declaredLength=18
+response next-delete-0x22 payload=1B000003BC02000002002400000025000000
+response next-delete-0x22 no decoded meaning
+send next-delete-0x23 bytes=19
+response next-delete-0x23 error=0x00 declaredLength=9 payload=12000000B60B000000
+response next-delete-0x23 info claimedStrokes=18 uncompressedBytes=2998 compressed=false
+transfer withholding the acknowledgement for packet 2 packetID=2 strokesInPacket=5 strokesSoFar=18 and closing the link
+transfer result packets=2 acknowledged=1 assembledPackets=2 strokes=18 dots=157 complete=true stopSent=false aborted=true
+transfer note: only a read afterwards shows what the pen still holds, and this run did not read it
+link closing chunks=11

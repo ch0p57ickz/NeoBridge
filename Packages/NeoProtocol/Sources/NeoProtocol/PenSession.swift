@@ -126,6 +126,20 @@ public enum PenSessionError: Error, Hashable, Sendable {
     /// The transfer uses a shape this build has no evidence for.
     case unsupportedTransfer(reason: String)
 
+    /// A deleting packet could not be committed durably, so it was not
+    /// acknowledged.
+    ///
+    /// A refused deleting route is not an error: the read continues
+    /// non-destructively and reports the blocker on ``PenSessionResult/deletingReadRefusal``.
+    case deletingPacketCommitFailed(reason: String)
+
+    /// The batch a failed deleting read opened could not be marked failed, so it
+    /// stays in progress with nothing in it.
+    ///
+    /// The read's own failure is named in the message: this case exists so a second
+    /// storage fault cannot hide the first one.
+    case deletingReadNotRecorded(reason: String)
+
     /// A frame arrived where a different command was expected.
     case unexpectedResponse(expected: PenCommand, received: PenCommand?)
 
@@ -159,6 +173,10 @@ public enum PenSessionError: Error, Hashable, Sendable {
             return "The transfer ended after \(packetCount) packet(s) without an end packet."
         case .unsupportedTransfer(let reason):
             return "The transfer uses an unsupported shape: \(reason)"
+        case .deletingPacketCommitFailed(let reason):
+            return "The read stopped because a packet could not be stored durably: \(reason)"
+        case .deletingReadNotRecorded(let reason):
+            return "The read failed and its empty deleting batch could not be marked failed: \(reason)"
         case .unexpectedResponse(let expected, let received):
             let receivedLabel = received.map { "0x\(String($0.rawValue, radix: 16, uppercase: true))" } ?? "an unknown command"
             return "Expected 0x\(String(expected.rawValue, radix: 16, uppercase: true)) but received \(receivedLabel)."
@@ -273,6 +291,103 @@ public struct PenNoteTransfer: Hashable, Sendable {
     }
 }
 
+/// What one deleting transfer left durably committed.
+///
+/// The report is the honest shape of a deleting read: the pen removed only what
+/// the host acknowledged, so the durable prefix, its completion, and whether the
+/// last acknowledgement's delivery is certain are the facts the shell reports.
+/// It never claims a completed whole-note removal, because the pen's internal
+/// removal trigger is not settled by the trace.
+public struct PenDeletingTransferReport: Hashable, Sendable {
+    /// The batch the packets were committed to.
+    public let batchID: UUID
+
+    /// Packets durably committed before their acknowledgements.
+    public let committedPacketCount: Int
+
+    /// Strokes the batch added to the library.
+    public let committedStrokeCount: Int
+
+    /// Dots in the strokes this batch added to the library.
+    ///
+    /// A fresh read that replays a packet the pen never had acknowledged adds no
+    /// stroke, so the report does not claim those dots twice.
+    public let committedDotCount: Int
+
+    /// Strokes the commits added rather than recognized as already stored.
+    public let addedStrokeCount: Int
+
+    /// Reliable strokes the commits recognized as already stored.
+    public let duplicateStrokeCount: Int
+
+    /// The distinct pages the committed strokes belong to, in canonical order.
+    public let pages: [PageIdentity]
+
+    /// Whether every discovered note reached its end packet and Stop was sent, and
+    /// that completion was recorded durably.
+    ///
+    /// It is `false` when the transfer stopped short, and also when it finished but
+    /// the durable completion marker could not be written: a restart reads the
+    /// batch as still in progress, so the report does not claim more than the record
+    /// holds.
+    public let isComplete: Bool
+
+    /// Whether every discovered note reached its end packet and Stop was sent.
+    ///
+    /// It is the transfer's own fact, independent of whether that completion could be
+    /// recorded. A transfer that reached its last packet but whose completion marker
+    /// could not be written reports this as `true` and ``isComplete`` as `false`: the
+    /// pen holds no remainder of it, and the read is incomplete because its own record
+    /// says so. A transfer that stopped short reports both as `false`.
+    public let reachedEndPacket: Bool
+
+    /// Whether the last acknowledgement's delivery is not certain.
+    ///
+    /// It is `true` when the transfer stopped after a durable commit but without
+    /// a confirmed acknowledgement, which leaves the pen's copy of that packet
+    /// unknown.
+    public let acknowledgementUncertain: Bool
+
+    /// Why the read is not durably complete, or `nil` when it is.
+    ///
+    /// It names why the transfer stopped short, and also why a finished transfer's
+    /// completion could not be recorded.
+    public let reason: String?
+
+    public init(
+        batchID: UUID,
+        committedPacketCount: Int,
+        committedStrokeCount: Int,
+        committedDotCount: Int,
+        addedStrokeCount: Int,
+        duplicateStrokeCount: Int,
+        pages: [PageIdentity],
+        isComplete: Bool,
+        reachedEndPacket: Bool,
+        acknowledgementUncertain: Bool,
+        reason: String?
+    ) {
+        self.batchID = batchID
+        self.committedPacketCount = committedPacketCount
+        self.committedStrokeCount = committedStrokeCount
+        self.committedDotCount = committedDotCount
+        self.addedStrokeCount = addedStrokeCount
+        self.duplicateStrokeCount = duplicateStrokeCount
+        self.pages = pages
+        self.isComplete = isComplete
+        self.reachedEndPacket = reachedEndPacket
+        self.acknowledgementUncertain = acknowledgementUncertain
+        self.reason = reason
+    }
+
+    /// Whether the read is not durably complete.
+    ///
+    /// It is `true` both for a transfer that stopped short and for one that reached its
+    /// end packet whose completion could not be recorded; ``reachedEndPacket`` tells the
+    /// two apart.
+    public var isPartial: Bool { !isComplete }
+}
+
 /// The assembled result of one pen session.
 ///
 /// The counts come from the accepted `0x24` packets, not from the `0xA3`
@@ -293,6 +408,41 @@ public struct PenSessionResult: Hashable, Sendable {
 
     /// Every assembled stroke, in transfer order.
     public let strokes: [Stroke]
+
+    /// What a deleting read durably committed, or `nil` for an ordinary read.
+    ///
+    /// A partial deleting transfer still returns a result, so the caller can
+    /// report the durable prefix and offer a fresh read instead of losing it.
+    public let deletingTransfer: PenDeletingTransferReport?
+
+    /// Why a requested deleting read took the ordinary non-destructive path, or
+    /// `nil` when no deleting read was requested or one ran.
+    ///
+    /// The connected pen's identity is only known after the handshake, so a pen
+    /// whose model, firmware, protocol, or response shape the transfer evidence
+    /// does not cover closes the deleting route at that point. The read then
+    /// continues non-destructively and this names the blocker, so the caller can
+    /// report it instead of the whole read failing.
+    public let deletingReadRefusal: String?
+
+    /// Creates a session result.
+    public init(
+        version: ProtocolVersion,
+        versionInfo: PenVersionInfo,
+        penState: PenState?,
+        notes: [PenNoteTransfer],
+        strokes: [Stroke],
+        deletingTransfer: PenDeletingTransferReport? = nil,
+        deletingReadRefusal: String? = nil
+    ) {
+        self.version = version
+        self.versionInfo = versionInfo
+        self.penState = penState
+        self.notes = notes
+        self.strokes = strokes
+        self.deletingTransfer = deletingTransfer
+        self.deletingReadRefusal = deletingReadRefusal
+    }
 
     /// Strokes assembled from the accepted packets.
     public var strokeCount: Int { strokes.count }
@@ -330,13 +480,19 @@ public struct PenSessionResult: Hashable, Sendable {
 /// to the non-destructive ``OfflineReadTransferOption/nextAndReserve``. The option
 /// is a parameter so the acceptance run can vary it while establishing which value
 /// is incremental; the 2026-10-19 experiment found neither incremental, and
-/// `nextAndReserve` is the only one with completed-transfer evidence.
+/// `nextAndReserve` is the option that experiment established for the read path.
+/// The SDK's deleting value, `0x01`, was measured against the pen on 2026-10-21
+/// (`docs/protocol-a1.md`, "Deleting transfer option, 2026-10-21"); it is not
+/// reachable from ``OfflineReadTransferOption``.
 ///
-/// Deletion is not part of a read: the session sends no `0x25` or `0x27` command,
-/// and the evidence table gates both behind the deletion evidence, whose recorded
-/// deletion-scope verdict is `unsafe`. Cleanup travels on the acknowledged path
-/// instead, so it can be ordered after a durable import and published exports;
-/// see ``PenCleanupPolicy``.
+/// Deleting is authorized per route, and each route has its own record. The session
+/// sends no `0x25` or `0x27` command: the evidence table gates both behind the command
+/// deletion evidence, whose recorded deletion-scope verdict is `unsafe`. The deleting
+/// transfer is the route it may take, and only with a ``PenDeletingReadAuthorization``:
+/// it removes a packet during the read, after the durable commit that precedes that
+/// packet's acknowledgement, so the removal is bounded by what the library already
+/// holds. That is a different order from the command route, which is requested after a
+/// durable import and published exports; see ``PenCleanupPolicy``.
 public final class PenSession: Sendable {
     private struct Status: Sendable {
         var state: PenSessionState = .idle
@@ -349,6 +505,9 @@ public final class PenSession: Sendable {
     private let timeouts: PenSessionTimeouts
     private let bootstrap: PenOfflineDiscoveryBootstrap
     private let transferOption: OfflineReadTransferOption
+    private let deletingRead: PenDeletingReadIntent?
+    private let packetBarrier: (any PenDeletingPacketBarrier)?
+    private let onDeletingPacketCommitted: (@Sendable (UInt16, Int) -> Void)?
     private let connectionCode: [UInt8]
     private let appVersion: String
     private let declaredProtocolVersion: String
@@ -381,6 +540,16 @@ public final class PenSession: Sendable {
     ///     against.
     ///   - penClockIsTrusted: Whether the pen's clock may be trusted for
     ///     cross-source stroke deduplication.
+    ///   - deletingRead: This sync's request for a deleting read, or `nil` for an
+    ///     ordinary read. The session resolves it against the identity the
+    ///     handshake reports and sends `0x23` option `0x01` only when the policy
+    ///     authorizes it. An ordinary session has no route to the deleting option.
+    ///   - packetBarrier: The durable storage each deleting packet is committed
+    ///     through before its acknowledgement. It is required for a deleting read
+    ///     and unused otherwise.
+    ///   - onDeletingPacketCommitted: Called with a packet's identifier and stroke
+    ///     count after its durable commit returned and before its `0xA4`. An
+    ///     acceptance run uses it to record the ordering in a transcript.
     ///   - onStateChange: Called on every state change, for presentation.
     public init(
         transport: PenTransport,
@@ -394,6 +563,9 @@ public final class PenSession: Sendable {
         declaredProtocolVersion: String = PenRequest.sdkDeclaredProtocolVersion,
         penClockIsTrusted: Bool = true,
         queryPenState: Bool = false,
+        deletingRead: PenDeletingReadIntent? = nil,
+        packetBarrier: (any PenDeletingPacketBarrier)? = nil,
+        onDeletingPacketCommitted: (@Sendable (UInt16, Int) -> Void)? = nil,
         onStateChange: (@Sendable (PenSessionState) -> Void)? = nil
     ) {
         self.transport = transport
@@ -402,6 +574,9 @@ public final class PenSession: Sendable {
         self.timeouts = timeouts
         self.bootstrap = bootstrap
         self.transferOption = transferOption
+        self.deletingRead = deletingRead
+        self.packetBarrier = packetBarrier
+        self.onDeletingPacketCommitted = onDeletingPacketCommitted
         self.connectionCode = connectionCode
         self.appVersion = appVersion
         self.declaredProtocolVersion = declaredProtocolVersion
@@ -513,26 +688,180 @@ public final class PenSession: Sendable {
         // 3. Discovery and retrieval.
         transition(to: .syncing)
 
+        // A deleting read is authorized here, after the handshake reported the
+        // pen's identity and before any `0x23` is sent. The option is decided once,
+        // before the first request, and never switched mid-transfer. A route that
+        // is not authorized takes the ordinary non-destructive path and names the
+        // blocker: the pen's identity is only known now, so failing the whole read
+        // would leave a pen the transfer record does not cover unreadable.
+        let deleting: DeletingContext?
+        var deletingRefusal: String?
+        if let intent = deletingRead {
+            switch intent.authorization(for: PenDeletingTransferIdentity(info)) {
+            case .success(let authorization):
+                if let barrier = packetBarrier {
+                    deleting = DeletingContext(authorization: authorization, barrier: barrier)
+                } else {
+                    deleting = nil
+                    deletingRefusal = "no durable packet storage is available"
+                }
+            case .failure(let refusal):
+                deleting = nil
+                deletingRefusal = refusal.reason
+            }
+        } else {
+            deleting = nil
+        }
+
         let notes = try await discoverNotes(channel: channel)
 
         // An empty list is a completed sync with zero counts, not a failure:
         // there is simply nothing to read.
         guard !notes.isEmpty else {
+            if let deleting {
+                // A deleting read with nothing to read commits no packet and is
+                // complete: the pen held nothing to remove.
+                try await deleting.finish(batchID: nil, isComplete: true)
+            }
             return PenSessionResult(
                 version: version,
                 versionInfo: info,
                 penState: measuredState,
                 notes: [],
-                strokes: []
+                strokes: [],
+                deletingTransfer: nil,
+                deletingReadRefusal: deletingRefusal
             )
         }
 
+        // The batch is opened before the first `0x23`, so every packet has a
+        // durable batch to commit into.
+        let batchID: UUID?
+        if let deleting {
+            batchID = try await deleting.barrier.beginDeletingRead(
+                notes: notes.map {
+                    PenDeletingReadNote(sectionOwnerID: $0.sectionOwnerId, noteID: $0.note)
+                }
+            )
+        } else {
+            batchID = nil
+        }
+
+        // Everything from here to the return is one attempt at the transfer, and the
+        // batch exists for all of it. A read that ends without a durable packet
+        // leaves through this catch, so the batch it opened is marked failed instead
+        // of staying in progress for ever. The progress is declared out here because
+        // that catch has to know whether any packet became durable.
+        var progress = DeletingProgress()
+        do {
+            return try await readEveryNote(
+                notes: notes,
+                channel: channel,
+                deleting: deleting,
+                batchID: batchID,
+                version: version,
+                info: info,
+                measuredState: measuredState,
+                deletingRefusal: deletingRefusal,
+                progress: &progress
+            )
+        } catch {
+            try await failEmptyDeletingBatch(
+                deleting,
+                batchID: batchID,
+                progress: progress,
+                error: error
+            )
+            throw error
+        }
+    }
+
+    /// Reads every discovered note and reports the read.
+    ///
+    /// The batch a deleting read opened exists for the whole of this call, so the
+    /// caller wraps it: a throw from here is a read that ended with the batch it
+    /// opened still in progress.
+    private func readEveryNote(
+        notes: [PenOfflineNote],
+        channel: PenFrameChannel,
+        deleting: DeletingContext?,
+        batchID: UUID?,
+        version: ProtocolVersion,
+        info: PenVersionInfo,
+        measuredState: PenState?,
+        deletingRefusal: String?,
+        progress: inout DeletingProgress
+    ) async throws -> PenSessionResult {
         var transfers: [PenNoteTransfer] = []
         var strokes: [Stroke] = []
+        var stopReason: String?
+        var acknowledgementUncertain = false
+
         for note in notes {
-            let transfer = try await readNote(note, channel: channel)
-            transfers.append(transfer)
-            strokes.append(contentsOf: transfer.strokes)
+            let outcome: NoteReadOutcome
+            do {
+                outcome = try await readNote(
+                    note,
+                    channel: channel,
+                    deleting: deleting,
+                    batchID: batchID,
+                    progress: &progress
+                )
+            } catch {
+                // Starting a note can fail on its own — a dropped link, a rejected
+                // request, a malformed page list. Once a packet is durable that is
+                // a partial stop, not an ordinary failure: the pen may already have
+                // removed the acknowledged prefix, so it is reported rather than
+                // lost to the error.
+                guard let stop = deletingStop(deleting, error: error, progress: progress) else {
+                    throw error
+                }
+                stopReason = stop.reason
+                break
+            }
+
+            transfers.append(outcome.transfer)
+            strokes.append(contentsOf: outcome.transfer.strokes)
+
+            if let reason = outcome.partialReason {
+                stopReason = reason
+                acknowledgementUncertain = outcome.acknowledgementUncertain
+                // A partial deleting transfer stops the read: a later note is not
+                // started, so nothing beyond the acknowledged prefix is claimed.
+                break
+            }
+        }
+
+        var deletingReport: PenDeletingTransferReport?
+        if let deleting, let batchID {
+            // Whether the transfer itself reached every end packet: the transfer's own
+            // fact, which stays true even when its completion cannot be recorded.
+            let reachedEndPacket = stopReason == nil
+            // Completion is a durable fact, so it is claimed only when the marker
+            // was written. A storage failure leaves the batch `inProgress`, which is
+            // what a restart will read, so the report says the read is not durably
+            // complete rather than disagreeing with its own record.
+            var durablyComplete = reachedEndPacket
+            var completionFailure: String?
+            do {
+                try await deleting.finish(batchID: batchID, isComplete: reachedEndPacket)
+            } catch {
+                durablyComplete = false
+                completionFailure = "the read's completion could not be recorded: \(error)"
+            }
+            deletingReport = PenDeletingTransferReport(
+                batchID: batchID,
+                committedPacketCount: progress.packetCount,
+                committedStrokeCount: progress.strokeCount,
+                committedDotCount: progress.dotCount,
+                addedStrokeCount: progress.addedStrokeCount,
+                duplicateStrokeCount: progress.duplicateStrokeCount,
+                pages: progress.pages.sorted(by: PageIdentity.canonicalOrder),
+                isComplete: durablyComplete,
+                reachedEndPacket: reachedEndPacket,
+                acknowledgementUncertain: acknowledgementUncertain,
+                reason: stopReason ?? completionFailure
+            )
         }
 
         return PenSessionResult(
@@ -540,7 +869,9 @@ public final class PenSession: Sendable {
             versionInfo: info,
             penState: measuredState,
             notes: transfers,
-            strokes: strokes
+            strokes: strokes,
+            deletingTransfer: deletingReport,
+            deletingReadRefusal: deletingRefusal
         )
     }
 
@@ -579,11 +910,69 @@ public final class PenSession: Sendable {
         }
     }
 
+    /// One note's outcome from `readNote`.
+    private struct NoteReadOutcome {
+        /// The note's transfer, carrying only durably committed strokes for a
+        /// deleting read.
+        let transfer: PenNoteTransfer
+
+        /// Why the transfer stopped short, or `nil` when it completed.
+        let partialReason: String?
+
+        /// Whether the last acknowledgement's delivery is uncertain.
+        let acknowledgementUncertain: Bool
+    }
+
+    /// The state one deleting transfer's packets are committed through.
+    private struct DeletingContext {
+        /// The authorization the policy granted for this sync.
+        let authorization: PenDeletingReadAuthorization
+
+        /// The durable storage each packet is committed to.
+        let barrier: any PenDeletingPacketBarrier
+
+        /// Marks the batch's completion, or does nothing when no batch was opened.
+        func finish(batchID: UUID?, isComplete: Bool) async throws {
+            guard let batchID else { return }
+            try await barrier.finishDeletingRead(batchID: batchID, isComplete: isComplete)
+        }
+    }
+
+    /// The durable progress a deleting read accumulates across notes.
+    private struct DeletingProgress {
+        /// Packets committed so far.
+        var packetCount = 0
+
+        /// Strokes committed so far.
+        var strokeCount = 0
+
+        /// Dots the commits added, so a replayed packet contributes none.
+        var dotCount = 0
+
+        /// Strokes the commits added rather than recognized as already stored.
+        var addedStrokeCount = 0
+
+        /// Reliable strokes the commits recognized as already stored.
+        var duplicateStrokeCount = 0
+
+        /// The distinct pages the committed strokes belong to.
+        var pages = Set<PageIdentity>()
+    }
+
     /// Reads one discovered note: `0x22`, `0x23`, `0xA3`, then the `0x24` stream.
+    ///
+    /// For a deleting read, each accepted packet is committed through the storage
+    /// barrier before its `0xA4`, so the pen never removes data the library does
+    /// not hold. A failure after at least one commit stops the note and reports
+    /// the durable prefix instead of throwing, because the prefix exists and must
+    /// be reported honestly.
     private func readNote(
         _ note: PenOfflineNote,
-        channel: PenFrameChannel
-    ) async throws -> PenNoteTransfer {
+        channel: PenFrameChannel,
+        deleting: DeletingContext?,
+        batchID: UUID?,
+        progress: inout DeletingProgress
+    ) async throws -> NoteReadOutcome {
         try await send(
             PenRequest.pageList(for: note),
             command: .offlinePageListRequest
@@ -606,10 +995,13 @@ public final class PenSession: Sendable {
             throw PenSessionError.protocolFailure(error)
         }
 
-        try await send(
-            PenRequest.offlineData(for: note, transferOption: transferOption),
-            command: .offlineDataRequest1
-        )
+        let request: [UInt8]?
+        if let deleting {
+            request = PenRequest.offlineData(for: note, deletingRead: deleting.authorization)
+        } else {
+            request = PenRequest.offlineData(for: note, transferOption: transferOption)
+        }
+        try await send(request, command: .offlineDataRequest1)
 
         guard let infoFrame = try await awaitFrame(
             channel: channel,
@@ -635,11 +1027,32 @@ public final class PenSession: Sendable {
         var strokes: [Stroke] = []
 
         while true {
-            guard let frame = try await awaitFrame(
-                channel: channel,
-                expecting: .offlineDataRequest2,
-                step: .dataPacket
-            ) else {
+            let frame: PenFrame?
+            do {
+                frame = try await awaitFrame(
+                    channel: channel,
+                    expecting: .offlineDataRequest2,
+                    step: .dataPacket
+                )
+            } catch {
+                // A deleting read that already committed a packet reports the
+                // durable prefix rather than losing it to an error.
+                if let stop = deletingStop(deleting, error: error, progress: progress) {
+                    return stop.outcome(note: note, listedPages: listedPages, info: info, strokes: strokes, packets: packets)
+                }
+                throw error
+            }
+
+            guard let frame else {
+                if let stop = deletingStop(
+                    deleting,
+                    error: PenSessionError.incompleteTransfer(
+                        assembledPacketCount: assembler.assembledPacketCount
+                    ),
+                    progress: progress
+                ) {
+                    return stop.outcome(note: note, listedPages: listedPages, info: info, strokes: strokes, packets: packets)
+                }
                 // A normal stream finish before an end-position packet is an
                 // incomplete transfer, never a completed result.
                 throw PenSessionError.incompleteTransfer(
@@ -647,48 +1060,230 @@ public final class PenSession: Sendable {
                 )
             }
 
-            let progress: OfflineTransferProgress
+            let packetProgress: OfflineTransferProgress
             switch assembler.ingest(payload: frame.payload, penClockIsTrusted: penClockIsTrusted) {
             case .packet(let accepted):
-                progress = accepted
+                packetProgress = accepted
             case .unsupported(let reason):
+                if let stop = deletingStop(
+                    deleting,
+                    error: PenSessionError.unsupportedTransfer(reason: reason),
+                    progress: progress
+                ) {
+                    return stop.outcome(note: note, listedPages: listedPages, info: info, strokes: strokes, packets: packets)
+                }
                 throw PenSessionError.unsupportedTransfer(reason: reason)
             case .error(let error):
+                if let stop = deletingStop(deleting, error: error, progress: progress) {
+                    return stop.outcome(note: note, listedPages: listedPages, info: info, strokes: strokes, packets: packets)
+                }
                 throw PenSessionError.protocolFailure(error)
             }
 
-            packets.append(progress)
-            strokes.append(contentsOf: progress.records.map(\.stroke))
+            // The durable commit barrier: for a deleting read the packet's
+            // strokes and progress are committed before anything is acknowledged,
+            // so a failure here sends no acknowledgement for this packet.
+            if let deleting, let batchID {
+                let commit: PenDeletingPacketCommitResult
+                do {
+                    commit = try await deleting.barrier.commitDeletingPacket(
+                        PenDeletingPacket(
+                            batchID: batchID,
+                            sectionOwnerID: note.sectionOwnerId,
+                            noteID: note.note,
+                            packetID: packetProgress.header.packetID,
+                            strokes: packetProgress.records.map(\.stroke),
+                            isEndPacket: packetProgress.isTransferComplete
+                        )
+                    )
+                } catch {
+                    // A packet that could not be committed is never acknowledged.
+                    // Once an earlier packet is durable the read reports that
+                    // prefix; the first packet's failure has no prefix to report,
+                    // so it is thrown rather than forced through a partial stop.
+                    let failure = PenSessionError.deletingPacketCommitFailed(
+                        reason: String(describing: error)
+                    )
+                    guard let stop = deletingStop(deleting, error: failure, progress: progress) else {
+                        throw failure
+                    }
+                    return stop.outcome(
+                        note: note,
+                        listedPages: listedPages,
+                        info: info,
+                        strokes: strokes,
+                        packets: packets
+                    )
+                }
+
+                progress.packetCount = commit.committedPacketCount
+                progress.strokeCount = commit.committedStrokeCount
+                progress.dotCount = commit.committedDotCount
+                progress.addedStrokeCount += commit.addedStrokeCount
+                progress.duplicateStrokeCount += commit.duplicateStrokeCount
+                progress.pages.formUnion(packetProgress.records.map(\.stroke.page))
+
+                // The commit returned, so this packet is durable and the
+                // acknowledgement below has not been sent yet. A transcript
+                // recorded here proves that ordering without the pen.
+                onDeletingPacketCommitted?(packetProgress.header.packetID, packetProgress.records.count)
+            }
+
+            packets.append(packetProgress)
+            strokes.append(contentsOf: packetProgress.records.map(\.stroke))
 
             // One acknowledgement per packet: Continue while the transfer runs,
             // Stop for the end packet. The pen sends the next packet only after
             // the acknowledgement, so this must happen before the next read.
-            let operation: PenTransferAcknowledgement = progress.isTransferComplete ? .stop : .next
-            try await send(
-                PenRequest.acknowledgement(packetID: progress.header.packetID, operation: operation),
-                command: .responseOfflineData
-            )
+            let operation: PenTransferAcknowledgement = packetProgress.isTransferComplete ? .stop : .next
+            do {
+                try await send(
+                    PenRequest.acknowledgement(
+                        packetID: packetProgress.header.packetID,
+                        operation: operation
+                    ),
+                    command: .responseOfflineData
+                )
+            } catch {
+                // The packet is durable but its acknowledgement may not have
+                // reached the pen, so the pen's copy is uncertain.
+                if let stop = deletingStop(deleting, error: error, progress: progress) {
+                    var outcome = stop.outcome(
+                        note: note,
+                        listedPages: listedPages,
+                        info: info,
+                        strokes: strokes,
+                        packets: packets
+                    )
+                    outcome = NoteReadOutcome(
+                        transfer: outcome.transfer,
+                        partialReason: outcome.partialReason,
+                        acknowledgementUncertain: true
+                    )
+                    return outcome
+                }
+                throw error
+            }
 
-            if progress.isTransferComplete {
+            if packetProgress.isTransferComplete {
                 break
             }
         }
 
         guard assembler.isComplete else {
+            if let stop = deletingStop(
+                deleting,
+                error: PenSessionError.incompleteTransfer(
+                    assembledPacketCount: assembler.assembledPacketCount
+                ),
+                progress: progress
+            ) {
+                return stop.outcome(note: note, listedPages: listedPages, info: info, strokes: strokes, packets: packets)
+            }
             throw PenSessionError.incompleteTransfer(
                 assembledPacketCount: assembler.assembledPacketCount
             )
         }
 
         // Counts come from the accepted packets, never from the `0xA3` summary.
-        return PenNoteTransfer(
-            note: note,
-            listedPages: listedPages,
-            pageIdentities: Self.distinctPages(in: strokes),
-            info: info,
-            strokes: strokes,
-            packetCount: packets.count
+        return NoteReadOutcome(
+            transfer: PenNoteTransfer(
+                note: note,
+                listedPages: listedPages,
+                pageIdentities: Self.distinctPages(in: strokes),
+                info: info,
+                strokes: strokes,
+                packetCount: packets.count
+            ),
+            partialReason: nil,
+            acknowledgementUncertain: false
         )
+    }
+
+    /// Whether a deleting read should report a partial stop rather than throw.
+    ///
+    /// A partial stop is possible only for a deleting read that already committed
+    /// at least one packet: before that, nothing is durable and the failure is
+    /// ordinary. A cancellation is included, because a committed prefix still
+    /// exists and the pen may already have removed it.
+    private func deletingStop(
+        _ deleting: DeletingContext?,
+        error: any Error,
+        progress: DeletingProgress
+    ) -> DeletingStop? {
+        guard deleting != nil, progress.packetCount > 0 else { return nil }
+        return DeletingStop(reason: Self.describe(error))
+    }
+
+    /// Marks the batch a deleting read opened failed when the read ended before its
+    /// first durable packet.
+    ///
+    /// The batch is opened before the first `0x23`, so a read that ends before any
+    /// packet commits would otherwise leave a `committed` batch claiming an
+    /// in-progress transfer for ever: it can never publish, because publication
+    /// needs a durable packet, and it holds no page, so it blocks nothing. Marking
+    /// it keeps the row visible and unpublishable instead of removing it, because
+    /// the journal and a later diagnosis need to see that the read was attempted.
+    ///
+    /// Only a read with no durable packet is marked: a read that stopped with a
+    /// prefix reports that prefix, which is what its own record already says. A
+    /// marking failure is reported together with the read's own reason rather than
+    /// instead of it, so a second storage fault cannot hide the first.
+    private func failEmptyDeletingBatch(
+        _ deleting: DeletingContext?,
+        batchID: UUID?,
+        progress: DeletingProgress,
+        error: any Error
+    ) async throws {
+        guard let deleting, let batchID, progress.packetCount == 0 else { return }
+        do {
+            try await deleting.barrier.failDeletingRead(batchID: batchID)
+        } catch let markingFailure {
+            throw PenSessionError.deletingReadNotRecorded(
+                reason: "\(Self.describe(error)); the batch's failure could not be recorded:"
+                    + " \(markingFailure)"
+            )
+        }
+    }
+
+    /// A short description of why a transfer stopped.
+    private static func describe(_ error: any Error) -> String {
+        switch error {
+        case let sessionError as PenSessionError:
+            return sessionError.message
+        case is CancellationError:
+            return PenSessionError.cancelled.message
+        default:
+            return String(describing: error)
+        }
+    }
+
+    /// A partial stop of a deleting transfer.
+    private struct DeletingStop {
+        /// Why the transfer stopped.
+        let reason: String
+
+        /// Builds the note outcome for the durable prefix.
+        func outcome(
+            note: PenOfflineNote,
+            listedPages: [UInt32],
+            info: PenOfflineDataInfo,
+            strokes: [Stroke],
+            packets: [OfflineTransferProgress]
+        ) -> NoteReadOutcome {
+            NoteReadOutcome(
+                transfer: PenNoteTransfer(
+                    note: note,
+                    listedPages: listedPages,
+                    pageIdentities: PenSession.distinctPages(in: strokes),
+                    info: info,
+                    strokes: strokes,
+                    packetCount: packets.count
+                ),
+                partialReason: reason,
+                acknowledgementUncertain: false
+            )
+        }
     }
 
     // MARK: - Transport helpers
@@ -829,5 +1424,22 @@ public final class PenSession: Sendable {
         default:
             return .transportFailure(description: String(describing: error))
         }
+    }
+}
+
+extension PenDeletingTransferIdentity {
+    /// The identity a connected pen reported.
+    ///
+    /// The compression field is the pen's advertised capability. The read always
+    /// requests an uncompressed transfer, and a compressed `0x24` packet is
+    /// refused by the transfer assembler before it could be acknowledged, so a
+    /// pen that advertises compression never matches the uncompressed trace.
+    public init(_ info: PenVersionInfo) {
+        self.init(
+            deviceName: info.deviceName,
+            firmwareVersion: info.firmwareVersion,
+            protocolVersion: info.protocolVersionText,
+            isCompressed: info.supportsCompressedTransfer
+        )
     }
 }
