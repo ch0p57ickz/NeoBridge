@@ -81,6 +81,145 @@ final class OfflineSessionIntegrationTests: XCTestCase {
         XCTAssertEqual(stored, fixture.expectedStrokeCount)
     }
 
+    /// A later read that carries strokes for a page the library already holds must
+    /// add them to that page, and the next export must publish the combined file.
+    ///
+    /// This is the library half of what the 2026-10-20 deletion trace showed on the
+    /// pen: `0x25` removes a note's data but not its identity, so strokes written
+    /// afterwards arrive under the same four page components as the strokes that
+    /// were already delivered. Appending keeps one page rather than two, and the
+    /// export is rendered from storage, so the file it replaces carries the union.
+    func testALaterReadAppendsToAStoredPageAndRepublishesTheCombinedFile() async throws {
+        let fixture = try IntegrationFixtures.offlineSession()
+        let workspace = try IntegrationWorkspace()
+        defer { workspace.remove() }
+
+        let first = try await OfflineSessionImport(importer: workspace.importer).run(
+            transport: FakePenTransport(chunks: try fixture.decodedChunks()),
+            export: workspace.exportRequest(pages: [])
+        )
+        XCTAssertTrue(first.outcome.isSaved)
+
+        let captured = try XCTUnwrap(fixture.expectedPage)
+        let page = PageIdentity(
+            section: captured.section,
+            owner: captured.owner,
+            book: captured.book,
+            page: captured.page
+        )
+        let storedBefore = try await workspace.library.strokes(on: page).count
+        XCTAssertGreaterThan(
+            storedBefore,
+            0,
+            "the first read must store strokes on the captured page"
+        )
+        let pagesBefore = try await workspace.library.pages().count
+        let fingerprintsBefore = Set(
+            try await workspace.library.strokes(on: page).map {
+                StrokeIdentity.fingerprint(of: $0)
+            }
+        )
+        let svgPath = workspace.exportDirectory
+            .appendingPathComponent(PageExportDocument(page: page, strokes: []).fileName(for: .svg))
+        let svgBefore = try Data(contentsOf: svgPath)
+
+        // A later read of the same page, carrying two strokes no read has delivered.
+        // The origin times are unmistakably synthetic, so a fixture regenerated from
+        // a real capture can never collide with them.
+        let laterRead = PenReadTransfer(
+            strokes: [
+                Stroke(
+                    page: page,
+                    originTime: .reliable(milliseconds: 1),
+                    points: [
+                        PenPoint(x: 111, y: 222, penTimeOffsetMilliseconds: 0, pressure: 3),
+                        PenPoint(x: 333, y: 444, penTimeOffsetMilliseconds: 26, pressure: 4),
+                    ],
+                    source: .offline
+                ),
+                Stroke(
+                    page: page,
+                    originTime: .reliable(milliseconds: 2),
+                    points: [
+                        PenPoint(x: 555, y: 666, penTimeOffsetMilliseconds: 0, pressure: 5)
+                    ],
+                    source: .offline
+                ),
+            ],
+            noteCount: 1
+        )
+
+        let second = try await workspace.importer.importRead(
+            laterRead,
+            export: workspace.exportRequest(pages: [page])
+        )
+
+        let save = try XCTUnwrap(second.save)
+        XCTAssertEqual(save.insertion.addedStrokeCount, 2)
+        XCTAssertEqual(save.insertion.duplicateStrokeCount, 0)
+        let report = try XCTUnwrap(second.export)
+        XCTAssertEqual(Set(report.artifacts.map(\.format)), Set(PenExportFormat.allCases))
+        XCTAssertEqual(
+            report.published.count,
+            PenExportFormat.allCases.count,
+            "every format must be regenerated for the combined page"
+        )
+
+        // The page keeps every stroke it held and gains the new ones under one row.
+        let storedAfter = try await workspace.library.strokes(on: page)
+        XCTAssertEqual(
+            storedAfter.count,
+            storedBefore + 2,
+            "a later read appends to the stored page rather than replacing it"
+        )
+        let fingerprintsAfter = Set(storedAfter.map { StrokeIdentity.fingerprint(of: $0) })
+        XCTAssertTrue(
+            fingerprintsBefore.isSubset(of: fingerprintsAfter),
+            "no stroke the first read delivered may be lost when a later one arrives"
+        )
+        let pagesAfter = try await workspace.library.pages().count
+        XCTAssertEqual(
+            pagesAfter,
+            pagesBefore,
+            "the same four components must not produce a second page identity"
+        )
+        var storedEverywhere = 0
+        for stored in try await workspace.library.pages() {
+            storedEverywhere += try await workspace.library.strokes(on: stored).count
+        }
+        XCTAssertEqual(
+            storedEverywhere,
+            try XCTUnwrap(fixture.expectedStrokeCount) + 2,
+            "the later read must add its two strokes and disturb no other page"
+        )
+
+        // The export is rendered from storage, so the SVG carries the union.
+        let svgAfterData = try Data(contentsOf: svgPath)
+        let svgAfter = String(decoding: svgAfterData, as: UTF8.self)
+        XCTAssertTrue(
+            svgAfter.contains("<desc>\(storedAfter.count) stroke(s)"),
+            "the regenerated SVG must carry every stored stroke, not only the new ones"
+        )
+
+        // Replacing a differing target preserves the version it replaced.
+        let backupPath = workspace.exportDirectory
+            .appendingPathComponent(
+                PageExportDocument(page: page, strokes: [])
+                    .backupFileName(for: .svg, depth: 1)
+            )
+        let svgBackup = try Data(contentsOf: backupPath)
+        XCTAssertEqual(
+            svgBackup,
+            svgBefore,
+            "the SVG replaced by the combined version must stay recoverable"
+        )
+        XCTAssertNotEqual(
+            svgAfterData,
+            svgBefore,
+            "the SVG must have been regenerated, not left as the earlier version"
+        )
+    }
+
     // MARK: - Interruption and recovery
 
     func testInterruptedSyncCommitsNothing() async throws {
