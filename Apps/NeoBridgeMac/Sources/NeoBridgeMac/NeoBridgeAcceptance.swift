@@ -95,6 +95,16 @@ enum NeoBridgeAcceptance {
             "acceptance: phase \(controller.statusLabel)",
         ]
 
+        if let state = controller.penState {
+            // The percentages and the charging flag are measurements, not
+            // identifiers, so a sanitized probe can be compared with the two
+            // surfaces that present them.
+            lines.append(
+                "acceptance: pen state battery \(state.batteryLevel)%"
+                    + " charging \(state.isCharging) storageUsed \(state.memoryUsed)%"
+            )
+        }
+
         if let outcome = controller.outcome {
             lines.append(
                 "acceptance: strokes \(outcome.summary.strokeCount) dots \(outcome.summary.dotCount)"

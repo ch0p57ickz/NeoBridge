@@ -364,10 +364,7 @@ evidence behind the transfer route's own record.
 
 ### The app's own deleting read (task 4.4)
 
-Every row above was driven by PenLab, which frames the option itself. No run has
-exercised the app's own end-to-end deleting read against a pen yet, so this is the
-run that closes that gap. It needs the pen seeded with known content and the four
-preconditions satisfied, which the headless path takes from its environment:
+**Task 4.4 was dropped by the owner on 2026-10-22; this procedure is kept for a future decision and is not a planned gate.** The app's own deleting read has since run end-to-end during the automatic-sync acceptance (a `deleting`/`complete` batch with two packets, inventory 12 → 0, library and exports intact), but the withheld-acknowledgement remainder and the `packetCommitDurable` ordering below remain unmeasured. Every row above was driven by PenLab, which frames the option itself. The procedure below is what such a run would need; it takes the seeded pen and the four preconditions from the environment:
 
 ```bash
 NEOBRIDGE_ACCEPTANCE_TRACE=/tmp/a1-deleting.txt \
