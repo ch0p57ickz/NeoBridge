@@ -324,14 +324,19 @@ public final class PenSyncController {
 
     /// A one-line statement of what the saved mode means for the pen's copy, for
     /// Connection Details.
+    ///
+    /// The statement is about the mode rather than about one automatic opportunity,
+    /// because the mode governs Sync Now too: a requested read follows the saved
+    /// setting, so pausing names the one read the menu can still start.
     public var syncModeLine: String {
         switch syncMode {
         case .delete:
-            return "Each eligible automatic sync removes the packets it saved from the pen."
+            return "Each eligible sync removes the packets it saved from the pen."
         case .retain:
-            return "Automatic syncs read the pen and keep its copy."
+            return "Syncs read the pen and keep its copy."
         case .paused:
-            return "Automatic sync is paused. No pen is discovered and no read starts."
+            return "Automatic sync is paused: no pen is discovered and no scheduled read starts,"
+                + " but Sync Now can still run one read."
         }
     }
 
@@ -626,6 +631,32 @@ public final class PenSyncController {
         start(selection: .automatic, authorization: .savedMode)
     }
 
+    /// Starts one read the user asked for, authorized by the saved mode it is given.
+    ///
+    /// The menu's Sync Now command is what leads here. The mode is the capture: the
+    /// caller that accepts the request reads the saved setting once, at acceptance,
+    /// and passes it here, so a setting changed after that cannot change what the
+    /// read does. **Sync and Delete** requests the deleting transfer through the same
+    /// gates an automatic read uses, while **Sync and Retain** and **Pause** both
+    /// request the ordinary non-destructive read. Pausing is not a setting that
+    /// authorizes a deletion, so a read accepted there keeps the pen's copy, and the
+    /// saved setting itself is left exactly as it was.
+    ///
+    /// A read already in flight, or a pen choice waiting to be answered, keeps this
+    /// call from starting a second read. The caller is what serializes a request with
+    /// the automatic schedule, so a request that loses that race is refused here
+    /// rather than queued behind the read that won it.
+    ///
+    /// - Parameter mode: The saved mode the request was accepted under.
+    public func readOnRequest(savedMode mode: PenSyncMode) {
+        guard !isAwaitingChoice, !isBusy else { return }
+        // The capture is consumed by the read that starts from it, and the mode is
+        // never written back to the saved setting.
+        nextReadCleanupMode = mode.cleanupMode ?? .keepOnPen
+        nextReadCleanupConfirmed = mode == .delete
+        start(selection: .automatic, authorization: .requestedMode)
+    }
+
     /// Reads the pen the user chose after several matched.
     ///
     /// The intent the user set, the confirmation given for it, and the saved mode
@@ -697,12 +728,12 @@ public final class PenSyncController {
                     // read's own transfer outcome stands.
                     cleanup = outcome.cleanup
                 } else if report.succeeded, mode == .deleteAfterAcknowledge,
-                    controller.attemptAuthorization == .savedMode
+                    controller.attemptAuthorization.removesPacketsOnlyThroughDeletingTransfer
                 {
-                    // An automatic Sync and Delete read removes packets only
+                    // A saved-mode or requested Delete read removes packets only
                     // through its deleting transfer, so its retry republishes from
                     // the library and asks for no separate deletion command either.
-                    cleanup = .skipped(reason: controller.automaticCleanupRefusal)
+                    cleanup = .skipped(reason: controller.deletingTransferOnlyRefusal)
                 } else if report.succeeded {
                     cleanup = await controller.requestCleanup(for: save.batchID, mode: mode)
                 } else if mode == .keepOnPen {
@@ -730,13 +761,36 @@ public final class PenSyncController {
     /// Where a read's transfer authorization comes from.
     private enum TransferAuthorization {
         /// The saved mode authorizes the transfer, and the per-read confirmation
-        /// does not apply. The automatic schedule uses this.
+        /// does not apply. The automatic schedule uses this, and it reads the mode
+        /// again for each read it starts.
         case savedMode
+
+        /// The saved mode the user's request captured authorizes the transfer, and
+        /// the per-read confirmation does not apply. A read the menu started with
+        /// Sync Now uses this: the same authorization an automatic read runs under,
+        /// except that the mode was fixed when the user asked for the read.
+        case requestedMode
 
         /// Only the per-read intent and confirmation apply. A caller that drives
         /// one read directly uses this, which is what keeps a headless run's
         /// deleting transfer behind its own explicit confirmation.
         case perReadChoice
+
+        /// Whether a read authorized this way removes packets only through its own
+        /// deleting transfer, and never through the separate `0x25`/`0x27` command.
+        ///
+        /// Both saved-mode authorizations are standing requests for the deleting
+        /// route, so a read that took the ordinary path keeps the pen's copy and
+        /// reports the transfer gate that closed rather than falling back to the
+        /// command route. A read a caller drives directly is authorized by that
+        /// read's own confirmation instead, so its outcome is reported by whichever
+        /// route it was given.
+        var removesPacketsOnlyThroughDeletingTransfer: Bool {
+            switch self {
+            case .savedMode, .requestedMode: return true
+            case .perReadChoice: return false
+            }
+        }
     }
 
     /// Where the read the shell shows got its transfer authorization.
@@ -766,7 +820,10 @@ public final class PenSyncController {
             // eligible automatic read does not ask again. Every other gate is
             // checked separately, in ``deletingReadIntent()``.
             attemptCleanupConfirmed = syncMode == .delete
-        case .perReadChoice:
+        case .requestedMode, .perReadChoice:
+            // A requested read captured the saved mode when the user asked for it
+            // and a directly driven one carries the shell's choice, so both consume
+            // the intent the next read was holding rather than the live setting.
             attemptCleanupMode = nextReadCleanupMode
             attemptCleanupConfirmed = nextReadCleanupConfirmed
         }
@@ -858,14 +915,16 @@ public final class PenSyncController {
         // A read whose deleting route closed after the handshake — a pen the
         // transfer evidence does not cover — reports that blocker. Asking the
         // importer would name the separate command gate instead, which is not what
-        // kept this read non-destructive.
+        // kept this read non-destructive. A saved-mode or requested read whose
+        // deleting transfer did not run reports its transfer blocker for the same
+        // reason: neither route removes packets through the separate command.
         let cleanup: PenCleanupOutcome
         if let refusal = read.deletingReadRefusal, attemptCleanupMode == .deleteAfterAcknowledge {
             cleanup = .skipped(reason: refusal)
         } else if attemptCleanupMode == .deleteAfterAcknowledge,
-            attemptAuthorization == .savedMode
+            attemptAuthorization.removesPacketsOnlyThroughDeletingTransfer
         {
-            cleanup = .skipped(reason: automaticCleanupRefusal)
+            cleanup = .skipped(reason: deletingTransferOnlyRefusal)
         } else {
             cleanup = await requestCleanup(for: outcome.save?.batchID, mode: attemptCleanupMode)
         }
@@ -968,16 +1027,18 @@ public final class PenSyncController {
         }
     }
 
-    /// Why an automatic sync that asked for a deleting transfer removed nothing.
+    /// Why a read that removes packets only through its deleting transfer removed
+    /// none.
     ///
-    /// Automatic Sync and Delete removes packets only through the deleting
-    /// transfer itself. It never falls back to the separate `0x25`/`0x27` command,
-    /// so the reason it reports is the transfer gate that closed rather than the
-    /// command gate, which no automatic read ever consults.
-    private var automaticCleanupRefusal: String {
+    /// A saved Sync and Delete mode and a Sync Now request made in that mode both
+    /// remove packets only through the deleting transfer itself. Neither falls back
+    /// to the separate `0x25`/`0x27` command, so the reason reported is the transfer
+    /// gate that closed rather than the command gate, which neither of them ever
+    /// consults.
+    private var deletingTransferOnlyRefusal: String {
         cleanupUnavailableReason
-            ?? "the deleting transfer did not run, and an automatic sync removes packets"
-                + " only through that transfer"
+            ?? "the deleting transfer did not run, and this read removes packets only"
+                + " through that transfer"
     }
 
     /// Ends the attempt, leaving the read's own intent in place.

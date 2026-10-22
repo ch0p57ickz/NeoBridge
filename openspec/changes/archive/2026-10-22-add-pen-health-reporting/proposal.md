@@ -7,7 +7,7 @@ The A1 reports its battery, charging state, and used storage through a verified 
 ## What Changes
 
 - Query `0x04` after the version handshake and decode the `0x84` response.
-- Show battery percentage, charging state, and pen storage used in the menu and details window after a successful read.
+- Show battery percentage, charging state, and pen storage used in Connection Details after a successful read. The later compact-menu decision keeps these measurements out of the menu.
 - Record the physical A1 evidence and cover decoding and session behavior with portable tests.
 
 ## Capabilities

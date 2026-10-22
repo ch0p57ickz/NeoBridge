@@ -384,6 +384,58 @@ without a power cycle. Commit timing is measured at the same time: how long the 
 tolerates between its packet and the host's acknowledgement is still an open
 question, and no portable test can answer it.
 
+## Open-menu sync crash acceptance (fix-open-menu-sync-crash)
+
+On a logged-in Mac with the assembled app, save **Sync and Retain** and choose
+**Sync Now**. The command closes the menu. Reopen it while scanning and leave it
+open until the result appears. With no compatible pen, expect **Syncing** followed
+by **Not Detected**, **Sync Now** disabled during the scan, and the app still running.
+Repeat a few short scans, then choose an available menu command and confirm it works.
+Command selection can close the menu. Also check **Cancel Read** during a scan and
+**Connection Details…** after it; closing the details window must leave the status
+item available. Record the macOS build and number of attempts. No long soak is required.
+
+When a physical A1 is available, run one automatic **Sync and Retain** read with the
+menu open through completion. Confirm the status becomes **Synced** and its elapsed
+time advances while the menu stays open. Then choose **Sync Now**, reopen the menu
+during the read, and confirm the same behavior. Sanitize any pen transcript and verify
+that no deleting transfer or deletion command was requested.
+
+## Sync Now acceptance (add-sync-now-menu-action)
+
+**Not run.** This change adds the menu's **Sync Now** command, which starts one read
+on request in every saved mode: **Sync and Delete** requests the same evidence-gated
+deleting transfer a scheduled read uses, and **Sync and Retain** and **Pause** take
+the ordinary non-destructive read. The command is disabled while a read or a pen
+choice is active, and the read follows the saved mode captured when the command was
+clicked. The menu-bar app cannot be driven from a script without an accessibility
+grant, so every row below needs the interface in hand; the unit suites cover the same
+behavior against the fake transport.
+
+The rows run against the same pen the rest of this checklist uses. Write a known mark
+before the **Sync and Delete** row so the read afterwards says what happened to the
+pen's copy; the retaining and paused rows need no mark, because their claim is that
+nothing was removed.
+
+| Scenario | Automated coverage | The hardware run must confirm | Pass / Fail |
+| --- | --- | --- | --- |
+| Request a read before the next automatic opportunity | `PenSyncCoordinatorTests` starts a requested read from a parked schedule | With the interval longer than a minute, choose **Sync Now** while idle and confirm one read starts without waiting for the interval | **Not run.** Needs the interface. |
+| Request a read while another read is active | `PenSyncCoordinatorTests` and `PenSyncControllerTests` refuse a request during a read or a pen choice | While a read runs, or a pen choice is on screen, confirm **Sync Now** is disabled and no second read starts | **Not run.** Needs the interface. |
+| Several pens answer a manual request | `PenSyncControllerTests` requests the explicit pen choice before any transfer | With two A1 pens in range, choose **Sync Now** and confirm the choice appears before a transfer starts | **Not run.** Needs a second A1. |
+| Manual read shares the existing status and result flow | `PenSyncControllerTests` publishes a requested read through the same status and result flow | Run one **Sync Now** read and confirm the menu status and Connection Details report it like a scheduled read | **Not run.** Needs the interface. |
+| Manual read and schedule do not overlap | `PenSyncCoordinatorTests` lets the request own the attempt and re-anchors the interval at its start | Choose **Sync Now** just before the interval is due and confirm one read runs and the next waits a full interval after it | **Not run.** Needs the interface. |
+| Automatic read starts first | `PenSyncCoordinatorTests` refuses a request while an automatic read is in flight and queues nothing | Choose **Sync Now** as an automatic read commits and confirm it starts nothing and queues nothing | **Not run.** Needs the interface. |
+| Sync Now in Sync and Delete | `PenSyncControllerTests` requests the evidence-gated transfer and reports a closed gate | With **Sync and Delete** saved and an export folder chosen, run **Sync Now** and check the pen's copy with the headless read afterwards; the transcript lists no `0x25` or `0x27` | **Not run.** Needs the interface and a mark. |
+| Sync Now in Sync and Retain | `PenSyncControllerTests` saves the read and requests no deletion | With **Sync and Retain** saved, run **Sync Now** and confirm no deletion request is sent and the pen's copy remains | **Not run.** Needs the interface. |
+| Sync Now in Pause | `PenSyncControllerTests` runs one non-destructive read and leaves Pause saved | With **Pause** saved, run **Sync Now** and confirm one read runs, the pen's copy remains, and Pause is still checked afterwards | **Not run.** Needs the interface. |
+| Mode changes during a manual read | `PenSyncControllerTests` keeps the captured mode for the read in flight | Change the saved mode while a **Sync Now** read runs and confirm that read keeps its captured mode | **Not run.** Needs the interface. |
+| Export retry after a manual deleting read | `PenSyncControllerTests` republishes from the library with no new deletion | Force a file failure after a **Sync Now** deleting read, retry, and confirm no `0x25` or `0x27` and no new transfer | **Not run.** Needs the interface and a forced failure. |
+
+The headless read above is what inspects the pen's copy afterwards; it does not drive
+the menu, so it cannot tick these rows on its own. When a row is eventually run
+headlessly, its `run` line records the read's cleanup intent and its
+`outboundCommands` line is the deletion check: `0x25` and `0x27` must never appear.
+
 ## pen cleanup
 
 These rows need a real A1 **and** the command deletion evidence gate open. That gate

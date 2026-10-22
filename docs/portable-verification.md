@@ -737,6 +737,160 @@ option.
 
 Recorded on 2026-10-22.
 
+## Verification for `add-sync-now-menu-action`
+
+Task 3.1 requires the portable script to pass on Linux and the macOS package tests to
+pass, and task 3.2 requires the Xcode-gated Mac build. Both ran on 2026-10-21.
+
+```bash
+# Linux, in Docker, as recorded for `reduce-redundant-export-backups`
+docker run -d --name neobridge-syncnow-swift64 -v "$PWD":/src:ro swift:6.4.1 sleep infinity
+docker exec neobridge-syncnow-swift64 bash -lc 'apt-get update -qq && apt-get install -y -qq libsqlite3-dev'
+docker exec neobridge-syncnow-swift64 bash -lc \
+  'mkdir -p /work && cd /src && tar --exclude=./.build --exclude=./.git -cf - . \
+     | (cd /work && tar -xf -) && cd /work && find . -name "._*" -delete \
+     && ./Scripts/test-portable.sh'
+docker rm -f neobridge-syncnow-swift64
+
+# macOS
+(cd Apps/NeoBridgeMac && swift test)
+Scripts/remote-mac-build.sh
+```
+
+| Item | Linux | macOS |
+| --- | --- | --- |
+| Host platform | Ubuntu (aarch64) in a Docker container on macOS 27.2 (26B5112a), arm64 | macOS 27.2 (26B5112a), arm64 |
+| Toolchain | Swift 6.4.1 (swift-6.4.1-RELEASE), target `aarch64-unknown-linux-gnu` | Apple Swift 6.4 (swiftlang-6.4.0.34.1), target `arm64-apple-macosx27.2.0` |
+| Xcode | Not used | 27.1 (27A9275), SDK `MacOSX27.0` |
+| Bluetooth hardware | Not used | Not used |
+
+Both hosts printed the same counts:
+
+```text
+== Package tests
+-- swift test (Packages/NeoCore)      62 tests, 0 failures
+-- swift test (Packages/NeoProtocol)  177 tests, 0 failures
+-- swift test (Packages/NeoStorage)   91 tests, 0 failures
+-- swift test (Packages/NeoExport)    79 tests, 0 failures
+-- swift test (Tests/Integration)     21 tests, 0 failures
+== Result
+PASSED: portable packages build with pinned dependencies, import no Apple-only framework, and pass their tests, and the integration scenarios pass.
+```
+
+```text
+(cd Apps/NeoBridgeMac && swift test)
+     Executed 179 tests, with 0 failures (0 unexpected)
+```
+
+The app suite gained 20 tests, all for Sync Now: nine `PenSyncCoordinatorTests`
+cases (an idle request reading at once, the observation handoff, the accepted request
+held when the controller goes busy during the handoff, the refusal during an automatic
+read with nothing queued, the refusal while a pen choice is pending and its release, a
+repeated click starting no second read, the next interval re-anchored at the manual
+attempt's start, one retaining read under Pause that leaves Pause saved, and the
+captured mode surviving acceptance) and eleven `PenSyncControllerTests` cases (eligible
+Delete, two blocked-Delete fallbacks, Retain, the paused one-time retaining read, the
+mode captured through a pen choice, a request ignored during a read, a request ignored
+while a pen choice is pending, a failed request reporting its error, cancellation
+reporting no completion, and an export retry after a fallback asking for no separate
+deletion). Five mutation checks confirmed the new tests bite: dropping the mode clear in
+`consumeRequestedRead()`, excluding `.requestedMode` from
+`removesPacketsOnlyThroughDeletingTransfer`, reading `syncMode` instead of the passed
+`mode` in `readOnRequest`, omitting `lastAttemptStart = clock.now` from the attempt
+that starts the read, and removing the hold that keeps an accepted request across the
+observation handoff (`testAnAcceptedRequestIsHeldWhenTheControllerGoesBusyDuringTheHandoff`
+failed with 79 assertion failures) each produced failures in the expected tests, and all
+mutations were reverted.
+
+Two fast code reviews of the diff found no BLOCKER or MAJOR issue. The first reported
+one MINOR correctness gap — a capture consumed across the `stopObservation()` handoff
+could be dropped if the controller went busy inside that one suspension point — which is
+now **fixed**: the capture is read only once the controller can start the read, and the
+loop holds an accepted request across the wait. Its regression test is
+`testAnAcceptedRequestIsHeldWhenTheControllerGoesBusyDuringTheHandoff`. The same review
+noted that the coordinator's `!isBusy`/`!isAwaitingChoice` acceptance clauses were pinned
+only at the controller level; the new test now pins the busy case at the coordinator
+level too. The second review of the fix found no BLOCKER or MAJOR issue and confirmed
+the loop cannot spin on the hold path, that `lastAttemptStart` is re-anchored by the
+pass that actually starts the read, and that the automatic path is unchanged. Its
+remaining notes are recorded as boundaries in the change's `tasks.md`.
+
+```text
+Scripts/remote-mac-build.sh
+== App build (Xcode)
+ok: the Xcode build succeeded.
+== Bundle verification
+ok: CFBundleIdentifier = com.sushidev.neobridge.mac
+ok: CFBundleExecutable = NeoBridgeMac
+ok: LSMinimumSystemVersion = 15.0
+ok: NSBluetoothAlwaysUsageDescription = NeoBridge reads offline strokes from a Neo Smartpen A1 over Bluetooth.
+ok: LSUIElement = true
+== Result
+PASSED: portable packages verified, app built under SwiftPM and Xcode, bundle assembled.
+```
+
+The assembled menu was read on the Mac runner with an accessibility-driven harness
+(`System Events`), which is the rendered-menu check the earlier menu changes recorded
+as unavailable:
+
+| Saved mode | Single status line | `Sync Now` | Other |
+| --- | --- | --- | --- |
+| Sync and Delete, idle | `Idle` | enabled | modes, interval submenu, `Connection Details…`, `Quit NeoBridge` |
+| Sync and Delete, requested read in flight | `Syncing` | disabled | `Cancel Read` enabled |
+| Pause | `Paused` | enabled | `Pause` carried the `✓` mark |
+
+That covers part of the change's own menu claims: the command is present in every mode,
+and it is unavailable while a read is in flight. Two further checks were blocked, and a
+crash was found:
+
+- Mode **preservation** past a Sync Now click was not observed live, so task 3.2 is left
+  unchecked. A second attempt selected **Sync and Retain** and confirmed it took, with
+  `defaults read` reporting `NeoBridge.syncMode = retain`, but the run had to stop before
+  the Sync Now click and its settle could be checked. Automation is not being retried,
+  because the menu interaction that this check needs is the one that reproduces the crash
+  below. The saved mode was restored to its pre-run value `delete` with `defaults write`,
+  and the app was stopped with `SIGTERM`. The behavior is covered by
+  `testSyncNowRunsOneRetainingReadWhilePausedAndLeavesItPaused`,
+  `testARequestedReadKeepsTheModeItWasAcceptedUnder`, and
+  `testARequestedPausedReadKeepsThePensCopyAndLeavesPauseSaved`.
+- Keeping the menu open across a read change reproduced a menu recursion crash
+  unrelated to this change's command. `NeoBridgeMac-2026-10-21-225953.ips` records
+  `EXC_BAD_ACCESS` / `SIGSEGV` with "Thread stack size exceeded due to excessive
+  recursion" and a repeating
+  `MainMenuItemHost.requestUpdate(after:)` → `ViewRendererHost.updateViewGraph` →
+  `ViewGraphRootValueUpdater.render` → `MenuBehavior.menuHostDidChangeMenuItems`
+  cycle. `openspec/changes/fix-open-menu-sync-crash` owns the fix.
+
+Physical A1 acceptance for Sync Now (task 3.3) was not run, because no pen was
+available; the procedure is in `Tests/Hardware/README.md` under "Sync Now acceptance
+(add-sync-now-menu-action)" and every row is marked **Not run**.
+
+Recorded on 2026-10-21.
+
+## Verification for `fix-open-menu-sync-crash`
+
+On 2026-10-22, macOS 27.2 (26B118), `Scripts/remote-mac-build.sh` reported
+**PASSED**, including portable package and integration tests, the SwiftPM app build,
+the Xcode gate, and bundle verification. `(cd Apps/NeoBridgeMac && swift test)`
+passed 187 tests with zero failures, including the menu presentation tests.
+
+The original SwiftUI menu crashed on cycle 6 of the short open-menu no-pen probe
+with the same `MainMenuItemHost` recursion signature. A static menu survived an
+exploratory probe, while several live-content variants crashed; that comparison
+identified the SwiftUI live-update boundary, not one faulty expression. The native
+menu remained running through two no-pen cycles, whose observed final statuses were
+**Failed** and **Not Detected**. The probe printed `timeout` for both because its
+status parser retained a menu-item prefix; the captured status sequences showed
+the settled results.
+
+With a physical A1 powered on and **Sync and Retain** selected, one direct **Sync
+Now** run kept the menu open from **Syncing** (with **Cancel Read** available and
+**Sync Now** disabled) through **Synced 11 seconds ago** (with **Sync Now** enabled).
+**Connection Details…** opened the details window afterward, and no new crash report
+appeared. This is GUI evidence only: no sanitized traffic transcript was captured,
+so the physical A1 acceptance task remains open. No long-duration check is required;
+everyday use can supply follow-up evidence.
+
 ## Fixture sanitization
 
 Verified when the capture-derived handshake fixture landed:

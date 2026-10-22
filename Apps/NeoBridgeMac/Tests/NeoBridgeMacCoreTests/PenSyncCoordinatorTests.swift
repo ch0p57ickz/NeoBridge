@@ -513,6 +513,259 @@ final class PenSyncCoordinatorTests: XCTestCase {
         await finish(fixture)
     }
 
+    // MARK: - Sync Now
+
+    func testSyncNowReadsThePenWithoutWaitingForDiscoveryOrTheInterval() async throws {
+        // No pen is in range and no interval has elapsed, so only the request itself
+        // can start this read.
+        let fixture = makeFixture(pen: nil)
+        fixture.coordinator.start()
+        try await waitUntil("observation to start") { fixture.central.isObserving }
+
+        XCTAssertTrue(fixture.coordinator.requestImmediateRead())
+
+        try await waitUntil("the requested read") { fixture.recorder.startCount == 1 }
+        try await waitUntil("it to settle") { fixture.controller.outcome != nil }
+
+        XCTAssertTrue(try XCTUnwrap(fixture.controller.outcome).isSaved)
+
+        await finish(fixture)
+    }
+
+    func testARequestedReadStopsTheObservationBeforeItScans() async throws {
+        let fixture = makeFixture(
+            pen: PenPeripheral(id: UUID(), name: penName),
+            runner: { central in
+                HandoffRunner(central: central, read: TestRead.result(strokes: [TestRead.stroke()]))
+            }
+        )
+        fixture.coordinator.start()
+
+        // The launch read fixes the starting point, so the handoff below belongs to
+        // the requested read.
+        try await waitUntil("the launch read") { fixture.controller.outcome != nil }
+        try await waitUntil("observation to resume") { fixture.central.isObserving }
+        let before = fixture.central.events.count
+
+        XCTAssertTrue(fixture.coordinator.requestImmediateRead())
+        try await waitUntil("the requested read to scan") {
+            fixture.central.events.count > before + 1
+        }
+
+        XCTAssertEqual(
+            Array(fixture.central.events[before..<(before + 2)]),
+            ["stopObservation", "scan"],
+            "a requested read takes the radio through the same handoff"
+        )
+
+        await finish(fixture)
+    }
+
+    func testAnAcceptedRequestIsHeldWhenTheControllerGoesBusyDuringTheHandoff() async throws {
+        // The publication fails, so the completed read offers the one action a user can
+        // take that makes the controller busy: Retry Export. Its gate stays closed, so
+        // the retry is still in flight while the request is handled.
+        let retry = Gate()
+        let failed = PenExportReport(artifacts: [
+            PenExportArtifact(
+                format: .json,
+                path: "/tmp/ncode-s3-o27-b700-p1.json",
+                byteCount: 1,
+                status: .failed(reason: "the disk is full")
+            )
+        ])
+        let fixture = makeFixture(
+            library: StubImportCoordinator(
+                outcome: .saved(TestRead.save(), export: failed),
+                saving: Gate(isOpen: true),
+                exporting: Gate(isOpen: true),
+                retry: retry
+            )
+        )
+        fixture.coordinator.start()
+
+        // The launch read settles with a failed export, which is what offers the retry.
+        try await waitUntil("the launch read to settle") { fixture.controller.outcome != nil }
+        try await waitUntil("observation to resume") { fixture.central.isObserving }
+        XCTAssertTrue(fixture.controller.canRetryExport)
+
+        // The request is accepted while the schedule is parked and the controller is
+        // idle, and the retry then runs in the same turn — before the loop resumes — so
+        // the controller is already busy by the time the loop reaches the start of the
+        // accepted read. That is the window the observation handoff opens in production.
+        XCTAssertTrue(fixture.coordinator.requestImmediateRead())
+        fixture.controller.retryExport()
+        XCTAssertTrue(fixture.controller.isBusy, "the retry is what makes the controller busy")
+
+        // The accepted request is held rather than dropped: the loop must not lose it,
+        // and it must not start the schedule's own read in its place.
+        try await assertNoReads(fixture, after: 1, window: .milliseconds(200))
+
+        await retry.open()
+
+        // Nothing but the accepted request can start a read here — no interval has
+        // elapsed and the pen in range is not a fresh appearance — so the second read is
+        // the request, taken once the controller is free again.
+        try await waitUntil("the requested read") { fixture.recorder.startCount == 2 }
+        try await waitUntil("it to settle") { fixture.controller.isBusy == false }
+        try await assertNoReads(fixture, after: 2, window: .milliseconds(200))
+
+        XCTAssertNotNil(
+            fixture.recorder.intents.last,
+            "the read started for the request carried the saved-mode Delete transfer intent"
+        )
+
+        await finish(fixture)
+    }
+
+    func testSyncNowIsRefusedWhileAnAutomaticReadIsRunningAndQueuesNothing() async throws {
+        let fixture = makeFixture(recorder: CoordinatorRunnerRecorder(holdsAttempts: true))
+        fixture.coordinator.start()
+
+        try await waitUntil("the automatic read") { fixture.recorder.startCount == 1 }
+
+        // The automatic read started first, so it owns the attempt: the request is
+        // refused rather than queued behind it.
+        XCTAssertFalse(fixture.coordinator.requestImmediateRead())
+        try await assertNoReads(fixture, after: 1, window: .milliseconds(200))
+
+        fixture.recorder.gate.open()
+        try await waitUntil("the read to settle") { fixture.controller.outcome != nil }
+
+        // The refusal queued nothing: the read that won stays the only attempt.
+        try await assertNoReads(fixture, after: 1, window: .milliseconds(200))
+
+        await finish(fixture)
+    }
+
+    func testSyncNowIsRefusedWhileAPenChoiceIsPendingAndWorksOnceItIsAnswered() async throws {
+        let first = PenPeripheral(id: UUID(), name: penName)
+        let second = PenPeripheral(id: UUID(), name: penName)
+        let recorder = CoordinatorRunnerRecorder()
+        let fixture = makeFixture(
+            pen: first,
+            recorder: recorder,
+            runner: { _ in ChoosingRunner(recorder: recorder, candidates: [first, second]) }
+        )
+        fixture.coordinator.start()
+
+        try await waitUntil("the pen choice") { fixture.controller.isAwaitingChoice }
+
+        // A request cannot start a read that would skip the question about which pen
+        // to use.
+        XCTAssertFalse(fixture.coordinator.requestImmediateRead())
+        try await assertNoReads(fixture, after: 1, window: .milliseconds(200))
+
+        fixture.controller.choosePen(second)
+        try await waitUntil("the chosen read to settle") { fixture.controller.outcome != nil }
+        try await waitUntil("observation to resume") { fixture.central.isObserving }
+
+        XCTAssertTrue(fixture.coordinator.requestImmediateRead())
+        try await waitUntil("the requested read") { recorder.startCount == 3 }
+
+        await finish(fixture)
+    }
+
+    func testASecondSyncNowClickStartsNoSecondRead() async throws {
+        let fixture = makeFixture(pen: nil)
+        fixture.coordinator.start()
+        try await waitUntil("observation to start") { fixture.central.isObserving }
+
+        XCTAssertTrue(fixture.coordinator.requestImmediateRead())
+        XCTAssertFalse(fixture.coordinator.requestImmediateRead())
+        XCTAssertFalse(fixture.coordinator.requestImmediateRead())
+
+        try await waitUntil("the requested read") { fixture.recorder.startCount == 1 }
+        try await waitUntil("it to settle") { fixture.controller.outcome != nil }
+        try await assertNoReads(fixture, after: 1, window: .milliseconds(200))
+
+        await finish(fixture)
+    }
+
+    func testARequestedReadReAnchorsTheNextAutomaticInterval() async throws {
+        let fixture = makeFixture(pen: nil)
+        fixture.coordinator.start()
+        try await waitUntil("observation to start") { fixture.central.isObserving }
+
+        // Two minutes into the five-minute interval, the user asks for a read of
+        // their own.
+        fixture.clock.advance(by: .seconds(120))
+        XCTAssertTrue(fixture.coordinator.requestImmediateRead())
+        try await waitUntil("the requested read") { fixture.recorder.startCount == 1 }
+        try await waitUntil("it to settle") { fixture.controller.outcome != nil }
+
+        // The next interval is measured from that read rather than from the schedule's
+        // own launch, so the deadline it replaced is not what starts the next attempt.
+        fixture.clock.advance(by: .seconds(299))
+        try await assertNoReads(fixture, after: 1, window: .milliseconds(200))
+
+        fixture.clock.advance(by: .seconds(1))
+        try await waitUntil("the interval read") { fixture.recorder.startCount == 2 }
+
+        await finish(fixture)
+    }
+
+    func testSyncNowRunsOneRetainingReadWhilePausedAndLeavesItPaused() async throws {
+        let fixture = makeFixture(mode: .paused)
+        fixture.coordinator.start()
+
+        // The paused schedule stops its observation before it waits for a wake-up, and
+        // nothing else it does is observable, so that is what says it can accept a
+        // request.
+        try await waitUntil("the paused schedule to wait") { fixture.central.didStopObservation }
+        XCTAssertFalse(fixture.central.isObserving, "Paused must not discover the pen")
+
+        XCTAssertTrue(fixture.coordinator.requestImmediateRead())
+        try await waitUntil("the requested read") { fixture.recorder.startCount == 1 }
+        try await waitUntil("it to settle") { fixture.controller.outcome != nil }
+
+        XCTAssertNil(
+            fixture.recorder.intents[0],
+            "a paused request asks for no deleting transfer"
+        )
+        XCTAssertEqual(
+            fixture.controller.outcome?.cleanup,
+            .retainedByChoice,
+            "the one read Pause allows keeps the pen's copy"
+        )
+        XCTAssertEqual(fixture.controller.syncMode, .paused, "the saved setting is left alone")
+        XCTAssertEqual(fixture.controller.menuStatus, .paused)
+
+        // Paused stayed paused: the observation is not running and no interval starts
+        // another read.
+        fixture.clock.advance(by: .seconds(1800))
+        try await assertNoReads(fixture, after: 1, window: .milliseconds(200))
+        XCTAssertFalse(fixture.central.isObserving)
+
+        // Choosing a mode is what resumes the schedule.
+        fixture.controller.selectSyncMode(.retain)
+        try await waitUntil("a read after resuming") { fixture.recorder.startCount == 2 }
+
+        await finish(fixture)
+    }
+
+    func testARequestedReadKeepsTheModeItWasAcceptedUnder() async throws {
+        let fixture = makeFixture(mode: .paused, pen: nil)
+        fixture.coordinator.start()
+        try await waitUntil("the paused schedule to wait") { fixture.central.didStopObservation }
+
+        // Accepted while Pause is saved, and the user selects Delete before the read
+        // starts: the read keeps what they saw, and the new mode is what is saved.
+        XCTAssertTrue(fixture.coordinator.requestImmediateRead())
+        fixture.controller.selectSyncMode(.delete)
+        try await waitUntil("the requested read to settle") { fixture.controller.outcome != nil }
+
+        try await assertNoReads(fixture, after: 1, window: .milliseconds(200))
+        XCTAssertNil(
+            fixture.recorder.intents[0],
+            "the mode captured at acceptance was Pause, so no deleting transfer is asked for"
+        )
+        XCTAssertEqual(fixture.controller.outcome?.cleanup, .retainedByChoice)
+        XCTAssertEqual(fixture.controller.syncMode, .delete)
+
+        await finish(fixture)
+    }
+
     // MARK: - Helpers
 
     private struct Fixture {

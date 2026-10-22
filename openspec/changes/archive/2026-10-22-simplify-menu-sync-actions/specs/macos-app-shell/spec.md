@@ -24,12 +24,12 @@ The menu SHALL offer **Sync and Delete**, **Sync and Retain**, and **Pause** as 
 #### Scenario: Pause prevents future syncs
 
 - **WHEN** the user selects Pause
-- **THEN** Pause is saved, pending discovery stops, and no new sync begins until the user selects Sync and Delete or Sync and Retain
+- **THEN** Pause is saved, pending automatic discovery stops, and no automatic sync begins until the user selects Sync and Delete or Sync and Retain; a separate Sync Now request may still start one retaining read
 
 #### Scenario: Pause during a sync
 
 - **WHEN** the user selects Pause while a sync is active
-- **THEN** that sync continues and no later sync begins while Pause remains selected
+- **THEN** that sync continues and no later automatic sync begins while Pause remains selected
 
 #### Scenario: Resume by choosing a mode
 
@@ -142,7 +142,7 @@ Counts, export paths, cleanup explanations, and failure details SHALL be absent 
 
 ### Requirement: Default cleanup and retention choice are visible
 
-The app SHALL default to Sync and Delete on first install and retain the selected mode across launches. The saved Delete mode SHALL authorize deleting transfers for eligible automatic syncs without per-read confirmation; each transfer still requires a requested export, safe transfer evidence, matching pen identity, and durable packet storage. Sync and Delete SHALL send no separate deletion command after a read or export retry. The app SHALL report retention, acknowledged removal, or skipped cleanup accurately.
+The app SHALL default to Sync and Delete on install and retain the selected mode across launches. The saved Delete mode SHALL authorize eligible automatic deleting transfers without per-read confirmation; each transfer still requires a requested export, safe transfer evidence, matching pen identity, and durable packet storage. Sync and Delete SHALL send no separate deletion command after a read or export retry. The app SHALL report retention, acknowledged removal, or skipped cleanup accurately.
 
 #### Scenario: Default cleanup is presented
 

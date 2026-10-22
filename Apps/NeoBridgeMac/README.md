@@ -3,9 +3,10 @@
 A menu-bar app that reads offline strokes from a Neo Smartpen A1 over Bluetooth,
 saves them to a durable local library, and writes deterministic page files to a
 folder you choose. It syncs on its own: discovery starts with the app, a read
-starts when the pen appears, and another is offered at the interval you saved. You
-choose once whether a sync removes its verified data from the pen or keeps the
-pen's copy, and the app follows that saved setting until you change it.
+starts when the pen appears, and another is offered at the interval you saved.
+**Sync Now** in the menu starts one read immediately, from any mode. You choose once
+whether a sync removes its verified data from the pen or keeps the pen's copy, and
+the app follows that saved setting until you change it.
 
 For the recorded pen identity, a sync you saved as **Sync and Delete**, that
 requests an export, and that has a writable library removes each packet from the
@@ -123,6 +124,18 @@ The app syncs without being asked. Discovery starts at launch, a read starts whe
 a compatible pen appears, and another read is offered at each saved interval while
 the app runs and is unpaused.
 
+**Sync Now** starts one read immediately, without waiting for discovery or the
+interval and without changing either saved setting. It is offered in every mode, so
+it works while **Pause** is selected. The read follows the saved mode the request was
+accepted under, so it requests a deleting transfer in **Sync and Delete** and an
+ordinary non-destructive read in **Sync and Retain** or **Pause**; a mode changed
+after acceptance governs later opportunities instead. One read runs at a time: **Sync
+Now** is disabled while a read or a pen choice is in progress, and the first accepted
+manual or automatic request owns the single attempt, so a click that loses that race
+starts nothing rather than queueing a second read. The next interval is measured from
+the manual attempt's own start, so the read you asked for is not repeated a moment
+later.
+
 | Setting | Choices | First-install default |
 | --- | --- | --- |
 | Mode | **Sync and Delete**, **Sync and Retain**, **Pause** | Sync and Delete |
@@ -136,16 +149,17 @@ setting.
 
 - **Sync and Delete** removes each packet the library has stored, as the deleting
   transfer that reads it acknowledges it. The saved mode is the authorization for
-  each eligible automatic sync, so no extra click is needed per sync. Every transfer
-  gate still decides: a sync with no export folder chosen, without safe transfer
-  evidence, meeting a different pen, or without a writable library keeps the pen's
-  copy, and Connection Details names the reason. An automatic sync never falls back
-  to the separate deletion command, including after a refused route or an export
-  retry.
+  each eligible sync — automatic or requested — so no extra click is needed per sync.
+  Every transfer gate still decides: a sync with no export folder chosen, without safe
+  transfer evidence, meeting a different pen, or without a writable library keeps the
+  pen's copy, and Connection Details names the reason. Neither an automatic nor a
+  requested sync falls back to the separate deletion command, including after a
+  refused route or an export retry.
 - **Sync and Retain** reads the pen and keeps its copy. It requests no deletion.
-- **Pause** stops discovery and the interval timer, so no pen is looked for and no
-  read starts. A read already in flight finishes and reports itself. Selecting
-  **Sync and Delete** or **Sync and Retain** saves that mode and resumes.
+- **Pause** stops discovery and the interval timer, so the schedule looks for no pen
+  and starts no read. **Sync Now** still runs one read, which keeps the pen's copy. A
+  read already in flight finishes and reports itself. Selecting **Sync and Delete** or
+  **Sync and Retain** saves that mode and resumes.
 
 ### Timing
 
@@ -170,11 +184,12 @@ setting.
 
 ### Where the app says what
 
-The menu holds one compact status line, the saved settings, and the actions that
-apply to the sync in progress. Counts, export paths, cleanup explanations, and
-failure details are in **Connection Details**, so the menu stays a control surface
-rather than a report. Both surfaces write the same saved settings, so a change in
-either is what the next automatic attempt uses.
+The menu holds one compact status line, the saved settings, the command that starts
+a read on request, and the actions that apply to the sync in progress. Counts, export
+paths, cleanup explanations, and failure details are in **Connection Details**, so the
+menu stays a control surface rather than a report. Both surfaces write the same saved
+settings, so a change in either is what the next attempt uses, whether the schedule or
+**Sync Now** starts it.
 
 | Status line | When |
 | --- | --- |
@@ -187,12 +202,13 @@ either is what the next automatic attempt uses.
 
 A read in flight outranks the saved mode, so pausing during a read still reports
 that read; the mode item's own checkmark is what says the schedule stopped. A read
-that reached the pen and carried no strokes still counts as synced — the pen was
-there and was read, so **Not Detected** would be false. A cancelled read records
-nothing, so the previous status stays on show, and an export retry leaves it alone
-whether it succeeds or fails: the line answers "when did the pen last sync", not
-"when was a file last written". Connection Details names the specific reason behind
-**Not Detected** or **Failed**.
+the menu started with **Sync Now** reports under these same rules, so the line cannot
+tell a requested read and a scheduled one apart. A read that reached the pen and
+carried no strokes still counts as synced — the pen was there and was read, so **Not
+Detected** would be false. A cancelled read records nothing, so the previous status
+stays on show, and an export retry leaves it alone whether it succeeds or fails: the
+line answers "when did the pen last sync", not "when was a file last written".
+Connection Details names the specific reason behind **Not Detected** or **Failed**.
 
 ## Building and running
 
@@ -338,8 +354,8 @@ success is claimed only when every requested file is in place.
 - **Retry Export** appears when a read saved but at least one file failed, in the
   menu while that read is the one shown and in Connection Details. It republishes
   from the stored rows without reading the pen again, so a retry can never invent a
-  result from data that was not stored, and an automatic retry never sends a
-  deletion command.
+  result from data that was not stored, and a retry of a saved-mode or **Sync Now**
+  read never sends a deletion command either.
 
 ## Pen cleanup
 
@@ -350,25 +366,27 @@ safe.
 There are two cleanup routes, and the app can only use one of them:
 
 - The **deleting transfer**, which the app uses. A sync saved as **Sync and Delete**,
-  that requests an export, matches the recorded pen identity, and has durable packet
-  storage asks the pen to remove each packet as part of the transfer that reads it.
-  The library commits a packet before the app acknowledges it, so what is removed is
-  what is already stored.
+  whether the schedule started it or you selected **Sync Now**, that requests an
+  export, matches the recorded pen identity, and has durable packet storage asks the
+  pen to remove each packet as part of the transfer that reads it. The library commits
+  a packet before the app acknowledges it, so what is removed is what is already
+  stored.
 - The separate **`0x25`/`0x27` deletion commands**, which the app cannot send. The
   session supplies no deletion sender, so no such frame is built, and the command
-  evidence record's deletion-scope verdict is `unsafe`. No automatic sync reaches
-  this route at all, not even after a refused transfer or an export retry.
+  evidence record's deletion-scope verdict is `unsafe`. No automatic or requested
+  sync reaches this route at all, not even after a refused transfer or an export
+  retry.
 
 ### What the saved mode means for the pen's copy
 
 - **Sync and Delete** is the first-install default, and it is what the app follows
-  until you change it. It authorizes the deleting transfer for each eligible
-  automatic sync, so there is no per-sync confirmation click. Connection Details
-  shows the statement the setting is about: "Sync and Delete removes each packet
-  saved to the local library from the pen when the read acknowledges it. A read that
-  requests no export, lacks safe transfer evidence, meets a different pen, or has no
-  writable library keeps the pen's copy instead, and Connection Details names the
-  reason."
+  until you change it. It authorizes the deleting transfer for each eligible sync —
+  the automatic ones and a **Sync Now** read alike — so there is no per-sync
+  confirmation click. Connection Details shows the statement the setting is about:
+  "Sync and Delete removes each packet saved to the local library from the pen when
+  the read acknowledges it. A read that requests no export, lacks safe transfer
+  evidence, meets a different pen, or has no writable library keeps the pen's copy
+  instead, and Connection Details names the reason."
 - **Sync and Retain** reads the pen and keeps its copy. The read reports that the
   strokes were kept because retention was chosen.
 - The setting is not proof that deletion happened. It asks for a deleting transfer;
@@ -376,7 +394,11 @@ There are two cleanup routes, and the app can only use one of them:
   the transfer's, not the setting's.
 - A mode or interval changed while a read is running applies to later attempts. The
   read already captured its own transfer, so changing the setting cannot change what
-  that read does.
+  that read does. **Sync Now** captures the mode when the request is accepted, so a
+  mode changed after the click governs later opportunities, not the read in flight.
+- A **Sync Now** read in **Pause** is the one ordinary non-destructive read the menu
+  may start there: it keeps the pen's copy, and when it settles the app is still
+  paused — no discovery, no interval — until the saved mode is changed.
 - The headless acceptance run is driven directly rather than by the schedule, so its
   deleting transfer stays behind its own explicit confirmation:
   `NEOBRIDGE_ACCEPTANCE_CONFIRM_CLEANUP` is what authorizes it, not a saved mode.
@@ -391,7 +413,7 @@ checked against the handshake:
   library plus the requested files is the user's path back to the data; a sync with
   no export folder chosen follows the ordinary retention rule instead.
 - The saved mode is **Sync and Delete**, which is the authorization for an automatic
-  sync.
+  sync and for a **Sync Now** request accepted while that mode is saved.
 - The connected pen matches the recorded identity: NWP-F151, firmware 3.00,
   protocol 2.23, uncompressed. A different identity takes the ordinary
   non-destructive read and the app names the blocker, because the pen's identity is
@@ -457,16 +479,18 @@ resolves nothing.
 
 The app runs as an accessory: `Info.plist` sets `LSUIElement`, so there is no
 Dock icon, and closing the window leaves the menu-bar item in place. The menu shows
-one status line, then the settings and the actions that apply to the sync in
-progress; everything else the app reports is in **Connection Details**.
+one status line, then the settings, the command that starts a read on request, and the
+actions that apply to the sync in progress; everything else the app reports is in
+**Connection Details**.
 
 | Command | Shown when | What it does |
 | --- | --- | --- |
 | The status line, such as `Synced 3 minutes ago` | Always | Disabled text, not a command. It reads Idle, Syncing, Paused, the last completed read with its elapsed time, Not Detected, or Failed |
-| **Sync and Delete** | Always, checked while it is the saved mode | Saves the mode and lets automatic syncs request a deleting transfer |
-| **Sync and Retain** | Always, checked while it is the saved mode | Saves the mode; automatic syncs read the pen and keep its copy |
+| **Sync and Delete** | Always, checked while it is the saved mode | Saves the mode; syncs, automatic or requested, go through the deleting transfer's gates |
+| **Sync and Retain** | Always, checked while it is the saved mode | Saves the mode; syncs read the pen and keep its copy |
 | **Pause** | Always, checked while it is the saved mode | Saves the mode; discovery and the interval timer stop, and a read in flight is left to finish |
 | **Sync Interval** submenu | Always | Offers **1 minute**, **5 minutes**, **15 minutes**, and **30 minutes**, with the saved one checked |
+| **Sync Now** | Always, disabled while a read or a pen choice is active | Starts one read now under the saved mode captured when you click, without changing the saved settings |
 | **Cancel Read** | A read is running | Stops the scan or the read and returns to idle |
 | A numbered pen entry, such as `Neosmartpen_A1 (pen 1)` | Two or more pens matched | Reads the pen you pick |
 | **Retry Export** | A read saved but a file failed | Republishes the stored read's files from the library |
@@ -476,6 +500,15 @@ progress; everything else the app reports is in **Connection Details**.
 Clicking the mode that is already checked clears its checkmark, which is not a
 setting the app has, so the clear is ignored: the three modes are one choice, and
 only selecting a different one changes it. The same applies to the interval.
+
+**Sync Now** is disabled while a read or a pen choice is in progress, so the command
+cannot start a second read. It is still offered in **Pause**, which is the one read
+the menu may start there; the saved mode stays **Pause**, so the schedule does not
+resume when that read settles.
+
+The status item uses a native AppKit menu. It updates its items in place while open
+as read state changes, avoiding the SwiftUI menu-host recursion observed on macOS
+27.0.1 and 27.2. The details window remains a SwiftUI scene and starts closed.
 
 The menu deliberately carries one status line and nothing else it would have to
 explain: no counts, no export path, no cleanup prose, and no failure text. They are

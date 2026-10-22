@@ -195,26 +195,59 @@ enum PenSyncAppComposition {
     }
 }
 
+/// Installs the AppKit status item that presents the menu.
+///
+/// The status item is AppKit rather than a SwiftUI `.menu`-style `MenuBarExtra`,
+/// because that host recursed while a read changed state with the menu open (see
+/// ``PenSyncMenuBarController``). The delegate owns it for the process's lifetime and
+/// keeps the app alive once the details window closes.
+@MainActor
+final class NeoBridgeMacAppDelegate: NSObject, NSApplicationDelegate {
+    /// The status item and its menu, held for the process's lifetime.
+    private var menuBarController: PenSyncMenuBarController?
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        let runtime = PenSyncAppComposition.runtime()
+        menuBarController = PenSyncMenuBarController(
+            controller: runtime.controller,
+            coordinator: runtime.coordinator,
+            activation: PenSyncActivation()
+        )
+    }
+
+    /// Keeps the menu-bar app running after the details window closes.
+    ///
+    /// With no `MenuBarExtra` scene left, SwiftUI would otherwise treat the details
+    /// window as the app's only reason to run and terminate when it closes.
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        false
+    }
+}
+
 /// The menu-bar app.
 ///
 /// The app runs as an accessory: `Info.plist` sets `LSUIElement`, so there is no
-/// Dock icon and no window until the user asks for one. All state lives in one
-/// ``PenSyncController`` and one ``PenSyncCoordinator``; the menu and the window
-/// are two views of the controller, and the schedule is what starts reads.
+/// Dock icon. All state lives in one ``PenSyncController`` and one
+/// ``PenSyncCoordinator``; the status item's menu and the details window are two views
+/// of the controller, and the schedule is what starts reads.
 struct NeoBridgeMacApp: App {
+    @NSApplicationDelegateAdaptor(NeoBridgeMacAppDelegate.self) private var delegate
     @State private var runtime = PenSyncAppComposition.runtime()
-    @State private var activation = PenSyncActivation()
 
     var body: some Scene {
-        MenuBarExtra("NeoBridge", systemImage: "pencil.tip") {
-            PenSyncMenu(controller: runtime.controller, activation: activation)
-        }
-        .menuBarExtraStyle(.menu)
-
         Window(PenSyncScene.windowTitle, id: PenSyncScene.windowID) {
             PenSyncView(controller: runtime.controller)
         }
         .defaultSize(width: 560, height: 620)
         .windowResizability(.contentMinSize)
+        // The details window is opened from the status-item menu, not at launch. Without
+        // this the app would show it on every launch, which it did not before.
+        .defaultLaunchBehavior(.suppressed)
+        .commands {
+            // The AppKit status item cannot read SwiftUI's environment, so the
+            // window-opening action is captured here, where the command menu is built at
+            // launch even though the window is not.
+            CommandGroup(replacing: .newItem) { PenSyncOpenWindowCapture() }
+        }
     }
 }

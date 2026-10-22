@@ -4,12 +4,12 @@
 
 ### Requirement: Pen battery and storage presentation
 
-After a successful A1 read, the app SHALL show battery percentage, charging state, and percentage of pen storage used in the menu and details window. It SHALL clear the previous measurement when a new read begins and SHALL not show an unmeasured value as current.
+After a successful A1 read, the app SHALL show battery percentage, charging state, and percentage of pen storage used in Connection Details. It SHALL clear the previous measurement when a new read begins and SHALL not show an unmeasured value as current.
 
 #### Scenario: Successful state query
 
 - **WHEN** the pen reports 94% battery, not charging, and 10% storage used
-- **THEN** both surfaces show those measurements with their correct labels
+- **THEN** Connection Details shows those measurements with their correct labels
 
 #### Scenario: Read begins again
 

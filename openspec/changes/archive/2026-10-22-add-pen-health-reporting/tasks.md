@@ -9,7 +9,7 @@
 ## 2. macOS presentation
 
 - [x] 2.1 Enable the query in the A1 runner and carry its result through read models and controller, clearing old values on a new read; verify controller tests cover the lifecycle.
-- [x] 2.2 Show battery, charging, and storage used in the menu and details window; verify app build and UI behavior on the Mac runner.
+- [x] 2.2 Show battery, charging, and storage used in Connection Details; verify app build and UI behavior on the Mac runner. The later compact-menu decision supersedes the original menu placement.
 
   Note: verified on 2026-10-21 against a physical A1 on `Jamess-MacBook-Pro-M4.local` (macOS 27.2, Xcode 27.1). A completed automatic Retain read displayed "Battery: 92% · Not charging" and "Pen storage used: 1%" in Connection Details, and a fresh sanitized `0x84` probe taken immediately afterwards reported `battery 92% charging false storageUsed 1%`. The state query follows the handshake: the sanitized transcript's `outboundCommands` is `0x01,0x04,0x21,0x22,0x23,0xA4`, so `0x04` precedes discovery.
 

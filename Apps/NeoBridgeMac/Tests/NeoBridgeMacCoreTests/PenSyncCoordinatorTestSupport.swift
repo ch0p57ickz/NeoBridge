@@ -144,3 +144,33 @@ struct HandoffRunner: PenSyncRunning {
         return read
     }
 }
+
+/// A runner that asks for a pen choice on its first attempt and settles afterwards.
+///
+/// An unanswered question is a state the schedule has to hold through — no second
+/// read may start while it is open — so a test needs an attempt that ends in that
+/// state and a later attempt that finishes. The recorder still counts both attempts
+/// and holds the second one open, which is what the other schedule tests use it for.
+struct ChoosingRunner: PenSyncRunning {
+    let recorder: CoordinatorRunnerRecorder
+    let candidates: [PenPeripheral]
+
+    func run(
+        deletingRead: PenDeletingReadIntent?,
+        report: @escaping @Sendable (PenSyncStage) -> Void
+    ) async throws -> PenReadResult {
+        recorder.begin(intent: deletingRead)
+        report(.scanning)
+
+        guard recorder.startCount > 1 else {
+            throw PenBluetoothError.multiplePensFound(
+                advertisedName: CoreBluetoothPenTransport.advertisedName,
+                candidates: candidates
+            )
+        }
+
+        try await recorder.gate.wait()
+        if let failure = recorder.failure { throw failure }
+        return recorder.read
+    }
+}

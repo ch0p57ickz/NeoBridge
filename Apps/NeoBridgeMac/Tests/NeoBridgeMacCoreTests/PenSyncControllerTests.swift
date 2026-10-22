@@ -1965,6 +1965,656 @@ final class PenSyncControllerTests: XCTestCase {
         )
     }
 
+    // MARK: - Requested reads
+
+    func testARequestedDeleteReadAsksForTheDeletingTransferWithoutAnotherClick() async throws {
+        let library = try makeLibrary()
+        defer { library.remove() }
+        let intents = DeletingReadRecorder()
+        let read = TestRead.deletingResult(strokes: [TestRead.stroke()], packetCount: 1, isComplete: true)
+        let (preferences, defaults, suiteName) = makeSavedMode(.delete)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let controller = makeController(
+            library: StubImportCoordinator(outcome: .saved(TestRead.save(), export: nil)),
+            destination: library.destination,
+            intents: intents,
+            preferences: preferences,
+            outcome: .success(read)
+        )
+
+        // The per-read route would still be waiting for a click of its own.
+        XCTAssertTrue(controller.needsCleanupConfirmation)
+
+        controller.readOnRequest(savedMode: .delete)
+        try await waitForAttemptToSettle(controller)
+
+        // The saved mode is the standing authorization, so the requested read reaches
+        // the same deleting transfer an automatic read would.
+        let intent = try XCTUnwrap(intents.values.first ?? nil)
+        XCTAssertTrue(intent.confirmedForThisSync)
+        XCTAssertTrue(intent.requestedExport)
+        XCTAssertTrue(intent.durablePacketStorageAvailable)
+        XCTAssertTrue(try XCTUnwrap(controller.outcome).isDeletingRead)
+    }
+
+    func testARequestedDeleteReadFallsBackWhenNoExportIsRequested() async throws {
+        let library = try makeLibrary()
+        defer { library.remove() }
+        let intents = DeletingReadRecorder()
+        let coordinator = StubImportCoordinator(outcome: .saved(TestRead.save(), export: nil))
+        await coordinator.saving.open()
+        await coordinator.exporting.open()
+        let (preferences, defaults, suiteName) = makeSavedMode(.delete)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let controller = makeController(
+            library: coordinator,
+            destination: NoExportDestination(),
+            intents: intents,
+            preferences: preferences,
+            outcome: .success(TestRead.result(strokes: [TestRead.stroke()]))
+        )
+
+        controller.readOnRequest(savedMode: .delete)
+        try await waitForAttemptToSettle(controller)
+
+        XCTAssertEqual(intents.values.count, 1)
+        XCTAssertNil(intents.values[0], "a closed route must not ask for a deleting transfer")
+        let outcome = try XCTUnwrap(controller.outcome)
+        XCTAssertTrue(outcome.isSaved, "the fallback still saves the read")
+        XCTAssertFalse(outcome.reclaimedPenCopy)
+        guard case .skipped(let reason) = outcome.cleanup else {
+            return XCTFail("expected a skipped cleanup, got \(outcome.cleanup)")
+        }
+        XCTAssertTrue(reason.contains("export"), reason)
+
+        let requested = await coordinator.requestedCleanupCount()
+        XCTAssertEqual(
+            requested,
+            0,
+            "a requested Delete read removes packets only through its deleting transfer"
+        )
+    }
+
+    func testARequestedDeleteReadFallsBackWhenTheRouteClosesAfterTheHandshake() async throws {
+        let library = try makeLibrary()
+        defer { library.remove() }
+        // The connected pen's identity is not the one the transfer evidence covers, so
+        // the session read non-destructively and named the blocker.
+        let refusal = "the deleting-transfer evidence gate is closed for protocol 2.18"
+        let read = TestRead.refusedDeletingResult(strokes: [TestRead.stroke()], refusal: refusal)
+        let coordinator = StubImportCoordinator(
+            outcome: .saved(TestRead.save(), export: nil),
+            cleanup: .reclaimed(pageCount: 1)
+        )
+        await coordinator.saving.open()
+        await coordinator.exporting.open()
+        let (preferences, defaults, suiteName) = makeSavedMode(.delete)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let controller = makeController(
+            library: coordinator,
+            destination: library.destination,
+            preferences: preferences,
+            outcome: .success(read)
+        )
+
+        controller.readOnRequest(savedMode: .delete)
+        try await waitForAttemptToSettle(controller)
+
+        let outcome = try XCTUnwrap(controller.outcome)
+        XCTAssertFalse(outcome.isDeletingRead, "the refusal makes it an ordinary read")
+        XCTAssertTrue(outcome.isSaved)
+        XCTAssertEqual(outcome.cleanup, .skipped(reason: refusal))
+
+        let requested = await coordinator.requestedCleanupCount()
+        XCTAssertEqual(requested, 0, "the fallback sends no separate deletion command")
+    }
+
+    func testARequestedRetainReadSavesAndRequestsNoDeletion() async throws {
+        let library = try makeLibrary()
+        defer { library.remove() }
+        let (preferences, defaults, suiteName) = makeSavedMode(.retain)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let controller = makeController(
+            library: library.importer,
+            destination: library.destination,
+            preferences: preferences,
+            outcome: .success(
+                TestRead.result(strokes: [TestRead.stroke(), TestRead.stroke(x: 20)])
+            )
+        )
+
+        controller.readOnRequest(savedMode: .retain)
+        try await waitForAttemptToSettle(controller)
+
+        // A requested read runs the ordinary route, so it commits and publishes
+        // exactly as an automatic one does.
+        let outcome = try XCTUnwrap(controller.outcome)
+        XCTAssertTrue(outcome.isSaved)
+        XCTAssertTrue(outcome.exportSucceeded)
+        XCTAssertEqual(
+            try library.exportedFiles(),
+            [
+                "ncode-s3-o27-b700-p1.json",
+                "ncode-s3-o27-b700-p1.md",
+                "ncode-s3-o27-b700-p1.svg",
+            ]
+        )
+        XCTAssertEqual(outcome.cleanup, .retainedByChoice)
+        XCTAssertEqual(controller.syncMode, .retain, "the saved setting is left as it was")
+
+        let outstanding = try await library.library.outstandingScopes()
+        XCTAssertEqual(outstanding, [], "a retaining read journals no cleanup request")
+    }
+
+    func testARequestedPausedReadKeepsThePensCopyAndLeavesPauseSaved() async throws {
+        let library = try makeLibrary()
+        defer { library.remove() }
+        let intents = DeletingReadRecorder()
+        let (preferences, defaults, suiteName) = makeSavedMode(.paused)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let controller = makeController(
+            library: library.importer,
+            destination: library.destination,
+            intents: intents,
+            preferences: preferences,
+            outcome: .success(TestRead.result(strokes: [TestRead.stroke()]))
+        )
+
+        controller.readOnRequest(savedMode: .paused)
+        try await waitForAttemptToSettle(controller)
+
+        // Pause authorizes no deletion, so the one read the menu may start there keeps
+        // the pen's copy and leaves the saved setting as it found it.
+        XCTAssertNil(intents.values[0], "a paused request asks for no deleting transfer")
+        let outcome = try XCTUnwrap(controller.outcome)
+        XCTAssertTrue(outcome.isSaved)
+        XCTAssertEqual(outcome.cleanup, .retainedByChoice)
+        XCTAssertEqual(controller.syncMode, .paused)
+        XCTAssertEqual(controller.statusLabel, "Complete")
+        XCTAssertEqual(
+            controller.menuStatus,
+            .paused,
+            "the status reports the saved mode once the read has settled"
+        )
+    }
+
+    func testARequestedReadKeepsTheModeCapturedAtAcceptanceThroughAPenChoice() async throws {
+        let library = try makeLibrary()
+        defer { library.remove() }
+        let first = PenPeripheral(id: UUID(), name: penName)
+        let second = PenPeripheral(id: UUID(), name: penName)
+        let intents = DeletingReadRecorder()
+        let counter = RunnerCounter()
+        let read = TestRead.deletingResult(strokes: [TestRead.stroke()], packetCount: 1, isComplete: true)
+        let penName = self.penName
+        let (preferences, defaults, suiteName) = makeSavedMode(.delete)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let controller = PenSyncController(
+            runners: PenSyncRunnerFactory { _ in
+                counter.increment()
+                if counter.value == 1 {
+                    return StubPenSyncRunner(
+                        stages: [.scanning],
+                        outcome: .failure(
+                            PenBluetoothError.multiplePensFound(
+                                advertisedName: penName,
+                                candidates: [first, second]
+                            )
+                        ),
+                        intents: intents
+                    )
+                }
+                return StubPenSyncRunner(
+                    stages: [.scanning, .syncing],
+                    outcome: .success(read),
+                    intents: intents
+                )
+            },
+            library: StubImportCoordinator(outcome: .saved(TestRead.save(), export: nil)),
+            destination: library.destination,
+            deletingReadStorage: .stub,
+            preferences: preferences
+        )
+
+        controller.readOnRequest(savedMode: .delete)
+        try await waitForAttemptToSettle(controller)
+        XCTAssertTrue(controller.isAwaitingChoice)
+
+        // The user changes the saved mode while the question is open. That governs
+        // later opportunities; the read they already asked for keeps its own.
+        controller.selectSyncMode(.retain)
+        controller.choosePen(second)
+        try await waitForAttemptToSettle(controller)
+
+        XCTAssertEqual(intents.values.count, 2)
+        XCTAssertTrue(
+            try XCTUnwrap(intents.values[1] ?? nil).confirmedForThisSync,
+            "the chosen read keeps the mode the request was accepted under"
+        )
+        XCTAssertTrue(try XCTUnwrap(controller.outcome).isDeletingRead)
+        XCTAssertEqual(controller.syncMode, .retain)
+    }
+
+    func testARequestedReadIsIgnoredWhileAnotherReadIsRunning() async throws {
+        let library = try makeLibrary()
+        defer { library.remove() }
+        let counter = RunnerCounter()
+        let (preferences, defaults, suiteName) = makeSavedMode(.delete)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let controller = PenSyncController(
+            runners: PenSyncRunnerFactory { _ in
+                counter.increment()
+                return StubPenSyncRunner(stages: [.scanning], outcome: .waitsForCancellation)
+            },
+            library: library.importer,
+            destination: library.destination,
+            deletingReadStorage: .stub,
+            preferences: preferences
+        )
+
+        controller.readOnRequest(savedMode: .delete)
+        try await waitUntil(controller, is: .scanning)
+        controller.readOnRequest(savedMode: .delete)
+
+        XCTAssertEqual(counter.value, 1, "a second request must not start a second scan")
+        controller.cancel()
+    }
+
+    func testARequestedReadIsIgnoredWhileAPenChoiceIsPending() async throws {
+        let library = try makeLibrary()
+        defer { library.remove() }
+        let first = PenPeripheral(id: UUID(), name: penName)
+        let second = PenPeripheral(id: UUID(), name: penName)
+        let counter = RunnerCounter()
+        let penName = self.penName
+        let (preferences, defaults, suiteName) = makeSavedMode(.delete)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let controller = PenSyncController(
+            runners: PenSyncRunnerFactory { _ in
+                counter.increment()
+                return StubPenSyncRunner(
+                    stages: [.scanning],
+                    outcome: .failure(
+                        PenBluetoothError.multiplePensFound(
+                            advertisedName: penName,
+                            candidates: [first, second]
+                        )
+                    )
+                )
+            },
+            library: library.importer,
+            destination: library.destination,
+            deletingReadStorage: .stub,
+            preferences: preferences
+        )
+
+        controller.readOnRequest(savedMode: .delete)
+        try await waitForAttemptToSettle(controller)
+        XCTAssertTrue(controller.isAwaitingChoice)
+
+        controller.readOnRequest(savedMode: .delete)
+
+        XCTAssertEqual(
+            counter.value,
+            1,
+            "a request must not start a read that would skip the question about which pen to use"
+        )
+        controller.cancel()
+    }
+
+    func testAFailedRequestedReadReportsItsError() async throws {
+        let library = try makeLibrary()
+        defer { library.remove() }
+        let (preferences, defaults, suiteName) = makeSavedMode(.delete)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let controller = makeController(
+            library: library.importer,
+            destination: library.destination,
+            preferences: preferences,
+            outcome: .failure(PenSessionError.incompleteTransfer(assembledPacketCount: 3))
+        )
+
+        controller.readOnRequest(savedMode: .delete)
+        try await waitForAttemptToSettle(controller)
+
+        XCTAssertNil(controller.outcome, "an interrupted transfer is not a completed sync")
+        XCTAssertEqual(
+            controller.errorMessage,
+            PenSessionError.incompleteTransfer(assembledPacketCount: 3).message
+        )
+        XCTAssertEqual(controller.errorDiagnostic, "3 packets arrived before the pen stopped sending.")
+        XCTAssertEqual(controller.menuStatus, .failed)
+        XCTAssertFalse(
+            controller.canRetryExport,
+            "a read that stored nothing offers no export retry"
+        )
+    }
+
+    func testCancellingARequestedReadReportsNoCompletionAndLeavesTheModeSaved() async throws {
+        let library = try makeLibrary()
+        defer { library.remove() }
+        let counter = RunnerCounter()
+        let (preferences, defaults, suiteName) = makeSavedMode(.paused)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let controller = PenSyncController(
+            runners: PenSyncRunnerFactory { _ in
+                counter.increment()
+                return StubPenSyncRunner(
+                    stages: [.scanning, .syncing],
+                    outcome: .waitsForCancellation
+                )
+            },
+            library: library.importer,
+            destination: library.destination,
+            deletingReadStorage: .stub,
+            preferences: preferences
+        )
+
+        controller.readOnRequest(savedMode: .paused)
+        try await waitUntil(controller, is: .syncing)
+
+        controller.cancel()
+
+        XCTAssertEqual(controller.phase, .idle)
+        XCTAssertNil(controller.outcome, "a cancelled request claims no completed sync")
+        XCTAssertEqual(counter.value, 1, "cancelling must not queue another read")
+        XCTAssertEqual(controller.syncMode, .paused, "the saved mode is untouched")
+        XCTAssertEqual(controller.menuStatus, .paused)
+    }
+
+    func testARetryAfterARequestedFallbackAsksForNoSeparateDeletion() async throws {
+        let library = try makeLibrary()
+        defer { library.remove() }
+        // The publication fails on the first attempt, so the completed read offers a
+        // retry. Its deleting route was closed by the missing durable packet storage,
+        // so the retry only republishes from the library.
+        let failed = PenExportReport(artifacts: [
+            PenExportArtifact(
+                format: .json,
+                path: "/tmp/ncode-s3-o27-b700-p1.json",
+                byteCount: 1,
+                status: .failed(reason: "the disk is full")
+            )
+        ])
+        let coordinator = StubImportCoordinator(
+            outcome: .saved(TestRead.save(), export: failed),
+            saving: Gate(isOpen: true),
+            exporting: Gate(isOpen: true),
+            retryReport: PenExportReport(artifacts: [])
+        )
+        let (preferences, defaults, suiteName) = makeSavedMode(.delete)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let controller = makeController(
+            library: coordinator,
+            destination: library.destination,
+            deletingReadStorage: .unavailable,
+            preferences: preferences,
+            outcome: .success(TestRead.result(strokes: [TestRead.stroke()]))
+        )
+
+        controller.readOnRequest(savedMode: .delete)
+        try await waitForAttemptToSettle(controller)
+
+        let read = try XCTUnwrap(controller.outcome)
+        XCTAssertTrue(read.isSaved, "the fallback still saves the read")
+        XCTAssertFalse(read.isDeletingRead)
+        XCTAssertTrue(controller.canRetryExport)
+
+        controller.retryExport()
+        try await waitForAttemptToSettle(controller)
+        XCTAssertTrue(
+            controller.outcome?.exportSucceeded == true,
+            "the retry publishes from the library"
+        )
+
+        let requested = await coordinator.requestedCleanupCount()
+        XCTAssertEqual(
+            requested,
+            0,
+            "a requested Delete read never falls back to the separate deletion command"
+        )
+        XCTAssertEqual(
+            controller.outcome?.cleanup,
+            read.cleanup,
+            "the retry republishes from the library and leaves the pen's copy where it was"
+        )
+    }
+
+    // MARK: - Menu presentation
+
+    func testTheMenuPresentationShowsTheIdleStateWithEverySettingAndNoConditionalCommand()
+        async throws
+    {
+        let library = try makeLibrary()
+        defer { library.remove() }
+        let controller = makeController(
+            library: library.importer,
+            destination: library.destination,
+            outcome: .waitsForCancellation
+        )
+
+        let presentation = PenSyncMenuPresentation.make(from: controller, at: Date())
+
+        XCTAssertEqual(
+            presentation.status,
+            "Idle",
+            "an app that has not read anything reports idle"
+        )
+        XCTAssertEqual(
+            presentation.modes.map(\.title),
+            ["Sync and Delete", "Sync and Retain", "Pause"],
+            "all three saved-mode choices are always offered"
+        )
+        XCTAssertEqual(
+            presentation.modes.filter(\.isSelected).map(\.mode),
+            [.delete],
+            "the first-install mode is the one that carries the checkmark"
+        )
+        XCTAssertEqual(
+            presentation.intervals.map(\.title),
+            ["1 minute", "5 minutes", "15 minutes", "30 minutes"],
+            "every interval choice is offered in the submenu"
+        )
+        XCTAssertEqual(
+            presentation.intervals.filter(\.isSelected).map(\.interval),
+            [.fiveMinutes],
+            "the first-install interval is the one that carries the checkmark"
+        )
+        XCTAssertTrue(presentation.isSyncNowEnabled, "Sync Now is offered while nothing is running")
+        XCTAssertFalse(presentation.isCancelVisible, "there is no read to cancel")
+        XCTAssertFalse(presentation.isChoosingPen, "no pen choice is pending")
+        XCTAssertEqual(presentation.pens, [], "no candidates are offered")
+        XCTAssertFalse(presentation.isRetryExportVisible, "no read has failed to export")
+    }
+
+    func testTheMenuPresentationMovesTheCheckmarkWithTheSavedSetting() async throws {
+        let library = try makeLibrary()
+        defer { library.remove() }
+        let (preferences, defaults, suiteName) = makeSavedMode(.delete)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let controller = makeController(
+            library: library.importer,
+            destination: library.destination,
+            preferences: preferences,
+            outcome: .waitsForCancellation
+        )
+
+        controller.selectSyncMode(.retain)
+        controller.selectSyncInterval(.thirtyMinutes)
+
+        let presentation = PenSyncMenuPresentation.make(from: controller, at: Date())
+
+        XCTAssertEqual(
+            presentation.modes.filter(\.isSelected).map(\.mode),
+            [.retain],
+            "the checkmark follows the saved mode"
+        )
+        XCTAssertEqual(
+            presentation.intervals.filter(\.isSelected).map(\.interval),
+            [.thirtyMinutes],
+            "the checkmark follows the saved interval"
+        )
+    }
+
+    func testTheMenuPresentationDisablesSyncNowAndOffersCancelWhileAReadRuns() async throws {
+        let library = try makeLibrary()
+        defer { library.remove() }
+        let controller = makeController(
+            library: library.importer,
+            destination: library.destination,
+            outcome: .waitsForCancellation
+        )
+
+        controller.readPenData()
+        try await waitUntil(controller, is: .syncing)
+
+        let presentation = PenSyncMenuPresentation.make(from: controller, at: Date())
+
+        XCTAssertEqual(presentation.status, "Syncing")
+        XCTAssertFalse(
+            presentation.isSyncNowEnabled,
+            "a request can only start the read that is not already running"
+        )
+        XCTAssertTrue(presentation.isCancelVisible, "a read in flight can be cancelled")
+
+        controller.cancel()
+    }
+
+    func testTheMenuPresentationReportsNotDetectedAfterAMissingPen() async throws {
+        let library = try makeLibrary()
+        defer { library.remove() }
+        let controller = makeController(
+            library: library.importer,
+            destination: library.destination,
+            outcome: .failure(PenBluetoothError.noMatchingPenFound(advertisedName: penName))
+        )
+
+        controller.readPenData()
+        try await waitForAttemptToSettle(controller)
+
+        let presentation = PenSyncMenuPresentation.make(from: controller, at: Date())
+
+        XCTAssertEqual(
+            presentation.status,
+            "Not Detected",
+            "a missing pen is its own status rather than a generic failure"
+        )
+        XCTAssertTrue(presentation.isSyncNowEnabled, "the user can try again at once")
+        XCTAssertFalse(presentation.isCancelVisible)
+    }
+
+    func testTheMenuPresentationReportsFailedAfterANonPenFailure() async throws {
+        let library = try makeLibrary()
+        defer { library.remove() }
+        let controller = makeController(
+            library: library.importer,
+            destination: library.destination,
+            outcome: .failure(PenBluetoothError.notConnected)
+        )
+
+        controller.readPenData()
+        try await waitForAttemptToSettle(controller)
+
+        let presentation = PenSyncMenuPresentation.make(from: controller, at: Date())
+
+        XCTAssertEqual(
+            presentation.status,
+            "Failed",
+            "a failure that is not a missing pen must not claim the pen was absent"
+        )
+    }
+
+    func testTheMenuPresentationDatesACompletedReadAndItsElapsedLabelAdvances() async throws {
+        let library = try makeLibrary()
+        defer { library.remove() }
+        let controller = makeController(
+            library: library.importer,
+            destination: library.destination,
+            outcome: .success(TestRead.result(strokes: [TestRead.stroke()]))
+        )
+
+        controller.readPenData()
+        try await waitForAttemptToSettle(controller)
+        let stored = syncedDate(controller)
+
+        let justNow = PenSyncMenuPresentation.make(from: controller, at: stored)
+        let later = PenSyncMenuPresentation.make(
+            from: controller,
+            at: stored.addingTimeInterval(3600)
+        )
+
+        XCTAssertEqual(justNow.status, "Synced just now")
+        XCTAssertTrue(
+            later.status.hasPrefix("Synced "),
+            "the line still describes when the last read occurred: \(later.status)"
+        )
+        XCTAssertNotEqual(
+            later.status,
+            justNow.status,
+            "the elapsed label advances as time passes with the menu open"
+        )
+    }
+
+    func testTheMenuPresentationNumbersPenChoicesWithoutAnAddress() async throws {
+        let library = try makeLibrary()
+        defer { library.remove() }
+        let first = PenPeripheral(id: UUID(), name: "Neosmartpen_A1")
+        let second = PenPeripheral(id: UUID(), name: "Neosmartpen_A1")
+        let controller = makeController(
+            library: library.importer,
+            destination: library.destination,
+            outcome: .failure(
+                PenBluetoothError.multiplePensFound(
+                    advertisedName: penName,
+                    candidates: [first, second]
+                )
+            )
+        )
+
+        controller.readPenData()
+        try await waitForAttemptToSettle(controller)
+
+        let presentation = PenSyncMenuPresentation.make(from: controller, at: Date())
+
+        XCTAssertTrue(presentation.isChoosingPen)
+        XCTAssertFalse(
+            presentation.isSyncNowEnabled,
+            "a request cannot bypass the question about which pen to use"
+        )
+        XCTAssertFalse(presentation.isCancelVisible)
+        XCTAssertEqual(
+            presentation.pens.map(\.label),
+            ["Neosmartpen_A1 (pen 1)", "Neosmartpen_A1 (pen 2)"],
+            "candidates are numbered rather than addressed"
+        )
+        XCTAssertEqual(presentation.pens.map(\.peripheral), [first, second])
+    }
+
+    func testTheMenuPresentationOffersRetryExportOnlyAfterAFailedExport() async throws {
+        let library = try makeLibrary(
+            publisher: StubPenExportPublisher(failures: [.svg: "the disk is full"])
+        )
+        defer { library.remove() }
+        let controller = makeController(
+            library: library.importer,
+            destination: library.destination,
+            outcome: .success(TestRead.result(strokes: [TestRead.stroke()]))
+        )
+
+        controller.readPenData()
+        try await waitForAttemptToSettle(controller)
+
+        XCTAssertTrue(controller.canRetryExport)
+        let presentation = PenSyncMenuPresentation.make(from: controller, at: Date())
+
+        XCTAssertTrue(
+            presentation.isRetryExportVisible,
+            "a stored read with a failed file offers a retry"
+        )
+        XCTAssertTrue(presentation.isSyncNowEnabled)
+        XCTAssertFalse(presentation.isCancelVisible)
+    }
+
     // MARK: - Helpers
 
     /// The date the menu status reports, when it reports a stored read.
@@ -1995,6 +2645,7 @@ final class PenSyncControllerTests: XCTestCase {
         cleanupPolicy: PenCleanupPolicy = PenCleanupPolicy(),
         deletingReadStorage: PenDeletingReadStorage = .stub,
         intents: DeletingReadRecorder? = nil,
+        preferences: PenSyncPreferences? = nil,
         outcome: StubPenSyncRunner.Outcome
     ) -> PenSyncController {
         PenSyncController(
@@ -2004,8 +2655,22 @@ final class PenSyncControllerTests: XCTestCase {
             library: library,
             destination: destination,
             cleanupPolicy: cleanupPolicy,
-            deletingReadStorage: deletingReadStorage
+            deletingReadStorage: deletingReadStorage,
+            preferences: preferences
         )
+    }
+
+    /// Creates a saved-settings store over its own defaults suite, holding one mode.
+    ///
+    /// - Parameter mode: The saved mode the store holds.
+    /// - Returns: The store, its defaults domain, and the suite name to remove.
+    private func makeSavedMode(_ mode: PenSyncMode) -> (PenSyncPreferences, UserDefaults, String) {
+        let suiteName = "NeoBridgeRequestedReadTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defaults.removePersistentDomain(forName: suiteName)
+        let preferences = PenSyncPreferences(defaults: defaults)
+        preferences.mode = mode
+        return (preferences, defaults, suiteName)
     }
 
     /// Waits until the controller reaches a specific phase.

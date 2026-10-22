@@ -14,7 +14,11 @@ public enum PenSyncMode: String, Hashable, Sendable, CaseIterable {
     /// Sync and keep the pen's copy.
     case retain
 
-    /// Stop discovering the pen and stop starting reads.
+    /// Stop discovering the pen and stop starting automatic reads.
+    ///
+    /// A manual **Sync Now** request is not an automatic read, so it still runs one
+    /// read while this is selected; the saved setting is what keeps discovery and the
+    /// interval stopped.
     case paused
 
     /// The title the menu shows for the setting.
@@ -30,11 +34,15 @@ public enum PenSyncMode: String, Hashable, Sendable, CaseIterable {
         }
     }
 
-    /// Whether this mode lets the app discover the pen and start reads.
+    /// Whether this mode lets the app discover the pen and start reads on its own.
     public var isAutomatic: Bool { self != .paused }
 
-    /// The transfer intent this mode asks a read for, or `nil` when the mode starts
-    /// no read at all.
+    /// The transfer intent this mode asks an automatic read for, or `nil` when the
+    /// mode starts no automatic read at all.
+    ///
+    /// A manual Sync Now request follows the same saved setting, so it asks for this
+    /// intent when there is one, and for an ordinary read that keeps the pen's copy
+    /// when there is not.
     public var cleanupMode: PenCleanupMode? {
         switch self {
         case .delete: return .deleteAfterAcknowledge

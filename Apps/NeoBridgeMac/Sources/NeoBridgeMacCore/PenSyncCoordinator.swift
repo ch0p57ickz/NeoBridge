@@ -14,6 +14,13 @@ import Foundation
 /// That handoff is why the two scans exist as separate operations on
 /// ``PenBluetoothCentral`` rather than as one stream with a flag.
 ///
+/// The schedule is also the one path to the radio for a read the user asked for,
+/// so the menu's **Sync Now** command is answered by the same loop that answers an
+/// interval tick. Whichever request starts a read first owns the attempt: a request
+/// that arrives while the loop is committing to an automatic read is refused rather
+/// than queued behind it, and a request that gets in first leaves the pending
+/// automatic opportunity with nothing to start.
+///
 /// Everything is main-actor isolated: the schedule decides, the controller
 /// publishes, and both are read by the same views.
 @MainActor
@@ -25,6 +32,9 @@ public final class PenSyncCoordinator {
 
         /// The saved interval elapsed since the previous attempt began.
         case deadline
+
+        /// The user asked for a read now, with the menu's Sync Now command.
+        case immediateRequest
 
         /// A saved setting changed, so the wait is re-planned.
         case replan
@@ -74,11 +84,32 @@ public final class PenSyncCoordinator {
     /// Where a waiting opportunity receives its trigger.
     private var opportunityContinuation: AsyncStream<Opportunity>.Continuation?
 
-    /// Callers suspended until a saved setting changes.
-    private var replanWaiters: [CheckedContinuation<Void, Never>] = []
+    /// Callers suspended until a saved setting changes or the user asks for a read.
+    private var wakeWaiters: [CheckedContinuation<Void, Never>] = []
 
-    /// Whether a change arrived while nobody was waiting for one.
+    /// Whether a re-plan arrived while nobody was waiting for one.
     private var pendingReplan = false
+
+    /// The saved mode a Sync Now request was accepted under, or `nil` when no
+    /// request is waiting for the loop to start it.
+    ///
+    /// The mode is captured when the request is accepted rather than read when the
+    /// read starts, so the read keeps what the user saw even if the setting changes
+    /// in between. Holding it here is also what makes one accepted request start
+    /// exactly one read: a further click while it is set is refused, and the loop
+    /// takes it once.
+    private var requestedReadMode: PenSyncMode?
+
+    /// Whether the user asked for a read that the loop has not started yet.
+    private var hasRequestedRead: Bool { requestedReadMode != nil }
+
+    /// Whether the schedule loop is parked, waiting for an opportunity or a wake-up.
+    ///
+    /// A Sync Now request is accepted only while the loop is parked and the
+    /// controller is idle. That pair is what makes acceptance atomic with the
+    /// decision to start a read, so a request that arrives while the loop is already
+    /// committing to an automatic read is refused instead of being queued behind it.
+    private var isParked = false
 
     /// When each recently seen pen last advertised.
     ///
@@ -133,6 +164,7 @@ public final class PenSyncCoordinator {
     public func start() {
         guard scheduleTask == nil else { return }
         pendingReplan = false
+        requestedReadMode = nil
         lastAttemptStart = nil
         lastSeenAt.removeAll()
         scheduleStart = clock.now
@@ -151,13 +183,16 @@ public final class PenSyncCoordinator {
     /// own outcome still reaches the controller, so nothing it acknowledged is
     /// left half-reported. Releasing the controller's availability waiters is what
     /// ends a schedule parked behind that read, so stopping never leaves a
-    /// continuation held by a read that has not settled.
+    /// continuation held by a read that has not settled. A Sync Now request that has
+    /// not started yet is dropped rather than run: the schedule stopping means the
+    /// app is going away, not that a read is still wanted.
     public func stop() async {
         scheduleTask?.cancel()
         scheduleTask = nil
         controller.settingsDidChange = nil
         pendingReplan = true
-        resumeReplanWaiters()
+        requestedReadMode = nil
+        resumeWakeWaiters()
         controller.releaseAvailabilityWaiters()
         await stopObservation()
     }
@@ -166,11 +201,47 @@ public final class PenSyncCoordinator {
     ///
     /// The controller calls this through ``PenSyncController/settingsDidChange``,
     /// so a mode or interval change takes effect on the next opportunity rather
-    /// than on the next launch.
+    /// than on the next launch. A mode change during a pause is also what ends the
+    /// pause: the schedule re-reads the saved mode and resumes its observation.
     public func replan() {
         pendingReplan = true
-        resumeReplanWaiters()
+        resumeWakeWaiters()
         opportunityContinuation?.yield(.replan)
+    }
+
+    /// Asks the schedule to start one read now, for the menu's Sync Now command.
+    ///
+    /// The request is accepted only when the schedule can start a read at once: the
+    /// loop is parked between opportunities and the controller is neither reading nor
+    /// waiting for a pen choice. Refusing the rest is deliberate. A request that
+    /// loses the race with an automatic read is dropped rather than queued, so the
+    /// read that won stays the only attempt, and a request that arrives while a pen
+    /// choice is pending cannot start a read that would bypass the question. A
+    /// request accepted during Pause is the one read the menu may start there; the
+    /// saved mode is what keeps discovery and the interval stopped afterwards.
+    ///
+    /// The saved mode is captured here, at acceptance, and the read is started from
+    /// that capture. Nothing here reads the pen: the read itself runs through the
+    /// same handoff and the same bounded selection scan an automatic read uses, and it
+    /// re-anchors the next interval at its own start, so the user's read is not
+    /// repeated a moment later.
+    ///
+    /// - Returns: Whether the schedule accepted the request. A refusal means there is
+    ///   nothing for the caller to do: the read the request asked about is already
+    ///   running, or a pen choice is pending, and a second read would overlap it.
+    @discardableResult
+    public func requestImmediateRead() -> Bool {
+        guard scheduleTask != nil, isParked else { return false }
+        guard !hasRequestedRead else { return false }
+        guard !controller.isBusy, !controller.isAwaitingChoice else { return false }
+
+        requestedReadMode = controller.syncMode
+        // The loop parks in one of two ways — waiting for an opportunity with the
+        // observation running, or waiting for a wake-up while Paused — so the request
+        // wakes both. Only one of them is holding anything.
+        resumeWakeWaiters()
+        opportunityContinuation?.yield(.immediateRequest)
+        return true
     }
 
     // MARK: - The schedule
@@ -178,11 +249,19 @@ public final class PenSyncCoordinator {
     /// Runs opportunities until the schedule is cancelled.
     private func runSchedule() async {
         while !Task.isCancelled {
+            // A request made while the loop was parked is answered before anything
+            // else decides what to read: it was accepted first, so it owns the
+            // attempt, and a pending tick it was waiting behind goes unread.
+            if hasRequestedRead {
+                await runOpportunityRead()
+                continue
+            }
+
             guard controller.syncMode.isAutomatic else {
-                // Paused stops discovery and timers. An attempt already in flight
-                // is not this loop's to cancel: the controller owns it.
-                await stopObservation()
-                await waitForReplan()
+                // Paused stops discovery and timers. An attempt already in flight is
+                // not this loop's to cancel: the controller owns it. The wait still
+                // answers a Sync Now request, which is the one read Pause allows.
+                await waitWhilePaused()
                 continue
             }
 
@@ -190,14 +269,56 @@ public final class PenSyncCoordinator {
             if Task.isCancelled { break }
 
             switch opportunity {
-            case .appearance, .deadline:
-                await runAutomaticRead()
+            case .appearance, .deadline, .immediateRequest:
+                await runOpportunityRead()
             case .replan, .stopped:
                 continue
             }
         }
 
         await stopObservation()
+    }
+
+    /// Starts the read that answers an opportunity.
+    ///
+    /// The read the user asked for starts when one was accepted, because it was
+    /// accepted before the loop reached this point; the schedule's own read starts
+    /// otherwise. Either way this is the one attempt: a request that did not start the
+    /// read is refused, not queued behind it.
+    ///
+    /// The observation is stopped first, because the radio cannot run both scans
+    /// and the read's own selection scan is the one that has to report every match
+    /// to decide whether the pen is ambiguous. The attempt is anchored to when it
+    /// starts, so the next interval is measured from it whether the read answered
+    /// an automatic opportunity or a Sync Now request.
+    private func runOpportunityRead() async {
+        lastAttemptStart = clock.now
+        await stopObservation()
+
+        // The handoff above is a suspension point, so the controller can become busy
+        // after a Sync Now request was accepted — a Retry Export click is the action
+        // that reaches this. The capture is read only once the controller can start the
+        // read, so an accepted request is held for the next pass rather than consumed
+        // and dropped, and the schedule's own read does not step in front of it.
+        // Waiting on the controller is what makes that next pass wait rather than spin.
+        //
+        // The hold covers a requested read only. An automatic attempt interrupted in the
+        // same window is still left to the next interval, which is the behaviour the
+        // automatic schedule has always had.
+        if hasRequestedRead, controller.isBusy || controller.isAwaitingChoice {
+            await controller.waitUntilAvailable()
+            return
+        }
+
+        if let mode = consumeRequestedRead() {
+            controller.readOnRequest(savedMode: mode)
+        } else {
+            controller.readAutomatically()
+        }
+        // Waiting here is what keeps a second attempt from starting while this one
+        // is in flight, and what keeps a missed tick from stacking a second read on
+        // top of a pen the user is still choosing between.
+        await controller.waitUntilAvailable()
     }
 
     /// When the next interval opportunity is due, or `nil` when the schedule has
@@ -214,6 +335,10 @@ public final class PenSyncCoordinator {
 
     /// Waits for the pen to appear or for the interval to elapse.
     ///
+    /// The loop counts as parked for the whole wait, including the adapter-ready
+    /// wait, so a Sync Now request made while the radio is still resolving is
+    /// answered instead of refused.
+    ///
     /// - Parameter deadline: When the interval opportunity is due, or `nil` when
     ///   no attempt has run yet and only an appearance can start one.
     /// - Returns: What ended the wait.
@@ -222,6 +347,9 @@ public final class PenSyncCoordinator {
             pendingReplan = false
             return .replan
         }
+
+        isParked = true
+        defer { isParked = false }
 
         await waitForReadyAdapter()
         if Task.isCancelled { return .stopped }
@@ -232,6 +360,11 @@ public final class PenSyncCoordinator {
             opportunityContinuation = nil
             continuation.finish()
         }
+
+        // A request accepted during the adapter-ready wait had no stream to arrive
+        // on, so it is answered here rather than left waiting for an appearance the
+        // user did not ask for.
+        if hasRequestedRead { return .immediateRequest }
 
         await startObservation(yieldingTo: continuation)
 
@@ -255,21 +388,6 @@ public final class PenSyncCoordinator {
             return opportunity
         }
         return .stopped
-    }
-
-    /// Starts one automatic read and waits for it to settle.
-    ///
-    /// The observation is stopped first, because the radio cannot run both scans
-    /// and the read's own selection scan is the one that has to report every match
-    /// to decide whether the pen is ambiguous.
-    private func runAutomaticRead() async {
-        lastAttemptStart = clock.now
-        await stopObservation()
-        controller.readAutomatically()
-        // Waiting here is what keeps a second attempt from starting while this one
-        // is in flight, and what keeps a missed tick from stacking a second read on
-        // top of a pen the user is still choosing between.
-        await controller.waitUntilAvailable()
     }
 
     // MARK: - Observation
@@ -353,21 +471,43 @@ public final class PenSyncCoordinator {
 
     // MARK: - Re-planning
 
-    /// Suspends until a saved setting changes or the schedule stops.
-    private func waitForReplan() async {
+    /// Stops the observation and waits until the app is unpaused or a read is
+    /// requested.
+    ///
+    /// The loop counts as parked for the whole wait, including the observation stop,
+    /// so a Sync Now request made in that gap is accepted and answered rather than
+    /// dropped.
+    private func waitWhilePaused() async {
+        isParked = true
+        defer { isParked = false }
+
+        await stopObservation()
+
         if pendingReplan {
             pendingReplan = false
             return
         }
+        // The request is only checked here, never taken: the loop consumes it, so a
+        // request that arrives in the gap above is still answered when the loop
+        // returns to the top.
+        if hasRequestedRead { return }
         await withCheckedContinuation { continuation in
-            replanWaiters.append(continuation)
+            wakeWaiters.append(continuation)
         }
     }
 
-    /// Releases everyone waiting for a saved setting to change.
-    private func resumeReplanWaiters() {
-        let waiters = replanWaiters
-        replanWaiters.removeAll()
+    /// Takes the request the user made, if one is waiting, and reports the saved mode
+    /// it was accepted under.
+    private func consumeRequestedRead() -> PenSyncMode? {
+        defer { requestedReadMode = nil }
+        return requestedReadMode
+    }
+
+    /// Releases everyone waiting for a saved setting to change or a read to be
+    /// requested.
+    private func resumeWakeWaiters() {
+        let waiters = wakeWaiters
+        wakeWaiters.removeAll()
         for waiter in waiters { waiter.resume() }
     }
 }
