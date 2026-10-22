@@ -6,8 +6,9 @@ tasks 1.1, 1.2, and 4.2, by
 `openspec/changes/archive/2026-10-19-correct-a1-codec-from-hardware-evidence/tasks.md` task 3.5, and
 by `openspec/changes/archive/2026-10-19-add-macos-connect-and-sync/tasks.md` tasks 1.8 and 4.3,
 and by `openspec/changes/add-persistence-and-deterministic-export/tasks.md` tasks 1.2, 2.1–2.4, 3.1–3.3, 4.2, 5.1, 5.2, and 5.3,
-and by `openspec/changes/simplify-menu-sync-actions/tasks.md` tasks 3.1 and 3.2, and
-by `openspec/changes/reduce-redundant-export-backups/tasks.md` task 3.2.
+and by `openspec/changes/simplify-menu-sync-actions/tasks.md` tasks 3.1 and 3.2,
+by `openspec/changes/reduce-redundant-export-backups/tasks.md` task 3.2, and
+by `openspec/changes/add-acknowledged-deleting-offline-read/tasks.md` task 4.1.
 
 ## Command
 
@@ -663,6 +664,78 @@ Recorded on 2026-10-21.
 Physical A1 acceptance was not run and is not required by this change: it alters no
 protocol command, no transfer option, and no deletion gate, so no new pen evidence
 is claimed here.
+
+## Verification for `add-acknowledged-deleting-offline-read`
+
+Task 4.1 requires the literal Linux run of `Scripts/test-portable.sh` plus the
+fake-transport integration scenarios for retention, no-export fallback, deleting
+reads, overlapping replay, interrupted sync, pen abandonment during commit, export
+failure, and recovery. The change's other gates were settled elsewhere — the Xcode
+gate (task 4.3) on the Mac runner and the schema-rollback check (task 4.2) in the
+portable suite — so the Linux container below is the one piece that had no host.
+
+The host platform is the Docker container on this Linux box, not the box itself. The
+box (Ubuntu 24.04.5, aarch64) carries the Swift 6.4.1 toolchain but not
+`sqlite3.h`, so the script's SQLite header check fails on the box and
+`NeoStorage` cannot build there. The documented procedure (below) therefore runs the
+whole suite inside a `swift:6.4.1` container that has `libsqlite3-dev` installed,
+which is the same route the `reduce-redundant-export-backups` run took.
+
+| Item | Value |
+| --- | --- |
+| Host platform | Ubuntu 26.04.1 LTS (aarch64) in a `swift:6.4.1` Docker container on Ubuntu 24.04.5 (aarch64) |
+| Toolchain | Swift 6.4.1 (swift-6.4.1-RELEASE), target `aarch64-unknown-linux-gnu` |
+| Xcode | Not used |
+| Bluetooth hardware | Not used |
+
+```bash
+docker run -d --name neobridge-swift64 -v "$PWD":/src:ro swift:6.4.1 sleep infinity
+docker exec neobridge-swift64 bash -lc 'apt-get update -qq && apt-get install -y -qq libsqlite3-dev'
+docker exec neobridge-swift64 bash -lc \
+  'mkdir -p /work && cd /src && tar --exclude=./.build --exclude=./.git -cf - . \
+     | (cd /work && tar -xf -) && cd /work && find . -name "._*" -delete \
+     && ./Scripts/test-portable.sh'
+```
+
+```text
+== Toolchain
+Swift version 6.4.1 (swift-6.4.1-RELEASE)
+Target: aarch64-unknown-linux-gnu
+== SQLite header check
+ok: the SQLite development header is available
+== Forbidden import check
+ok: Packages/NeoCore imports no Apple-only framework
+ok: Packages/NeoProtocol imports no Apple-only framework
+ok: Packages/NeoStorage imports no Apple-only framework
+ok: Packages/NeoExport imports no Apple-only framework
+ok: Tests/Integration imports no Apple-only framework
+== Pinned dependency resolution
+-- swift build --disable-automatic-resolution (Packages/NeoCore)
+-- swift build --disable-automatic-resolution (Packages/NeoProtocol)
+-- swift build --disable-automatic-resolution (Packages/NeoStorage)
+-- swift build --disable-automatic-resolution (Packages/NeoExport)
+-- swift build --disable-automatic-resolution (Tests/Integration)
+== Package tests
+-- swift test (Packages/NeoCore)      62 tests, 0 failures
+-- swift test (Packages/NeoProtocol)  177 tests, 0 failures
+-- swift test (Packages/NeoStorage)   91 tests, 0 failures
+-- swift test (Packages/NeoExport)    79 tests, 0 failures
+-- swift test (Tests/Integration)     21 tests, 0 failures
+== Result
+PASSED: portable packages build with pinned dependencies, import no Apple-only framework, and pass their tests, and the integration scenarios pass.
+```
+
+No count moved from the `reduce-redundant-export-backups` run, so this verifies the
+deleting-read code without changing the pinned suites. The deleting-read integration
+scenarios task 4.1 lists are the `DeletingReadIntegrationTests` suite, which passed
+in full: commit-before-acknowledgement ordering, a failed export left retryable,
+fresh-read recovery without duplicating committed strokes, a pen that abandons
+mid-commit leaving a recoverable partial batch, a published partial batch blocking a
+separate-command deletion, an interrupted read committing nothing and failing the
+batch it opened, and the no-export intent falling back without sending the deleting
+option.
+
+Recorded on 2026-10-22.
 
 ## Fixture sanitization
 
