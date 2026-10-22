@@ -1667,7 +1667,318 @@ final class PenSyncControllerTests: XCTestCase {
         XCTAssertTrue(controller.needsCleanupConfirmation)
     }
 
+    // MARK: - Menu status
+
+    /// An error a publication retry throws, to prove a failed retry records nothing.
+    private struct RetryFailure: Error, Sendable {}
+
+    func testAnEmptyReadStillCountsAsSynced() async throws {
+        let library = try makeLibrary()
+        defer { library.remove() }
+        let controller = makeController(
+            library: library.importer,
+            destination: library.destination,
+            outcome: .success(TestRead.result(strokes: [], noteCount: 0))
+        )
+
+        controller.readPenData()
+        try await waitForAttemptToSettle(controller)
+
+        XCTAssertNil(controller.outcome?.save, "the read stored nothing")
+        // The pen was reached and read, so the sync did happen: reporting that it
+        // has not synced would be false, and it is what separates this from the pen
+        // never having been there at all.
+        let date = syncedDate(controller)
+        XCTAssertLessThan(abs(date.timeIntervalSinceNow), 5)
+    }
+
+    func testAFailedExportRetryKeepsTheSyncedDate() async throws {
+        let library = try makeLibrary()
+        defer { library.remove() }
+        let failed = PenExportReport(artifacts: [
+            PenExportArtifact(
+                format: .svg,
+                path: "/tmp/ncode-s3-o27-b700-p1.svg",
+                byteCount: 1,
+                status: .failed(reason: "the disk is full")
+            )
+        ])
+        let coordinator = StubImportCoordinator(
+            outcome: .saved(TestRead.save(), export: failed),
+            retryReport: failed,
+            retryFailure: RetryFailure()
+        )
+        await coordinator.saving.open()
+        await coordinator.exporting.open()
+        let controller = makeController(
+            library: coordinator,
+            destination: library.destination,
+            outcome: .success(TestRead.result(strokes: [TestRead.stroke()]))
+        )
+
+        controller.readPenData()
+        try await waitForAttemptToSettle(controller)
+        let stored = syncedDate(controller)
+        XCTAssertTrue(controller.canRetryExport)
+
+        controller.retryExport()
+        try await waitForAttemptToSettle(controller)
+
+        // The retry republishes a read that already completed, so a retry that
+        // throws must not claim the pen has not synced. The failure phase is what
+        // proves the retry threw rather than returned a failed report: a retry that
+        // returns a report leaves the read complete.
+        guard case .failed = controller.phase else {
+            return XCTFail("the retry should have failed; the phase is \(controller.phase)")
+        }
+        XCTAssertFalse(controller.canRetryExport)
+        XCTAssertEqual(
+            syncedDate(controller),
+            stored,
+            "a failed export retry must leave the pen's last sync date alone"
+        )
+    }
+
+    func testASessionCancellationKeepsThePreviousStatus() async throws {
+        let library = try makeLibrary()
+        defer { library.remove() }
+        let attempts = RunnerCounter()
+        let controller = PenSyncController(
+            runners: PenSyncRunnerFactory { _ in
+                attempts.increment()
+                return attempts.value == 1
+                    ? StubPenSyncRunner(
+                        stages: [.scanning],
+                        outcome: .success(TestRead.result(strokes: [TestRead.stroke()]))
+                    )
+                    : StubPenSyncRunner(
+                        stages: [.scanning],
+                        // The session layer's own cancellation, which is not the
+                        // Bluetooth error the shell produces for a Cancel Read.
+                        outcome: .failure(PenSessionError.cancelled)
+                    )
+            },
+            library: library.importer,
+            destination: library.destination,
+            deletingReadStorage: .stub
+        )
+
+        controller.readPenData()
+        try await waitForAttemptToSettle(controller)
+        let stored = syncedDate(controller)
+
+        controller.readPenData()
+        try await waitForAttemptToSettle(controller)
+
+        XCTAssertEqual(
+            syncedDate(controller),
+            stored,
+            "every shape of cancellation must leave the previous status on show"
+        )
+    }
+
+    func testTheMenuStatusIsIdleBeforeAnyAttempt() async throws {
+        let library = try makeLibrary()
+        defer { library.remove() }
+        let controller = makeController(
+            library: library.importer,
+            destination: library.destination,
+            outcome: .waitsForCancellation
+        )
+
+        XCTAssertEqual(
+            controller.menuStatus,
+            .idle,
+            "an app that has not read anything yet reports idle rather than a result"
+        )
+    }
+
+    func testTheMenuStatusReportsSyncingWhileAReadRunsAndIdleAfterACancel() async throws {
+        let library = try makeLibrary()
+        defer { library.remove() }
+        let controller = makeController(
+            library: library.importer,
+            destination: library.destination,
+            outcome: .waitsForCancellation
+        )
+
+        controller.readPenData()
+        try await waitUntil(controller, is: .syncing)
+
+        XCTAssertEqual(controller.menuStatus, .syncing)
+
+        controller.cancel()
+
+        // The cancelled read recorded no result, so there is nothing to report:
+        // cancelling is the user withdrawing a read, not the pen failing to appear.
+        XCTAssertEqual(controller.menuStatus, .idle)
+    }
+
+    func testTheMenuStatusDatesAStoredRead() async throws {
+        let library = try makeLibrary()
+        defer { library.remove() }
+        let controller = makeController(
+            library: library.importer,
+            destination: library.destination,
+            outcome: .success(TestRead.result(strokes: [TestRead.stroke()]))
+        )
+
+        controller.readPenData()
+        try await waitForAttemptToSettle(controller)
+
+        let date = syncedDate(controller)
+        XCTAssertLessThan(
+            abs(date.timeIntervalSinceNow),
+            5,
+            "the date must be the moment the read was stored, so the line reads as an elapsed time"
+        )
+    }
+
+    func testTheMenuStatusReportsAMissingPenAsNotDetected() async throws {
+        let library = try makeLibrary()
+        defer { library.remove() }
+        let controller = makeController(
+            library: library.importer,
+            destination: library.destination,
+            outcome: .failure(PenBluetoothError.noMatchingPenFound(advertisedName: penName))
+        )
+
+        controller.readPenData()
+        try await waitForAttemptToSettle(controller)
+
+        // A missing pen is its own status rather than a generic failure, because it
+        // is the condition the interval exists to report on.
+        XCTAssertEqual(controller.menuStatus, .notDetected)
+        if case .failed = controller.phase {} else {
+            XCTFail("a missing pen is still a failed attempt; the phase is \(controller.phase)")
+        }
+    }
+
+    func testTheMenuStatusReportsANonPenFailureAsFailed() async throws {
+        let library = try makeLibrary()
+        defer { library.remove() }
+        let controller = makeController(
+            library: library.importer,
+            destination: library.destination,
+            outcome: .failure(PenBluetoothError.notConnected)
+        )
+
+        controller.readPenData()
+        try await waitForAttemptToSettle(controller)
+
+        XCTAssertEqual(
+            controller.menuStatus,
+            .failed,
+            "a failure that is not a missing pen must not claim the pen was absent"
+        )
+    }
+
+    func testACancelledAttemptKeepsThePreviousStatus() async throws {
+        let library = try makeLibrary()
+        defer { library.remove() }
+        let attempts = RunnerCounter()
+        let controller = PenSyncController(
+            runners: PenSyncRunnerFactory { _ in
+                // The first attempt stores a read; the second is cancelled by the
+                // session rather than by the shell, so it arrives as an error.
+                attempts.increment()
+                return attempts.value == 1
+                    ? StubPenSyncRunner(
+                        stages: [.scanning],
+                        outcome: .success(TestRead.result(strokes: [TestRead.stroke()]))
+                    )
+                    : StubPenSyncRunner(
+                        stages: [.scanning],
+                        outcome: .failure(PenBluetoothError.cancelled)
+                    )
+            },
+            library: library.importer,
+            destination: library.destination,
+            deletingReadStorage: .stub
+        )
+
+        controller.readPenData()
+        try await waitForAttemptToSettle(controller)
+        let stored = syncedDate(controller)
+
+        controller.readPenData()
+        try await waitForAttemptToSettle(controller)
+
+        guard case .failed(let message, _) = controller.phase else {
+            return XCTFail(
+                "the cancelled attempt is still reported as a failed attempt; it is \(controller.phase)"
+            )
+        }
+        XCTAssertEqual(message, PenBluetoothError.cancelled.message)
+        XCTAssertEqual(
+            syncedDate(controller),
+            stored,
+            "a cancelled attempt records nothing, so the stored read's date stands"
+        )
+    }
+
+    func testTheMenuStatusReportsPausedAndAnAttemptInFlightOutranksIt() async throws {
+        let library = try makeLibrary()
+        defer { library.remove() }
+        let controller = makeController(
+            library: library.importer,
+            destination: library.destination,
+            outcome: .waitsForCancellation
+        )
+
+        controller.selectSyncMode(.paused)
+        XCTAssertEqual(
+            controller.menuStatus,
+            .paused,
+            "a paused app is not syncing whatever a previous attempt did"
+        )
+
+        // A read already in flight keeps running through Pause, so the status still
+        // reports it; the mode item's own checkmark is what says the schedule stopped.
+        controller.readPenData()
+        try await waitUntil(controller, is: .syncing)
+        XCTAssertEqual(controller.menuStatus, .syncing)
+
+        controller.cancel()
+        XCTAssertEqual(controller.menuStatus, .paused)
+    }
+
+    func testTheMenuStatusReportsPausedOverAnEarlierStoredRead() async throws {
+        let library = try makeLibrary()
+        defer { library.remove() }
+        let controller = makeController(
+            library: library.importer,
+            destination: library.destination,
+            outcome: .success(TestRead.result(strokes: [TestRead.stroke()]))
+        )
+
+        controller.readPenData()
+        try await waitForAttemptToSettle(controller)
+        _ = syncedDate(controller)
+
+        controller.selectSyncMode(.paused)
+
+        XCTAssertEqual(
+            controller.menuStatus,
+            .paused,
+            "pausing must say why nothing is syncing rather than show a stale success"
+        )
+    }
+
     // MARK: - Helpers
+
+    /// The date the menu status reports, when it reports a stored read.
+    private func syncedDate(
+        _ controller: PenSyncController,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) -> Date {
+        guard case .synced(let date) = controller.menuStatus else {
+            XCTFail("expected a synced status, got \(controller.menuStatus)", file: file, line: line)
+            return .distantPast
+        }
+        return date
+    }
 
     private func makeLibrary(
         publisher: any PenExportPublisher = FilePenExportPublisher(),

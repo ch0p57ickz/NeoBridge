@@ -5,8 +5,9 @@ import SwiftUI
 
 /// The optional details window.
 ///
-/// The window shows the same state as the menu with room for the counts, the
-/// notes read, each file's publication result, and the failure detail.
+/// The window is where the information lives that the menu deliberately leaves
+/// out: the saved settings and what they mean, the export folder, the counts and
+/// notes a read found, each file's publication result, and the failure detail.
 struct PenSyncView: View {
     @Environment(\.dismissWindow) private var dismissWindow
     @State private var folderMessage: String?
@@ -30,18 +31,18 @@ struct PenSyncView: View {
 
             Divider()
 
-            destination
+            settings
 
             Divider()
 
-            cleanup
+            destination
 
             Divider()
 
             actions
         }
         .padding(20)
-        .frame(minWidth: 520, minHeight: 480, alignment: .topLeading)
+        .frame(minWidth: 560, minHeight: 560, alignment: .topLeading)
         .background(WindowRaiserView())
     }
 
@@ -167,44 +168,64 @@ struct PenSyncView: View {
         }
     }
 
-    /// The pen's copy: the intent on screen, and the outcome after a read.
+    /// The saved sync settings, which the menu offers too.
+    ///
+    /// The two surfaces write the same saved setting, so a change here is what the
+    /// next automatic attempt uses, and the mode and interval the menu shows agree
+    /// with what this window shows.
     @ViewBuilder
-    private var cleanup: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text("Pen cleanup")
+    private var settings: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Sync settings")
                 .font(.headline)
-            Text(PenSyncController.cleanupIntentStatement)
+
+            Picker("Mode", selection: modeBinding) {
+                ForEach(PenSyncMode.allCases, id: \.self) { mode in
+                    Text(mode.title).tag(mode)
+                }
+            }
+            .pickerStyle(.segmented)
+
+            Picker("Interval", selection: intervalBinding) {
+                ForEach(PenSyncInterval.allCases, id: \.self) { interval in
+                    Text(interval.title).tag(interval)
+                }
+            }
+
+            Text(controller.syncModeLine)
                 .font(.callout)
                 .foregroundStyle(.secondary)
-            Text(controller.cleanupIntentLine)
+            Text(controller.syncIntervalLine)
                 .font(.callout)
+                .foregroundStyle(.secondary)
+            Text(PenSyncController.automaticCleanupStatement)
+                .font(.callout)
+                .foregroundStyle(.secondary)
 
-            if controller.canChooseCleanup {
-                if controller.isCleanupIntended {
-                    Button(PenSyncController.retainPenDataTitle) {
-                        controller.retainPenDataForThisSync()
-                    }
-                } else {
-                    Button("Remove Them After a Successful Read") {
-                        controller.intendCleanupForThisSync()
-                    }
-                }
-            }
-
-            // The confirmation is what authorizes the deleting route for the
-            // sync it is made against, so it is offered only while that route is
-            // available and still unconfirmed.
-            if controller.needsCleanupConfirmation {
-                Button(PenSyncController.confirmCleanupTitle) {
-                    controller.confirmCleanupForThisSync()
-                }
-            }
-
+            // The mode never stands in for a transfer gate, so the gate that is
+            // closed is named here rather than left for the user to infer from a
+            // read that kept the pen's copy.
             if let reason = controller.cleanupUnavailableReason {
                 Text("Cleanup is unavailable: \(reason)")
                     .font(.callout)
             }
         }
+    }
+
+    /// The saved mode the picker shows and writes.
+    private var modeBinding: Binding<PenSyncMode> {
+        Binding(
+            get: { controller.syncMode },
+            set: { controller.selectSyncMode($0) }
+        )
+    }
+
+    /// The saved interval the picker shows and writes.
+    private var intervalBinding: Binding<PenSyncInterval> {
+        Binding(
+            get: { controller.syncInterval },
+            set: { controller.selectSyncInterval($0) }
+        )
     }
 
     @ViewBuilder
@@ -213,7 +234,6 @@ struct PenSyncView: View {
             if controller.isBusy {
                 Button("Cancel") { controller.cancel() }
             } else {
-                Button(PenSyncController.readActionTitle) { controller.readPenData() }
                 Button("Choose Export Folder…") {
                     folderMessage = PenExportFolderChooser.choose(into: controller)
                 }

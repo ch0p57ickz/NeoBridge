@@ -2,22 +2,26 @@
 
 A menu-bar app that reads offline strokes from a Neo Smartpen A1 over Bluetooth,
 saves them to a durable local library, and writes deterministic page files to a
-folder you choose. Each read intends to remove its verified data from the pen, and
-you can keep the strokes on the pen for one read instead. For the recorded pen
-identity, a read you have confirmed, that requests an export, and that has a
-writable library removes each packet from the pen as it reads it — after the library
-has stored that packet, so what is removed is what is already saved. The
-`0x25`/`0x27` deletion commands are unreachable: the physical A1 trace of 2026-10-20
-recorded that command's deletion scope as unsafe, because the command removes a
-note's stored data as a whole, including strokes no read had imported.
+folder you choose. It syncs on its own: discovery starts with the app, a read
+starts when the pen appears, and another is offered at the interval you saved. You
+choose once whether a sync removes its verified data from the pen or keeps the
+pen's copy, and the app follows that saved setting until you change it.
+
+For the recorded pen identity, a sync you saved as **Sync and Delete**, that
+requests an export, and that has a writable library removes each packet from the
+pen as it reads it — after the library has stored that packet, so what is removed
+is what is already saved. The `0x25`/`0x27` deletion commands are unreachable: the
+physical A1 trace of 2026-10-20 recorded that command's deletion scope as unsafe,
+because the command removes a note's stored data as a whole, including strokes no
+read had imported.
 
 ## What the app is made of
 
 | Target | Contains | Runs where |
 | --- | --- | --- |
-| `NeoBridgeMacCore` | The Bluetooth adapter, the transport, the attempt runner, the shell's state machine, the durable library composition, and the export destination | Tested on macOS with `swift test` |
+| `NeoBridgeMacCore` | The Bluetooth adapter, the transport, the attempt runner, the shell's state machine, the saved sync settings, the automatic schedule, the durable library composition, and the export destination | Tested on macOS with `swift test` |
 | `NeoBridgeMac` | The `@main` app: a `MenuBarExtra` and one window of SwiftUI views, plus the folder picker and the headless acceptance path | macOS only |
-| `NeoBridgeMacCoreTests` | Unit tests for the adapter, the transport, the runner, the shell, and the save/export flow | macOS only |
+| `NeoBridgeMacCoreTests` | Unit tests for the adapter, the transport, the runner, the shell, the saved settings, the schedule, and the save/export flow | macOS only |
 
 Protocol logic lives in `Packages/NeoProtocol`, storage in `Packages/NeoStorage`,
 and export in `Packages/NeoExport`. All three are portable. The app package is a
@@ -60,6 +64,11 @@ the first filter in hardware:
 | Service | `19F1` | `4F99F138-9D53-5BFA-9E50-B147491AFE68` |
 | Write characteristic | `2BA0` | `8bc8cc7d-88ca-56b0-af9a-9bf514d0d61a` |
 | Notify characteristic | `2BA1` | `64cd86b1-2256-5aeb-9f04-2caf6c60ae57` |
+
+That bounded scan is the read's own pen-selection scan. The automatic schedule
+runs a second, continuous scan that asks for duplicate advertisements, so a pen
+that stays in range keeps reporting; the two never overlap. See
+[Automatic sync](#automatic-sync).
 
 These values and the write mode come from the Neo iOS SDK 3.0,
 `NISDK3/Classes/Common/Global.swift` at commit `a53a01e`. The SDK scans with
@@ -107,6 +116,83 @@ Bluetooth is switched off while a scan is running: the adapter fails the scan an
 the pending setup waits at once, so the shell shows the adapter state rather than
 reporting a missing pen. If the notify characteristic exists but the subscription
 is refused, the connection fails before the version request is sent.
+
+## Automatic sync
+
+The app syncs without being asked. Discovery starts at launch, a read starts when
+a compatible pen appears, and another read is offered at each saved interval while
+the app runs and is unpaused.
+
+| Setting | Choices | First-install default |
+| --- | --- | --- |
+| Mode | **Sync and Delete**, **Sync and Retain**, **Pause** | Sync and Delete |
+| Interval | 1, 5, 15, or 30 minutes | 5 minutes |
+
+Both settings are saved as you select them, in `UserDefaults` beside the
+export-folder bookmark but under their own keys, so neither feature disturbs the
+other's stored value. A stored value this build does not understand is treated as
+absent, so a value written by a later build never leaves the app without a usable
+setting.
+
+- **Sync and Delete** removes each packet the library has stored, as the deleting
+  transfer that reads it acknowledges it. The saved mode is the authorization for
+  each eligible automatic sync, so no extra click is needed per sync. Every transfer
+  gate still decides: a sync with no export folder chosen, without safe transfer
+  evidence, meeting a different pen, or without a writable library keeps the pen's
+  copy, and Connection Details names the reason. An automatic sync never falls back
+  to the separate deletion command, including after a refused route or an export
+  retry.
+- **Sync and Retain** reads the pen and keeps its copy. It requests no deletion.
+- **Pause** stops discovery and the interval timer, so no pen is looked for and no
+  read starts. A read already in flight finishes and reports itself. Selecting
+  **Sync and Delete** or **Sync and Retain** saves that mode and resumes.
+
+### Timing
+
+- The interval is measured from the start of the previous attempt, so a read that
+  outlasted the interval leaves the next opportunity already due. Several missed
+  ticks coalesce into one attempt rather than stacking up.
+- At most one read runs at a time. A tick that arrives while a read is in flight
+  waits for it rather than starting a second read, and the schedule also waits while
+  you are choosing between pens.
+- A pen that stays in range is not synced again just because it is still
+  advertising. Its advertisement counts as an appearance only when the app has not
+  seen that pen before or the pen has been silent for 30 seconds, which is what
+  makes a pen that left and came back sync at once instead of waiting for the
+  interval. The 30-second baseline is refreshed when observation starts, so a read
+  that outlasted it does not make the pen look like one that left and returned.
+- An absent pen and a failed read are reported in Connection Details and paced by
+  the interval. Neither starts a rapid retry loop.
+- The observation scan asks CoreBluetooth for duplicate advertisements, which is
+  the opposite of what the bounded pen-selection scan asks for. The radio runs one
+  scan at a time, so the schedule stops observing before a read starts its selection
+  scan and resumes afterwards.
+
+### Where the app says what
+
+The menu holds one compact status line, the saved settings, and the actions that
+apply to the sync in progress. Counts, export paths, cleanup explanations, and
+failure details are in **Connection Details**, so the menu stays a control surface
+rather than a report. Both surfaces write the same saved settings, so a change in
+either is what the next automatic attempt uses.
+
+| Status line | When |
+| --- | --- |
+| **Idle** | No read has settled yet |
+| **Syncing** | A read is running, or the app is waiting for you to choose between pens |
+| **Paused** | Pause is the saved mode and no read is in flight |
+| **Synced … ago** | The last read completed; the line shows the time since it |
+| **Not Detected** | The last attempt found no pen advertising the expected name |
+| **Failed** | The last attempt failed for a reason other than a missing pen |
+
+A read in flight outranks the saved mode, so pausing during a read still reports
+that read; the mode item's own checkmark is what says the schedule stopped. A read
+that reached the pen and carried no strokes still counts as synced — the pen was
+there and was read, so **Not Detected** would be false. A cancelled read records
+nothing, so the previous status stays on show, and an export retry leaves it alone
+whether it succeeds or fails: the line answers "when did the pen last sync", not
+"when was a file last written". Connection Details names the specific reason behind
+**Not Detected** or **Failed**.
 
 ## Building and running
 
@@ -168,7 +254,7 @@ incremental:
 | Variable | Effect | Default |
 | --- | --- | --- |
 | `NEOBRIDGE_ACCEPTANCE_TRANSFER_OPTION` | The `0x23` transfer option the read sends: `notNextTransfer`, `nextAndReserve`, or the option byte in decimal or hexadecimal. | `nextAndReserve`, the established non-destructive option |
-| `NEOBRIDGE_ACCEPTANCE_CLEANUP` | The cleanup intent the run starts with: `keepOnPen` or `deleteAfterAcknowledge`, also as `keep` and `cleanup`. The intent is set through the same method the menu calls. | the policy default, cleanup |
+| `NEOBRIDGE_ACCEPTANCE_CLEANUP` | The cleanup intent the run starts with: `keepOnPen` or `deleteAfterAcknowledge`, also as `keep` and `cleanup`. The intent is applied through the controller's per-read choice, which is the path a directly driven read uses; the menu is not involved, and the run starts no background schedule. | the policy default, cleanup |
 | `NEOBRIDGE_ACCEPTANCE_CONFIRM_CLEANUP` | Whether the run confirms cleanup for its sync, as `true`/`yes`/`1` or `false`/`no`/`0`. The confirmation is what authorizes a deleting transfer, so it is a separate key: asking for the intent alone takes the ordinary non-destructive read. | unset, not confirmed |
 | `NEOBRIDGE_ACCEPTANCE_ABORT_AT_PACKET` | Drops the pen link when that `0x24` packet arrives, so the transfer fails part way on purpose. The packet is not delivered, so the read assembles one fewer packet than the number. | unset, the transfer runs to its end |
 
@@ -232,8 +318,10 @@ success is claimed only when every requested file is in place.
 - Files are written to a sibling temporary file, flushed, and renamed into
   place, so an interrupted write never leaves a half-written page.
 - If the generated bytes already match the target, the file is left as it is and
-  reported as unchanged. Otherwise the previous three versions are kept as
-  `.bak1`, `.bak2`, and `.bak3`.
+  reported as unchanged. A changed JSON keeps up to three prior versions as
+  `.bak1`, `.bak2`, and `.bak3`, but only when the record it replaces cannot be
+  validated or holds strokes the library no longer has; a changed drawing or
+  Markdown page is replaced without a backup.
 - The output is deterministic: the bytes depend only on the stored strokes, in
   canonical order, never on arrival order, the transfer source, or the host. No
   Bluetooth address, serial number, or authentication material reaches a file,
@@ -242,14 +330,16 @@ success is claimed only when every requested file is in place.
 
 ### Folder and retry
 
-- **Choose Export Folder…** asks for the destination once. The choice is stored
-  as a security-scoped bookmark, so it survives a relaunch and keeps working if
-  the app is sandboxed later.
-- With no folder chosen, a read is saved to the library and no files are
-  written.
-- **Retry Export** appears when a read saved but at least one file failed. It
-  republishes from the stored rows without reading the pen again, so a retry can
-  never invent a result from data that was not stored.
+- **Choose Export Folder…** in Connection Details asks for the destination once.
+  The choice is stored as a security-scoped bookmark, so it survives a relaunch and
+  keeps working if the app is sandboxed later. It is untouched by the sync settings,
+  which live under their own `UserDefaults` keys.
+- With no folder chosen, a sync is saved to the library and no files are written.
+- **Retry Export** appears when a read saved but at least one file failed, in the
+  menu while that read is the one shown and in Connection Details. It republishes
+  from the stored rows without reading the pen again, so a retry can never invent a
+  result from data that was not stored, and an automatic retry never sends a
+  deletion command.
 
 ## Pen cleanup
 
@@ -259,44 +349,37 @@ safe.
 
 There are two cleanup routes, and the app can only use one of them:
 
-- The **deleting transfer**, which the app uses. A read that requests an export,
-  has the user's confirmation for that sync, matches the recorded pen identity, and
-  has durable packet storage asks the pen to remove each packet as part of the
-  transfer that reads it. The library commits a packet before the app acknowledges
-  it, so what is removed is what is already stored.
+- The **deleting transfer**, which the app uses. A sync saved as **Sync and Delete**,
+  that requests an export, matches the recorded pen identity, and has durable packet
+  storage asks the pen to remove each packet as part of the transfer that reads it.
+  The library commits a packet before the app acknowledges it, so what is removed is
+  what is already stored.
 - The separate **`0x25`/`0x27` deletion commands**, which the app cannot send. The
   session supplies no deletion sender, so no such frame is built, and the command
-  evidence record's deletion-scope verdict is `unsafe`.
+  evidence record's deletion-scope verdict is `unsafe`. No automatic sync reaches
+  this route at all, not even after a refused transfer or an export retry.
 
-### What the app intends by default
+### What the saved mode means for the pen's copy
 
-- Every read intends cleanup. The menu and the window show the statement the
-  confirmation is about: "If you confirm cleanup for this read, each packet saved to
-  the local library is removed from the pen when the read acknowledges it. The files
-  requested for this read are exported afterwards; if that export fails, retry it
-  from the local library."
-- Cleanup still needs a confirmation for each sync. The line under the statement
-  names which transfer the choice applies to, so the buttons always say what they
-  apply to.
-- **Keep Strokes on the Pen for This Read** retains the pen's copy for the transfer
-  the line names: the retry of a read whose files failed, or the next read. The
-  transfer that consumes the choice uses it once, so the default intent is presented
-  again afterwards.
-- **Remove Them After a Successful Read** restores the default cleanup intent for
-  the same transfer.
-- **Remove Acknowledged Packets for This Read** confirms cleanup for one read. It is
-  what authorizes the deleting transfer, it is offered only while cleanup is
-  intended, available, and still unconfirmed, and it is cleared when that read
-  starts, so a later sync cannot inherit it. It is not offered while a completed
-  read's files can still be published again, because a retry publishes from the
-  library and removes nothing.
-- Neither the retain nor the remove button appears while a read is running: a
-  running read captured its intent when it started, so a later choice could not
-  reach it. Asking which pen to use is not a read, so a choice made before that
-  question still holds for the pen you pick. Neither appears after a deleting read
-  whose files still need publishing either: that read removed the packets it stored
-  as it read them, so its **Retry Export** only republishes the durable copy and a
-  choice there could keep nothing.
+- **Sync and Delete** is the first-install default, and it is what the app follows
+  until you change it. It authorizes the deleting transfer for each eligible
+  automatic sync, so there is no per-sync confirmation click. Connection Details
+  shows the statement the setting is about: "Sync and Delete removes each packet
+  saved to the local library from the pen when the read acknowledges it. A read that
+  requests no export, lacks safe transfer evidence, meets a different pen, or has no
+  writable library keeps the pen's copy instead, and Connection Details names the
+  reason."
+- **Sync and Retain** reads the pen and keeps its copy. The read reports that the
+  strokes were kept because retention was chosen.
+- The setting is not proof that deletion happened. It asks for a deleting transfer;
+  the transfer's own gates decide whether one runs, and the result the app reports is
+  the transfer's, not the setting's.
+- A mode or interval changed while a read is running applies to later attempts. The
+  read already captured its own transfer, so changing the setting cannot change what
+  that read does.
+- The headless acceptance run is driven directly rather than by the schedule, so its
+  deleting transfer stays behind its own explicit confirmation:
+  `NEOBRIDGE_ACCEPTANCE_CONFIRM_CLEANUP` is what authorizes it, not a saved mode.
 
 ### When cleanup actually runs
 
@@ -305,9 +388,10 @@ them are decided before the app connects, and the fourth — the pen's identity 
 checked against the handshake:
 
 - The sync requests an export. The pen's copy leaves as the read progresses, so the
-  library plus the requested files is the user's path back to the data; a read with
+  library plus the requested files is the user's path back to the data; a sync with
   no export folder chosen follows the ordinary retention rule instead.
-- The user confirmed cleanup for this sync.
+- The saved mode is **Sync and Delete**, which is the authorization for an automatic
+  sync.
 - The connected pen matches the recorded identity: NWP-F151, firmware 3.00,
   protocol 2.23, uncompressed. A different identity takes the ordinary
   non-destructive read and the app names the blocker, because the pen's identity is
@@ -338,10 +422,10 @@ reclaimed that way.
 
 ### While a precondition is missing
 
-**Cleanup is unavailable** appears while the deleting route cannot run, naming the
-missing precondition: no export folder chosen, no writable library, or transfer
-evidence that does not cover the connected pen. The read still runs; it saves,
-publishes, and reports the skip.
+**Cleanup is unavailable** appears in Connection Details while the deleting route
+cannot run, naming the missing precondition: no export folder chosen, no writable
+library, or transfer evidence that does not cover the connected pen. The sync still
+runs; it saves, publishes, and reports the skip.
 
 The command gate is data, not a switch. `PenDeletionEvidence` holds a verdict for
 each safety condition — payload framing, exact deletion scope, response meaning, and
@@ -372,32 +456,45 @@ resolves nothing.
 ## Menu commands
 
 The app runs as an accessory: `Info.plist` sets `LSUIElement`, so there is no
-Dock icon, and closing the window leaves the menu-bar item in place.
+Dock icon, and closing the window leaves the menu-bar item in place. The menu shows
+one status line, then the settings and the actions that apply to the sync in
+progress; everything else the app reports is in **Connection Details**.
 
 | Command | Shown when | What it does |
 | --- | --- | --- |
-| Summary line | Always | Shows the current state, such as "Scanning for a pen", "Saving to the library", or "Complete" |
-| **Read and Save Pen Data** | No attempt running and no choice pending | Scans, connects, reads the pen's offline data, saves it, and writes its page files |
-| **Cancel Read** | An attempt is running | Stops the scan or the read and returns to idle |
+| The status line, such as `Synced 3 minutes ago` | Always | Disabled text, not a command. It reads Idle, Syncing, Paused, the last completed read with its elapsed time, Not Detected, or Failed |
+| **Sync and Delete** | Always, checked while it is the saved mode | Saves the mode and lets automatic syncs request a deleting transfer |
+| **Sync and Retain** | Always, checked while it is the saved mode | Saves the mode; automatic syncs read the pen and keep its copy |
+| **Pause** | Always, checked while it is the saved mode | Saves the mode; discovery and the interval timer stop, and a read in flight is left to finish |
+| **Sync Interval** submenu | Always | Offers **1 minute**, **5 minutes**, **15 minutes**, and **30 minutes**, with the saved one checked |
+| **Cancel Read** | A read is running | Stops the scan or the read and returns to idle |
 | A numbered pen entry, such as `Neosmartpen_A1 (pen 1)` | Two or more pens matched | Reads the pen you pick |
-| Result line | A read completed | Shows strokes, dots, and distinct pages, plus a notice of what was saved and written |
-| Cleanup outcome line | A read completed | Says what happened to the pen's copy. A deleting read shows the acknowledged packet prefix, that retention was chosen, or a skip with its blocking condition; the separate command route's reclaimed and outstanding outcomes are the ones this build cannot produce, because no deletion command is sent |
-| Per-file failure line | At least one file could not be written | Names the file and the reason |
-| **Retry Export** | A read saved but a file failed | Republishes the stored read's files |
-| Cleanup statement line | Always | The statement the confirmation is about: "If you confirm cleanup for this read, each packet saved to the local library is removed from the pen when the read acknowledges it. The files requested for this read are exported afterwards; if that export fails, retry it from the local library." |
-| Cleanup intent line | Always | Names the intent on screen and what the choice applies to: "Removing each acknowledged packet from the pen as this read progresses.", "Keeping the pen's strokes for this read; cleanup was not confirmed.", "Retry Export publishes files from the library and removes nothing from the pen.", "The next read can remove acknowledged packets once you confirm cleanup for it.", or the same line with "keeps the pen's strokes" when retention was chosen or cleanup is unavailable |
-| **Keep Strokes on the Pen for This Read** | No attempt is running, cleanup is the intent on screen, and no deleting read's retry is pending | Retains the pen's copy for the transfer the intent line names |
-| **Remove Them After a Successful Read** | No attempt is running, retention is the intent on screen, and no deleting read's retry is pending | Restores the default cleanup intent for the transfer the intent line names |
-| **Remove Acknowledged Packets for This Read** | No attempt is running, cleanup is intended and available, this sync is not yet confirmed, and no deleting read's retry is pending | Confirms cleanup for one read, which is what authorizes the deleting transfer |
-| Cleanup-unavailable line | The deleting route cannot run | "Cleanup is unavailable: …", naming the missing precondition: no export folder chosen, no writable library, or transfer evidence that does not cover the connected pen |
-| **Choose Export Folder…** | Always | Picks the folder page files are written into and remembers it |
-| Export-folder line | Always | Shows the chosen folder, or that no folder is chosen |
-| Failure line | A read failed | Shows the human-readable error |
+| **Retry Export** | A read saved but a file failed | Republishes the stored read's files from the library |
 | **Connection Details…** | Always | Opens the details window, brings it forward, and takes keyboard focus from the app you were using |
 | **Quit NeoBridge** | Always | Quits the app |
 
-The action that retrieves strokes is labelled **Read and Save Pen Data**, because
-that is what it does: it commits the strokes and writes the files.
+Clicking the mode that is already checked clears its checkmark, which is not a
+setting the app has, so the clear is ignored: the three modes are one choice, and
+only selecting a different one changes it. The same applies to the interval.
+
+The menu deliberately carries one status line and nothing else it would have to
+explain: no counts, no export path, no cleanup prose, and no failure text. They are
+in Connection Details, where there is room for them and where they stay out of the
+way of the settings.
+
+## Connection Details
+
+The window shows what the menu leaves out.
+
+| Section | Shows |
+| --- | --- |
+| Header | The current state, such as "Scanning for a pen", "Saving to the library", "Complete", or "Partial" |
+| Result | Strokes, dots, and distinct pages; the notes read; a notice of what was saved and written; and one line per file with its result (written, already up to date, or failed) |
+| Failure | The error, a diagnostic when a transfer stopped after some packets, and a statement that no counts are shown because the read did not complete |
+| Pen choice | One button per matching pen, numbered rather than addressed |
+| Sync settings | The same saved mode and interval the menu offers, what each means for the pen's copy, and the transfer gate that keeps a deleting transfer from running when one is closed |
+| Export folder | The chosen folder, or that no folder is chosen, with **Choose Export Folder…** |
+| Actions | **Cancel** while a read runs, **Retry Export** when a read saved but a file failed, and **Close** |
 
 ## Shell states
 
@@ -418,9 +515,9 @@ A partial read is never labelled a completed sync. An ordinary transfer that sto
 early is presented as a failure; a deleting read that stops early is presented as
 **Partial**, because what it holds is the durable prefix it acknowledged while the
 pen may still hold the rest. In both cases the partial counts are diagnostics
-rather than a result. Retry is the same **Read and Save Pen Data** command: every
-attempt builds a new transport and a new session, so a retry starts a new scan
-rather than resuming the old one.
+rather than a result. Every attempt builds a new transport and a new session, so an
+attempt after a failure starts a new scan rather than resuming the old one, and the
+schedule paces the next one at the saved interval.
 
 ## What this version does not do
 

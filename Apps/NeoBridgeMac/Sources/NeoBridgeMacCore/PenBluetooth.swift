@@ -162,9 +162,14 @@ public protocol PenBluetoothConnection: Sendable {
 
 /// The CoreBluetooth operations the transport needs.
 ///
-/// Narrowing the surface to these five members is what lets the transport's
-/// selection and routing rules run under `swift test` against a fake, because no
-/// test needs a radio.
+/// Narrowing the surface to these members is what lets the transport's selection
+/// and routing rules run under `swift test` against a fake, because no test needs
+/// a radio.
+///
+/// There are two scans on purpose, and the radio runs only one of them at a time:
+/// the bounded ``scan()`` answers "which pen should this read use", while
+/// ``observe()`` answers "is the pen still there" for the automatic schedule. The
+/// schedule stops its observation before a read starts and resumes it afterwards.
 public protocol PenBluetoothCentral: Sendable {
     /// The adapter state at the moment of the call.
     var state: PenBluetoothState { get }
@@ -177,6 +182,24 @@ public protocol PenBluetoothCentral: Sendable {
 
     /// Stops a running scan. Finishing an already-finished scan does nothing.
     func stopScan() async
+
+    /// Starts a continuous scan that reports every advertisement, including repeats.
+    ///
+    /// The bounded selection scan withholds duplicate advertisements, so a pen that
+    /// stays in range reports once and then goes quiet. That is the right shape for
+    /// picking a pen and the wrong shape for measuring how long a pen has been
+    /// silent, so the observation scan asks for duplicates instead. The stream
+    /// finishes when `stopObservation()` is called, and throws when the adapter stops
+    /// the scan for an error of its own.
+    ///
+    /// The radio runs one scan at a time, so requesting an observation retires a
+    /// bounded selection scan that is running: the selection stream finishes rather
+    /// than waiting for advertisements that the radio will no longer report.
+    func observe() -> AsyncThrowingStream<PenPeripheral, any Error>
+
+    /// Stops an observation scan. Finishing an already-finished scan does nothing,
+    /// and a bounded selection scan that is running is left alone.
+    func stopObservation() async
 
     /// Connects to one peripheral and prepares its data channel.
     ///

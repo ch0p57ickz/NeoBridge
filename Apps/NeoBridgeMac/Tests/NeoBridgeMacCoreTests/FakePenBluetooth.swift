@@ -5,16 +5,27 @@ import Synchronization
 /// A scripted stand-in for the Bluetooth adapter.
 ///
 /// The transport's selection and routing rules run against this fake, so no test
-/// needs a radio. The scan stream stays open until `stopScan()`, which is the
-/// contract ``CoreBluetoothPenTransport`` relies on to collect every match
-/// before it decides.
+/// needs a radio. Both scan streams stay open until their stop method is called,
+/// which is the contract ``CoreBluetoothPenTransport`` relies on to collect every
+/// match before it decides and the contract the automatic schedule relies on to
+/// measure how long a pen has been silent.
 final class FakePenBluetoothCentral: PenBluetoothCentral, @unchecked Sendable {
     private struct Store {
         var isScanning = false
         var didStopScan = false
+        var isObserving = false
+        var didStopObservation = false
         var scanContinuation: AsyncThrowingStream<PenPeripheral, any Error>.Continuation?
+        var observationContinuation: AsyncThrowingStream<PenPeripheral, any Error>.Continuation?
         var connected: [PenPeripheral] = []
         var state: PenBluetoothState = .poweredOn
+
+        /// The scans this fake started and stopped, in order.
+        ///
+        /// The radio runs one scan at a time, so a test checks the handoff between
+        /// observation and a read's selection scan by reading this log rather than
+        /// by watching two streams at once.
+        var events: [String] = []
     }
 
     /// The peripherals a scan reports, in order.
@@ -26,6 +37,11 @@ final class FakePenBluetoothCentral: PenBluetoothCentral, @unchecked Sendable {
     /// An error the scan finishes with. When absent, the scan stays open until
     /// `stopScan()`.
     let scanFailure: PenBluetoothError?
+
+    /// An error the observation finishes with, after it has delivered its
+    /// scripted advertisements. When absent, the observation stays open until
+    /// `stopObservation()`.
+    let observationFailure: PenBluetoothError?
 
     /// A state the adapter adopts when the scan stops, which models the adapter
     /// going away while a scan was running. The scan then also finishes with the
@@ -66,6 +82,7 @@ final class FakePenBluetoothCentral: PenBluetoothCentral, @unchecked Sendable {
         adapterStateResolvesAfter: Duration? = nil,
         advertisedPeripherals: [PenPeripheral] = [],
         scanFailure: PenBluetoothError? = nil,
+        observationFailure: PenBluetoothError? = nil,
         stateAfterScan: PenBluetoothState? = nil,
         connectionFailure: PenBluetoothError? = nil,
         connectionStalls: Bool = false,
@@ -79,6 +96,7 @@ final class FakePenBluetoothCentral: PenBluetoothCentral, @unchecked Sendable {
         }
         self.advertisedPeripherals = advertisedPeripherals
         self.scanFailure = scanFailure
+        self.observationFailure = observationFailure
         self.stateAfterScan = stateAfterScan
         self.connectionFailure = connectionFailure
         self.connectionStalls = connectionStalls
@@ -92,6 +110,15 @@ final class FakePenBluetoothCentral: PenBluetoothCentral, @unchecked Sendable {
 
     /// Whether `stopScan()` has been called.
     var didStopScan: Bool { store.withLock { $0.didStopScan } }
+
+    /// Whether `observe()` is running.
+    var isObserving: Bool { store.withLock { $0.isObserving } }
+
+    /// Whether `stopObservation()` has been called.
+    var didStopObservation: Bool { store.withLock { $0.didStopObservation } }
+
+    /// The scans this fake started and stopped, in order.
+    var events: [String] { store.withLock { $0.events } }
 
     /// Every peripheral passed to `connect(to:)`, in order.
     var connectedPeripherals: [PenPeripheral] { store.withLock { $0.connected } }
@@ -113,6 +140,7 @@ final class FakePenBluetoothCentral: PenBluetoothCentral, @unchecked Sendable {
         return AsyncThrowingStream { continuation in
             store.withLock { store in
                 store.isScanning = true
+                store.events.append("scan")
                 store.scanContinuation = continuation
             }
 
@@ -142,6 +170,10 @@ final class FakePenBluetoothCentral: PenBluetoothCentral, @unchecked Sendable {
         let continuation = store.withLock {
             store -> AsyncThrowingStream<PenPeripheral, any Error>.Continuation? in
             store.didStopScan = true
+            if store.isScanning {
+                store.isScanning = false
+                store.events.append("stopScan")
+            }
             if let stateAfterScan {
                 store.state = stateAfterScan
             }
@@ -155,6 +187,48 @@ final class FakePenBluetoothCentral: PenBluetoothCentral, @unchecked Sendable {
         } else {
             continuation?.finish()
         }
+    }
+
+    func observe() -> AsyncThrowingStream<PenPeripheral, any Error> {
+        let advertised = advertisedPeripherals
+        let failure = observationFailure
+
+        return AsyncThrowingStream { continuation in
+            store.withLock { store in
+                store.isObserving = true
+                store.events.append("observe")
+                store.observationContinuation = continuation
+            }
+
+            // The observation reports the same peripherals as the selection scan,
+            // but it keeps reporting them: a pen that stays in range is what the
+            // schedule measures silence against.
+            for peripheral in advertised {
+                continuation.yield(peripheral)
+            }
+            if let failure {
+                continuation.finish(throwing: failure)
+            }
+        }
+    }
+
+    func stopObservation() async {
+        let continuation = store.withLock {
+            store -> AsyncThrowingStream<PenPeripheral, any Error>.Continuation? in
+            store.didStopObservation = true
+            if store.isObserving {
+                store.isObserving = false
+                store.events.append("stopObservation")
+            }
+            defer { store.observationContinuation = nil }
+            return store.observationContinuation
+        }
+        continuation?.finish()
+    }
+
+    /// Delivers one advertisement, as a pen that is still in range would.
+    func emit(_ peripheral: PenPeripheral) {
+        store.withLock { $0.observationContinuation }?.yield(peripheral)
     }
 
     func connect(to peripheral: PenPeripheral) async throws -> any PenBluetoothConnection {

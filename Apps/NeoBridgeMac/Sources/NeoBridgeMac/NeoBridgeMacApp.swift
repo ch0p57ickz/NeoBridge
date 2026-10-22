@@ -9,7 +9,7 @@ enum PenSyncScene {
     static let windowID = "pen-sync"
 
     /// The title the details window shows.
-    static let windowTitle = "NeoBridge Pen Sync"
+    static let windowTitle = "NeoBridge Connection Details"
 }
 
 /// The process entry point.
@@ -40,6 +40,20 @@ enum NeoBridgeMacMain {
     }
 }
 
+/// The controller and the automatic schedule the app runs.
+///
+/// They are paired because they share one Bluetooth adapter: the radio runs one
+/// scan at a time, so the schedule's observation and a read's selection scan have
+/// to be handed off between the same central.
+@MainActor
+struct PenSyncRuntime {
+    /// The controller the menu and the details window present.
+    let controller: PenSyncController
+
+    /// The schedule that discovers the pen and starts reads without a click.
+    let coordinator: PenSyncCoordinator
+}
+
 /// Builds the objects the app runs.
 ///
 /// One Bluetooth adapter serves a whole run, because only one pen connects at a
@@ -49,6 +63,23 @@ enum NeoBridgeMacMain {
 /// attempt.
 @MainActor
 enum PenSyncAppComposition {
+    /// The runtime the interface presents, built and started once per process.
+    ///
+    /// The schedule starts with the app rather than with the first menu click, so
+    /// discovery begins at launch. SwiftUI may create the app struct more than
+    /// once, so the runtime is cached rather than rebuilt: a second one would open
+    /// a second adapter and a second schedule.
+    private static var cachedRuntime: PenSyncRuntime?
+
+    /// Returns the app's runtime, starting its schedule the first time.
+    static func runtime() -> PenSyncRuntime {
+        if let cachedRuntime { return cachedRuntime }
+        let built = buildRuntime()
+        cachedRuntime = built
+        built.coordinator.start()
+        return built
+    }
+
     /// Creates the controller the app and the acceptance run drive.
     ///
     /// - Parameters:
@@ -63,7 +94,51 @@ enum PenSyncAppComposition {
         exportDirectory: String? = nil,
         acceptance: PenAcceptanceOptions? = nil
     ) -> PenSyncController {
+        makeController(
+            central: CoreBluetoothPenCentral(),
+            preferences: nil,
+            trace: trace,
+            exportDirectory: exportDirectory,
+            acceptance: acceptance
+        )
+    }
+
+    /// Creates the app's controller and schedule over one adapter.
+    ///
+    /// - Parameters:
+    ///   - defaults: The domain the saved sync settings live in.
+    ///   - clock: The clock the schedule measures intervals with.
+    private static func buildRuntime(
+        defaults: UserDefaults = .standard,
+        clock: any PenSyncClock = ContinuousClock()
+    ) -> PenSyncRuntime {
         let central = CoreBluetoothPenCentral()
+        let controller = makeController(
+            central: central,
+            preferences: PenSyncPreferences(defaults: defaults),
+            trace: nil,
+            exportDirectory: nil,
+            acceptance: nil
+        )
+        return PenSyncRuntime(
+            controller: controller,
+            coordinator: PenSyncCoordinator(central: central, controller: controller, clock: clock)
+        )
+    }
+
+    /// Creates a controller over an adapter.
+    ///
+    /// - Parameter preferences: The saved sync settings, or `nil` for a run that is
+    ///   driven directly and has no saved setting to honor. The acceptance run
+    ///   supplies `nil`, so its deleting transfer stays behind its own explicit
+    ///   confirmation.
+    private static func makeController(
+        central: any PenBluetoothCentral,
+        preferences: PenSyncPreferences?,
+        trace: PenTrafficLog?,
+        exportDirectory: String?,
+        acceptance: PenAcceptanceOptions?
+    ) -> PenSyncController {
         let destination: any PenExportDestinationProviding = exportDirectory.map {
             FixedExportDestination(directory: $0)
         } ?? BookmarkedExportDestination()
@@ -82,7 +157,8 @@ enum PenSyncAppComposition {
             },
             library: library.coordinator,
             destination: destination,
-            deletingReadStorage: library.deletingReadStorage
+            deletingReadStorage: library.deletingReadStorage,
+            preferences: preferences
         )
     }
 
@@ -123,21 +199,22 @@ enum PenSyncAppComposition {
 ///
 /// The app runs as an accessory: `Info.plist` sets `LSUIElement`, so there is no
 /// Dock icon and no window until the user asks for one. All state lives in one
-/// ``PenSyncController``; the menu and the window are two views of it.
+/// ``PenSyncController`` and one ``PenSyncCoordinator``; the menu and the window
+/// are two views of the controller, and the schedule is what starts reads.
 struct NeoBridgeMacApp: App {
-    @State private var controller = PenSyncAppComposition.makeController()
+    @State private var runtime = PenSyncAppComposition.runtime()
     @State private var activation = PenSyncActivation()
 
     var body: some Scene {
         MenuBarExtra("NeoBridge", systemImage: "pencil.tip") {
-            PenSyncMenu(controller: controller, activation: activation)
+            PenSyncMenu(controller: runtime.controller, activation: activation)
         }
         .menuBarExtraStyle(.menu)
 
         Window(PenSyncScene.windowTitle, id: PenSyncScene.windowID) {
-            PenSyncView(controller: controller)
+            PenSyncView(controller: runtime.controller)
         }
-        .defaultSize(width: 520, height: 520)
+        .defaultSize(width: 560, height: 620)
         .windowResizability(.contentMinSize)
     }
 }

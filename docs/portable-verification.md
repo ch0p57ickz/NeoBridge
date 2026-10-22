@@ -6,7 +6,8 @@ tasks 1.1, 1.2, and 4.2, by
 `openspec/changes/archive/2026-10-19-correct-a1-codec-from-hardware-evidence/tasks.md` task 3.5, and
 by `openspec/changes/archive/2026-10-19-add-macos-connect-and-sync/tasks.md` tasks 1.8 and 4.3,
 and by `openspec/changes/add-persistence-and-deterministic-export/tasks.md` tasks 1.2, 2.1–2.4, 3.1–3.3, 4.2, 5.1, 5.2, and 5.3,
-and by `openspec/changes/reduce-redundant-export-backups/tasks.md` task 3.2.
+and by `openspec/changes/simplify-menu-sync-actions/tasks.md` tasks 3.1 and 3.2, and
+by `openspec/changes/reduce-redundant-export-backups/tasks.md` task 3.2.
 
 ## Command
 
@@ -449,6 +450,92 @@ Linux side turns the pax `LIBARCHIVE.xattr.*` records a macOS `tar` emits into
 `._x.json` as a fixture, which fails with a JSON decode error. Strip them after
 copying (`find /work3 -name '._*' -delete`) or copy with a method that does not
 carry extended attributes.
+
+## Verification for `simplify-menu-sync-actions`
+
+Task 3.1 requires the portable script and the macOS package tests to pass, and task
+3.2 requires the app to build under both SwiftPM and Xcode with the gate enabled.
+
+```bash
+SWIFT="$HOME/.local/share/swiftly/bin/swift" Scripts/test-portable.sh
+(cd Apps/NeoBridgeMac && swift test)
+Scripts/remote-mac-build.sh
+```
+
+| Item | Value |
+| --- | --- |
+| Host platform | macOS 27.2 (26B5112a), arm64 |
+| Toolchain | Swift 6.4.1 (swift-6.4.1-RELEASE) |
+| Xcode | 27.1 (27A9275), SDK `MacOSX27.0` |
+| Bluetooth hardware | Not used |
+
+```text
+== Toolchain
+Swift version 6.4.1 (swift-6.4.1-RELEASE)
+== SQLite header check
+ok: the SQLite development header is available
+== Forbidden import check
+ok: Packages/NeoCore imports no Apple-only framework
+ok: Packages/NeoProtocol imports no Apple-only framework
+ok: Packages/NeoStorage imports no Apple-only framework
+ok: Packages/NeoExport imports no Apple-only framework
+ok: Tests/Integration imports no Apple-only framework
+== Pinned dependency resolution
+-- swift build --disable-automatic-resolution (Packages/NeoCore, Packages/NeoProtocol, Packages/NeoStorage, Packages/NeoExport, Tests/Integration)
+== Package tests
+-- swift test (Packages/NeoCore)      62 tests, 0 failures
+-- swift test (Packages/NeoProtocol)  177 tests, 0 failures
+-- swift test (Packages/NeoStorage)   91 tests, 0 failures
+-- swift test (Packages/NeoExport)    41 tests, 0 failures
+-- swift test (Tests/Integration)     20 tests, 0 failures
+== Result
+PASSED: portable packages build with pinned dependencies, import no Apple-only framework, and pass their tests, and the integration scenarios pass.
+```
+
+```text
+(cd Apps/NeoBridgeMac && swift test)
+     Executed 159 tests, with 0 failures (0 unexpected)
+```
+
+The app suite gained 30 tests in three new suites: `PenSyncPreferencesTests` (the
+saved mode and interval, their defaults, and the untouched export bookmark),
+`PenObservationTests` (the continuous observation scan and its handoff rules), and
+`PenSyncCoordinatorTests` (the schedule, driven by a fake clock and a fake adapter).
+It gained 12 more with the menu's status line: eleven `PenSyncControllerTests` cases
+for every status value and its precedence rules, and one `PenSyncPreferencesTests`
+case pinning the three mode titles. Six of those tests were mutation-checked — the
+paused-mode precedence, the missing-pen classification, the cancelled-attempt rule,
+the empty-read rule, and the two paths that must leave the date alone (a failed
+export retry and a session-level cancellation) — and each fails when its branch is
+removed.
+
+```text
+Scripts/remote-mac-build.sh
+== App build (Xcode)
+ok: the Xcode build succeeded.
+== Bundle verification
+ok: CFBundleIdentifier = com.sushidev.neobridge.mac
+ok: NSBluetoothAlwaysUsageDescription = NeoBridge reads offline strokes from a Neo Smartpen A1 over Bluetooth.
+ok: LSUIElement = true
+== Result
+PASSED: portable packages verified, app built under SwiftPM and Xcode, bundle assembled.
+```
+
+The assembled bundle also launched and stayed running for six seconds with no
+output and no crash, which is the only automated check available for a menu-bar
+app: its menu cannot be inspected from a script without an accessibility grant.
+Physical A1 acceptance for automatic sync (task 3.3) was not run, because no pen was
+available; see `Tests/Hardware/README.md`.
+
+One part of the change has no automated test and is an accepted boundary: the
+real adapter's scan bookkeeping in `CoreBluetoothPenCentral` — retiring the other
+scan kind on request, declining to re-arm the radio when a stop or an
+adapter-state change landed first, and keeping one tracked scan at a time. That
+code needs a live `CBCentralManager`, so `PenObservationTests` exercises the fake
+adapter instead, which carries no generation bookkeeping. The behaviour was
+reviewed by reasoning about the serial `queue` and the actor, not run.
+
+Recorded on 2026-10-21.
 
 ## Verification for `reduce-redundant-export-backups`
 

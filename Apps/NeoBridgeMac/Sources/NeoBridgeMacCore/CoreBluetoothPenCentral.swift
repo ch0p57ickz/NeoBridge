@@ -110,7 +110,23 @@ public final class CoreBluetoothPenCentral: NSObject, PenBluetoothCentral, PenBl
         var inbound: AsyncThrowingStream<[UInt8], any Error>?
         var inboundContinuation: InboundContinuation?
 
-        var scanContinuation: AsyncThrowingStream<PenPeripheral, any Error>.Continuation?
+        /// The scan the radio is running, if any.
+        ///
+        /// CoreBluetooth runs one scan per central, so the two scans the app needs
+        /// cannot overlap: the automatic schedule stops its observation before a
+        /// read starts its bounded selection scan.
+        var runningScan: ScanKind?
+
+        /// How many scans have been requested.
+        ///
+        /// A scan's start reaches `queue` after its continuation is installed, so
+        /// the number lets a queued start see that a stop retired it and decline to
+        /// re-arm the radio.
+        var scanGeneration = 0
+
+        var selectionContinuation: AsyncThrowingStream<PenPeripheral, any Error>.Continuation?
+        var observationContinuation: AsyncThrowingStream<PenPeripheral, any Error>.Continuation?
+
         var connectionWaiter: DelegateWaiter?
         var serviceWaiter: DelegateWaiter?
         var characteristicWaiter: DelegateWaiter?
@@ -118,6 +134,16 @@ public final class CoreBluetoothPenCentral: NSObject, PenBluetoothCentral, PenBl
         var writeWaiter: DelegateWaiter?
 
         var isClosed = false
+    }
+
+    /// Which of the two scans the radio is running.
+    private enum ScanKind: Sendable {
+        /// The bounded scan a read uses to select a pen. Duplicates are withheld.
+        case selection
+
+        /// The continuous scan the automatic schedule uses to watch for a pen.
+        /// Duplicates are requested, so a pen that stays in range keeps reporting.
+        case observation
     }
 
     private typealias InboundContinuation = AsyncThrowingStream<[UInt8], any Error>.Continuation
@@ -155,25 +181,103 @@ public final class CoreBluetoothPenCentral: NSObject, PenBluetoothCentral, PenBl
 
     public func scan() -> AsyncThrowingStream<PenPeripheral, any Error> {
         AsyncThrowingStream { continuation in
-            store.withLock { $0.scanContinuation = continuation }
-            startScan()
+            let (displaced, generation) = store.withLock {
+                state
+                    -> (
+                        [AsyncThrowingStream<PenPeripheral, any Error>.Continuation],
+                        Int
+                    ) in
+                // The radio runs one scan at a time, so requesting this one retires
+                // the other. Retiring it here, in the same critical section that
+                // installs this continuation, is what makes a stop decide against
+                // what was asked for rather than against what has reached `queue`
+                // yet. Both slots are retired, this kind's own included, so a
+                // repeated request cannot leave an earlier consumer waiting on
+                // advertisements that will never arrive.
+                let displaced = [state.observationContinuation, state.selectionContinuation]
+                    .compactMap { $0 }
+                state.observationContinuation = nil
+                state.selectionContinuation = continuation
+                state.runningScan = .selection
+                state.scanGeneration += 1
+                return (displaced, state.scanGeneration)
+            }
+            // Finishing the displaced streams is what keeps their consumers from
+            // waiting for advertisements that will never arrive.
+            displaced.forEach { $0.finish() }
+            startScan(as: .selection, generation: generation)
         }
     }
 
     public func stopScan() async {
-        let continuation = store.withLock {
-            state -> AsyncThrowingStream<PenPeripheral, any Error>.Continuation? in
-            defer { state.scanContinuation = nil }
-            return state.scanContinuation
+        let (continuation, shouldStopRadio) = store.withLock {
+            state -> (AsyncThrowingStream<PenPeripheral, any Error>.Continuation?, Bool) in
+            let continuation = state.selectionContinuation
+            state.selectionContinuation = nil
+            guard state.runningScan == .selection else { return (continuation, false) }
+            state.runningScan = nil
+            // Retiring the generation keeps a start that has not reached `queue`
+            // yet from re-arming the radio after this stop.
+            state.scanGeneration += 1
+            return (continuation, true)
         }
 
+        if shouldStopRadio {
+            await stopRadioScan()
+        }
+        continuation?.finish()
+    }
+
+    public func observe() -> AsyncThrowingStream<PenPeripheral, any Error> {
+        AsyncThrowingStream { continuation in
+            let (displaced, generation) = store.withLock {
+                state
+                    -> (
+                        [AsyncThrowingStream<PenPeripheral, any Error>.Continuation],
+                        Int
+                    ) in
+                let displaced = [state.selectionContinuation, state.observationContinuation]
+                    .compactMap { $0 }
+                state.selectionContinuation = nil
+                state.observationContinuation = continuation
+                state.runningScan = .observation
+                state.scanGeneration += 1
+                return (displaced, state.scanGeneration)
+            }
+            displaced.forEach { $0.finish() }
+            startScan(as: .observation, generation: generation)
+        }
+    }
+
+    public func stopObservation() async {
+        let (continuation, shouldStopRadio) = store.withLock {
+            state -> (AsyncThrowingStream<PenPeripheral, any Error>.Continuation?, Bool) in
+            let continuation = state.observationContinuation
+            state.observationContinuation = nil
+            guard state.runningScan == .observation else { return (continuation, false) }
+            state.runningScan = nil
+            state.scanGeneration += 1
+            return (continuation, true)
+        }
+
+        if shouldStopRadio {
+            await stopRadioScan()
+        }
+        continuation?.finish()
+    }
+
+    /// Stops whatever scan the radio is running.
+    ///
+    /// The stop is hopped onto `queue` so it cannot race a scan that is being
+    /// started there, and the caller waits for it, so a read that starts its own
+    /// scan afterwards cannot be stopped by this one.
+    private func stopRadioScan() async {
         await withCheckedContinuation { done in
             queue.async { [self] in
                 manager.stopScan()
                 done.resume()
             }
         }
-        continuation?.finish()
     }
 
     public func connect(to peripheral: PenPeripheral) async throws -> any PenBluetoothConnection {
@@ -390,10 +494,20 @@ public final class CoreBluetoothPenCentral: NSObject, PenBluetoothCentral, PenBl
 
     // MARK: - Queue helpers
 
-    private func startScan() {
+    private func startScan(as kind: ScanKind, generation: Int) {
         queue.async { [self] in
+            // A stop that landed after this scan was requested retired it, so the
+            // queued start must not re-arm the radio behind the stop's back. The
+            // kind is checked as well as the generation: an adapter-state change
+            // clears `runningScan` without retiring the generation, and a start
+            // queued before it must not arm a scan nothing can then stop.
+            guard store.withLock({ $0.scanGeneration == generation && $0.runningScan == kind })
+            else { return }
             // A previous scan is stopped first, and the discovered set is
-            // dropped, so no result survives from an earlier power cycle.
+            // dropped, so no result survives from an earlier power cycle. The
+            // two scans never overlap: requesting one retires the other before
+            // this block runs, and the schedule stops its observation before a
+            // read starts its selection scan.
             manager.stopScan()
             store.withLock { $0.objects.discovered.removeAll() }
             manager.scanForPeripherals(
@@ -401,7 +515,9 @@ public final class CoreBluetoothPenCentral: NSObject, PenBluetoothCentral, PenBl
                     CBUUID(string: PenGATT.serviceShortUUID),
                     CBUUID(string: PenGATT.serviceUUID),
                 ],
-                options: [CBCentralManagerScanOptionAllowDuplicatesKey: false]
+                options: [
+                    CBCentralManagerScanOptionAllowDuplicatesKey: kind == .observation
+                ]
             )
         }
     }
@@ -441,12 +557,26 @@ extension CoreBluetoothPenCentral: CBCentralManagerDelegate {
         // revocation reports the same error a setup step checks for.
         guard let error = adapterState.unavailableError else { return }
 
-        let scan = store.withLock {
-            store -> AsyncThrowingStream<PenPeripheral, any Error>.Continuation? in
-            defer { store.scanContinuation = nil }
-            return store.scanContinuation
+        let (scan, observation) = store.withLock {
+            store
+                -> (
+                    AsyncThrowingStream<PenPeripheral, any Error>.Continuation?,
+                    AsyncThrowingStream<PenPeripheral, any Error>.Continuation?
+                ) in
+            let running = store.runningScan
+            store.runningScan = nil
+            let scan =
+                running == .selection
+                ? store.selectionContinuation : nil
+            let observation =
+                running == .observation
+                ? store.observationContinuation : nil
+            store.selectionContinuation = nil
+            store.observationContinuation = nil
+            return (scan, observation)
         }
         scan?.finish(throwing: error)
+        observation?.finish(throwing: error)
 
         failDelegate(\.connectionWaiter, error)
         failDelegate(\.serviceWaiter, error)
@@ -465,7 +595,9 @@ extension CoreBluetoothPenCentral: CBCentralManagerDelegate {
         let continuation = store.withLock {
             state -> AsyncThrowingStream<PenPeripheral, any Error>.Continuation? in
             state.objects.discovered[peripheral.identifier] = peripheral
-            return state.scanContinuation
+            return state.runningScan == .observation
+                ? state.observationContinuation
+                : state.selectionContinuation
         }
         continuation?.yield(described)
     }

@@ -59,6 +59,40 @@ public final class PenSyncController {
         }
     }
 
+    /// The compact status the menu shows in one line.
+    ///
+    /// The menu is a control surface, so its status says only what a glance needs:
+    /// whether a read is running, whether the last one stored anything, and whether
+    /// the pen was there to be read. Counts, export paths, cleanup explanations, and
+    /// failure detail stay in Connection Details.
+    public enum MenuStatus: Hashable, Sendable {
+        /// A read is running, or the app is waiting for the pen choice it asked for.
+        case syncing
+
+        /// The saved mode is Pause, so no pen is discovered and no read starts.
+        case paused
+
+        /// No attempt has settled yet.
+        case idle
+
+        /// The last read completed, at the given time.
+        ///
+        /// A read that carried no strokes counts as completed: the pen was reached
+        /// and read, it simply had nothing new to store, so the sync did happen. That
+        /// is what separates this case from ``notDetected``, where the pen was never
+        /// there at all.
+        ///
+        /// The time is wall-clock rather than the schedule's clock, because the line
+        /// reads as an elapsed time for a person: "Synced 5 minutes ago".
+        case synced(at: Date)
+
+        /// The last attempt found no pen advertising the expected name.
+        case notDetected
+
+        /// The last attempt failed for a reason other than a missing pen.
+        case failed
+    }
+
     /// The title of the action that retrieves offline strokes.
     ///
     /// The label says the app saves the pen's data, because that is what the read
@@ -87,8 +121,67 @@ public final class PenSyncController {
         + " from the pen when the read acknowledges it. The files requested for this read are"
         + " exported afterwards; if that export fails, retry it from the local library."
 
+    /// What the saved Sync and Delete mode does with the pen's copy.
+    ///
+    /// The statement is about the saved setting rather than about one read, so it
+    /// names the gates that still apply: the mode authorizes an eligible automatic
+    /// read, and it never stands in for evidence, a requested export, a matching pen
+    /// identity, or a writable library.
+    public static let automaticCleanupStatement =
+        "Sync and Delete removes each packet saved to the local library from the pen when the read"
+        + " acknowledges it. A read that requests no export, lacks safe transfer evidence, meets a"
+        + " different pen, or has no writable library keeps the pen's copy instead, and Connection"
+        + " Details names the reason."
+
     /// What the shell is showing now.
+    ///
+    /// Every write goes through ``setPhase(_:)``, which is what releases the
+    /// automatic schedule when a read stops being in flight.
     public private(set) var phase: Phase = .idle
+
+    /// How the last read ended, once it stopped being in flight.
+    private enum AttemptResult: Hashable, Sendable {
+        /// The read completed, at the given time.
+        ///
+        /// A read that carried no strokes still completed, so this case covers it:
+        /// the pen was reached and read. Only a pen that was never there is
+        /// ``notDetected``.
+        case completedRead(at: Date)
+
+        /// The attempt found no pen advertising the expected name.
+        case notDetected
+
+        /// The attempt failed for a reason other than a missing pen.
+        case failed
+    }
+
+    /// The last read attempt's result, or `nil` before one settles.
+    ///
+    /// Only a read records here. An export retry republishes a read that already
+    /// completed, so it leaves the status alone whether it succeeds or fails: the
+    /// line answers "when did the pen last sync", not "when was a file last
+    /// written". A cancelled attempt records nothing either, so the previous status
+    /// stays on show: the user withdrew that read rather than the pen failing to
+    /// appear.
+    private var lastAttemptResult: AttemptResult?
+
+    /// The compact status the menu shows.
+    ///
+    /// An attempt in flight wins over the saved mode, so pausing during a read
+    /// still reports that read rather than claiming nothing is running; the mode
+    /// item's own checkmark is what says the schedule is paused. Otherwise the
+    /// saved mode wins over the last result, because a paused app is not syncing
+    /// whatever the previous attempt did.
+    public var menuStatus: MenuStatus {
+        if isBusy || isAwaitingChoice { return .syncing }
+        guard syncMode.isAutomatic else { return .paused }
+        switch lastAttemptResult {
+        case .completedRead(let date): return .synced(at: date)
+        case .notDetected: return .notDetected
+        case .failed: return .failed
+        case nil: return .idle
+        }
+    }
 
     /// The measured state from the current completed read, if available.
     public var penState: PenState? { outcome?.penState }
@@ -133,6 +226,30 @@ public final class PenSyncController {
     private var attempt: Task<Void, Never>?
     private var generation = 0
 
+    /// Where the saved sync settings are read from and written to.
+    ///
+    /// It is `nil` for a controller a caller drives directly rather than through
+    /// the automatic schedule: the headless acceptance run and the shell tests.
+    /// Such a controller has no saved setting to honor, so its transfer is
+    /// authorized by the per-read confirmation instead.
+    private let preferences: PenSyncPreferences?
+
+    /// Called after a saved setting changes, so the automatic schedule can re-plan.
+    public var settingsDidChange: (@MainActor () -> Void)?
+
+    /// The saved mode the automatic schedule follows.
+    ///
+    /// It is published so the menu and the window can show a checkmark beside the
+    /// saved setting, and so a test can read back what a selection saved.
+    public private(set) var syncMode: PenSyncMode
+
+    /// The saved interval the automatic schedule follows.
+    public private(set) var syncInterval: PenSyncInterval
+
+    /// Waiters that are suspended until no read is in flight and no pen choice is
+    /// pending.
+    private var availabilityWaiters: [CheckedContinuation<Void, Never>] = []
+
     /// Whether the next read has this sync's cleanup confirmation.
     ///
     /// It is deliberately not durable: a confirmation applies to one read, so a
@@ -154,20 +271,99 @@ public final class PenSyncController {
     ///   - deletingReadStorage: The durable packet storage a deleting read commits
     ///     through. The default has none, so a deleting read is refused rather
     ///     than started without a barrier.
+    ///   - preferences: The saved sync settings, or `nil` for a controller that is
+    ///     driven directly and has no saved setting to honor. The app supplies a
+    ///     store; the headless acceptance run and the shell tests do not.
     public init(
         runners: PenSyncRunnerFactory,
         library: any PenImportCoordinator,
         destination: any PenExportDestinationProviding,
         cleanupPolicy: PenCleanupPolicy = PenCleanupPolicy(),
-        deletingReadStorage: PenDeletingReadStorage = .unavailable
+        deletingReadStorage: PenDeletingReadStorage = .unavailable,
+        preferences: PenSyncPreferences? = nil
     ) {
         self.runners = runners
         self.library = library
         self.destination = destination
         self.cleanupPolicy = cleanupPolicy
         self.deletingReadStorage = deletingReadStorage
+        self.preferences = preferences
+        self.syncMode = preferences?.mode ?? .delete
+        self.syncInterval = preferences?.interval ?? .fiveMinutes
         self.nextReadCleanupMode = cleanupPolicy.mode
         self.attemptCleanupMode = cleanupPolicy.mode
+    }
+
+    // MARK: - Saved settings
+
+    /// Saves the sync mode the automatic schedule follows.
+    ///
+    /// Selecting Delete or Retain while Paused is what resumes automatic sync, so
+    /// the change is reported to the schedule rather than only stored. A mode set
+    /// while a read is in flight is saved and applies to the next read: the read
+    /// already captured its own transfer, so changing it here cannot change what
+    /// that read does.
+    ///
+    /// - Parameter mode: The setting the user selected.
+    public func selectSyncMode(_ mode: PenSyncMode) {
+        guard mode != syncMode else { return }
+        syncMode = mode
+        preferences?.mode = mode
+        settingsDidChange?()
+    }
+
+    /// Saves the interval the automatic schedule follows.
+    ///
+    /// - Parameter interval: The setting the user selected.
+    public func selectSyncInterval(_ interval: PenSyncInterval) {
+        guard interval != syncInterval else { return }
+        syncInterval = interval
+        preferences?.interval = interval
+        settingsDidChange?()
+    }
+
+    /// A one-line statement of what the saved mode means for the pen's copy, for
+    /// Connection Details.
+    public var syncModeLine: String {
+        switch syncMode {
+        case .delete:
+            return "Each eligible automatic sync removes the packets it saved from the pen."
+        case .retain:
+            return "Automatic syncs read the pen and keep its copy."
+        case .paused:
+            return "Automatic sync is paused. No pen is discovered and no read starts."
+        }
+    }
+
+    /// A one-line statement of the saved interval, for Connection Details.
+    public var syncIntervalLine: String {
+        "Another automatic sync is offered every \(syncInterval.title) while the pen is available."
+    }
+
+    // MARK: - Availability
+
+    /// Suspends until no read is in flight and no pen choice is pending.
+    ///
+    /// The automatic schedule waits on this after it asks for a read, so it never
+    /// starts a second read and never stacks opportunities while the user answers a
+    /// question about which pen to use.
+    public func waitUntilAvailable() async {
+        guard isBusy || isAwaitingChoice else { return }
+        await withCheckedContinuation { continuation in
+            availabilityWaiters.append(continuation)
+        }
+    }
+
+    /// Releases everyone suspended in ``waitUntilAvailable()``.
+    ///
+    /// The automatic schedule calls this when it stops, so a schedule parked behind
+    /// a read that never settles does not hold a continuation forever. Releasing the
+    /// wait does not cancel the read: a caller that is still wanted simply waits
+    /// again, and one that is not checks whether it should carry on.
+    func releaseAvailabilityWaiters() {
+        let waiters = availabilityWaiters
+        availabilityWaiters.removeAll()
+        for waiter in waiters { waiter.resume() }
     }
 
     /// Whether a deleting transfer can be offered for a prospective read.
@@ -397,24 +593,50 @@ public final class PenSyncController {
         try destination.setExportDirectory(url)
     }
 
-    /// Starts a read attempt.
+    /// Starts a read attempt that a caller drives directly.
+    ///
+    /// This is the headless acceptance run's entry point and the shell tests'
+    /// entry point. The saved mode does not apply: the transfer is authorized only
+    /// by the per-read intent and confirmation, so a run that asks for cleanup
+    /// without confirming it keeps the pen's copy. The app's automatic syncs use
+    /// ``readAutomatically()`` instead, where the saved mode is what authorizes the
+    /// transfer.
     ///
     /// A call while a choice is pending does nothing, so a read cannot skip the
     /// question about which pen to use.
     public func readPenData() {
         guard !isAwaitingChoice else { return }
-        start(selection: .automatic)
+        start(selection: .automatic, authorization: .perReadChoice)
+    }
+
+    /// Starts one automatic sync, authorized by the saved mode.
+    ///
+    /// The saved mode is what authorizes this read: Sync and Delete asks for a
+    /// deleting transfer without a further click, Sync and Retain asks for the
+    /// ordinary non-destructive read, and Paused starts nothing. The transfer's own
+    /// gates — a requested export, safe evidence, a matching pen identity, and
+    /// durable packet storage — still decide whether deletion can happen, so the
+    /// mode never stands in for them.
+    ///
+    /// A read already in flight, or a pen choice waiting to be answered, keeps this
+    /// call from starting a second read.
+    public func readAutomatically() {
+        guard syncMode.isAutomatic else { return }
+        guard !isAwaitingChoice, !isBusy else { return }
+        start(selection: .automatic, authorization: .savedMode)
     }
 
     /// Reads the pen the user chose after several matched.
     ///
-    /// The intent the user set, and the confirmation given for it, survive the
-    /// question, because the attempt had not started when they were asked.
+    /// The intent the user set, the confirmation given for it, and the saved mode
+    /// the read was authorized by all survive the question, because the attempt had
+    /// not started when they were asked. Answering a question resumes the read that
+    /// asked it rather than starting a new one under a different authorization.
     ///
     /// - Parameter peripheral: A candidate from ``penCandidates``.
     public func choosePen(_ peripheral: PenPeripheral) {
         guard isAwaitingChoice else { return }
-        start(selection: .explicit(peripheral))
+        start(selection: .explicit(peripheral), authorization: attemptAuthorization)
     }
 
     /// Stops the running attempt and returns to idle.
@@ -431,7 +653,7 @@ public final class PenSyncController {
         nextReadCleanupMode = cleanupPolicy.mode
         nextReadCleanupConfirmed = false
         generation += 1
-        phase = .idle
+        setPhase(.idle)
     }
 
     /// Publishes the last stored read's files again.
@@ -454,7 +676,7 @@ public final class PenSyncController {
         // that read. Capturing it keeps the value fixed even if the shell is tapped
         // again while the retry runs.
         let mode = cleanupIntent
-        phase = .exporting
+        setPhase(.exporting)
 
         let request = PenExportRequest(pages: save.pages, destinationDirectory: directory)
         attempt = Task { [weak self] in
@@ -474,6 +696,13 @@ public final class PenSyncController {
                     // command, so the retry only republishes its files and the
                     // read's own transfer outcome stands.
                     cleanup = outcome.cleanup
+                } else if report.succeeded, mode == .deleteAfterAcknowledge,
+                    controller.attemptAuthorization == .savedMode
+                {
+                    // An automatic Sync and Delete read removes packets only
+                    // through its deleting transfer, so its retry republishes from
+                    // the library and asks for no separate deletion command either.
+                    cleanup = .skipped(reason: controller.automaticCleanupRefusal)
                 } else if report.succeeded {
                     cleanup = await controller.requestCleanup(for: save.batchID, mode: mode)
                 } else if mode == .keepOnPen {
@@ -498,20 +727,55 @@ public final class PenSyncController {
 
     // MARK: - Attempt
 
-    private func start(selection: CoreBluetoothPenTransport.Selection) {
+    /// Where a read's transfer authorization comes from.
+    private enum TransferAuthorization {
+        /// The saved mode authorizes the transfer, and the per-read confirmation
+        /// does not apply. The automatic schedule uses this.
+        case savedMode
+
+        /// Only the per-read intent and confirmation apply. A caller that drives
+        /// one read directly uses this, which is what keeps a headless run's
+        /// deleting transfer behind its own explicit confirmation.
+        case perReadChoice
+    }
+
+    /// Where the read the shell shows got its transfer authorization.
+    ///
+    /// It is set when a read starts and kept while that read's outcome is shown, so
+    /// a retry of an automatic read is authorized the same way the read was. An
+    /// automatic read never reaches the separate deletion command, so the retry of
+    /// one must not reach it either.
+    private var attemptAuthorization: TransferAuthorization = .perReadChoice
+
+    private func start(
+        selection: CoreBluetoothPenTransport.Selection,
+        authorization: TransferAuthorization
+    ) {
         guard !isBusy else { return }
 
-        // The read consumes the intent and the confirmation the shell was showing
-        // for it, and the shell goes back to the policy's default while the read
-        // runs: the choice was for this read, so a later one never inherits it.
-        attemptCleanupMode = nextReadCleanupMode
-        attemptCleanupConfirmed = nextReadCleanupConfirmed
+        attemptAuthorization = authorization
+
+        // The read captures the intent and the confirmation it runs with, so a
+        // setting changed while it runs cannot change what it does. The shell goes
+        // back to the policy's default afterwards: a choice was for one read, so a
+        // later one never inherits it.
+        switch authorization {
+        case .savedMode:
+            attemptCleanupMode = syncMode.cleanupMode ?? cleanupPolicy.mode
+            // The saved Delete mode is the user's standing authorization, so an
+            // eligible automatic read does not ask again. Every other gate is
+            // checked separately, in ``deletingReadIntent()``.
+            attemptCleanupConfirmed = syncMode == .delete
+        case .perReadChoice:
+            attemptCleanupMode = nextReadCleanupMode
+            attemptCleanupConfirmed = nextReadCleanupConfirmed
+        }
         nextReadCleanupMode = cleanupPolicy.mode
         nextReadCleanupConfirmed = false
 
         generation += 1
         let generation = self.generation
-        phase = .scanning
+        setPhase(.scanning)
 
         // A deleting read is requested only for a cleanup intent that this sync
         // confirmed, with a requested export, version-matched evidence, and durable
@@ -535,7 +799,7 @@ public final class PenSyncController {
                 let read = try await runner.run(deletingRead: deletingRead, report: report)
                 try await controller.save(read, for: generation)
             } catch {
-                controller.fail(with: error, for: generation)
+                controller.failRead(with: error, for: generation)
             }
         }
     }
@@ -598,6 +862,10 @@ public final class PenSyncController {
         let cleanup: PenCleanupOutcome
         if let refusal = read.deletingReadRefusal, attemptCleanupMode == .deleteAfterAcknowledge {
             cleanup = .skipped(reason: refusal)
+        } else if attemptCleanupMode == .deleteAfterAcknowledge,
+            attemptAuthorization == .savedMode
+        {
+            cleanup = .skipped(reason: automaticCleanupRefusal)
         } else {
             cleanup = await requestCleanup(for: outcome.save?.batchID, mode: attemptCleanupMode)
         }
@@ -613,7 +881,8 @@ public final class PenSyncController {
             destinationDirectory: directory,
             penState: read.penState
         )
-        phase = .complete(presented)
+        noteCompletedRead()
+        setPhase(.complete(presented))
     }
 
     /// Publishes a deleting read's durable batch and reports its acknowledged
@@ -670,7 +939,8 @@ public final class PenSyncController {
             penState: read.penState,
             deletingTransfer: deleting
         )
-        phase = .complete(presented)
+        noteCompletedRead()
+        setPhase(.complete(presented))
     }
 
     /// Requests cleanup for a stored batch, or explains why there is none.
@@ -698,6 +968,18 @@ public final class PenSyncController {
         }
     }
 
+    /// Why an automatic sync that asked for a deleting transfer removed nothing.
+    ///
+    /// Automatic Sync and Delete removes packets only through the deleting
+    /// transfer itself. It never falls back to the separate `0x25`/`0x27` command,
+    /// so the reason it reports is the transfer gate that closed rather than the
+    /// command gate, which no automatic read ever consults.
+    private var automaticCleanupRefusal: String {
+        cleanupUnavailableReason
+            ?? "the deleting transfer did not run, and an automatic sync removes packets"
+                + " only through that transfer"
+    }
+
     /// Ends the attempt, leaving the read's own intent in place.
     ///
     /// The read's intent stays available so the shell keeps showing what it used and
@@ -707,18 +989,33 @@ public final class PenSyncController {
         attempt = nil
     }
 
+    /// Publishes a phase and releases anyone waiting for the controller to become
+    /// available.
+    ///
+    /// The automatic schedule waits on ``waitUntilAvailable()`` after it asks for a
+    /// read. Releasing the waiters here, rather than at each call site, is what keeps
+    /// a new lap from starting while a read is still in flight or while the user is
+    /// answering a question about which pen to use.
+    private func setPhase(_ next: Phase) {
+        phase = next
+        guard !isBusy, !isAwaitingChoice else { return }
+        let waiters = availabilityWaiters
+        availabilityWaiters.removeAll()
+        for waiter in waiters { waiter.resume() }
+    }
+
     // MARK: - Attempt updates
 
     private func apply(_ stage: PenSyncStage, for generation: Int) {
         guard self.generation == generation else { return }
-        phase = Phase(stage)
+        setPhase(Phase(stage))
     }
 
     private func apply(_ stage: PenImportStage, for generation: Int) {
         guard self.generation == generation else { return }
         switch stage {
-        case .saving: phase = .saving
-        case .exporting: phase = .exporting
+        case .saving: setPhase(.saving)
+        case .exporting: setPhase(.exporting)
         }
     }
 
@@ -740,7 +1037,57 @@ public final class PenSyncController {
             penState: outcome.penState,
             deletingTransfer: outcome.deletingTransfer
         )
-        phase = .complete(updated)
+        setPhase(.complete(updated))
+    }
+
+    /// Records that a read completed, which is what the menu's status line dates.
+    ///
+    /// A read that carried no strokes still completes: the pen was reached and read,
+    /// so reporting that the pen has not synced would be false. Only a read calls
+    /// this. An export retry republishes a read that already completed, so it leaves
+    /// the date alone.
+    private func noteCompletedRead() {
+        lastAttemptResult = .completedRead(at: Date())
+    }
+
+    /// Classifies a failed read for the menu's status line.
+    ///
+    /// A missing pen is its own status rather than a generic failure, because it is
+    /// the condition the interval exists to report on. Two shapes return `nil` so the
+    /// caller records nothing and the previous status stays on show. A cancellation
+    /// is the user withdrawing the read, so nothing failed to be found; every shape
+    /// the error presentation treats as a cancellation is listed, because the
+    /// session, the transport, and Swift's own task cancellation all produce one. A
+    /// several-pens answer is a question rather than a failure, and the app is
+    /// waiting for the user to answer it.
+    private static func result(for error: any Error) -> AttemptResult? {
+        switch error {
+        case let bluetoothError as PenBluetoothError:
+            switch bluetoothError {
+            case .noMatchingPenFound: return .notDetected
+            case .multiplePensFound: return nil
+            case .cancelled: return nil
+            default: return .failed
+            }
+        case let sessionError as PenSessionError:
+            return sessionError == .cancelled ? nil : .failed
+        case is CancellationError:
+            return nil
+        default:
+            return .failed
+        }
+    }
+
+    /// Records a failed read and publishes its failure.
+    ///
+    /// Only a read goes through here. The export retry calls ``fail(with:for:)``
+    /// directly, because a failed republish does not change when the pen last synced.
+    private func failRead(with error: any Error, for generation: Int) {
+        guard self.generation == generation else { return }
+        if let result = Self.result(for: error) {
+            lastAttemptResult = result
+        }
+        fail(with: error, for: generation)
     }
 
     private func fail(with error: any Error, for generation: Int) {
@@ -758,15 +1105,17 @@ public final class PenSyncController {
             attempt = nil
             nextReadCleanupMode = attemptCleanupMode
             nextReadCleanupConfirmed = attemptCleanupConfirmed
-            phase = .choosingPen(candidates: candidates)
+            setPhase(.choosingPen(candidates: candidates))
             return
         }
 
         settle()
 
-        phase = .failed(
-            message: penSyncErrorMessage(for: error),
-            diagnostic: penSyncErrorDiagnostic(for: error)
+        setPhase(
+            .failed(
+                message: penSyncErrorMessage(for: error),
+                diagnostic: penSyncErrorDiagnostic(for: error)
+            )
         )
     }
 }

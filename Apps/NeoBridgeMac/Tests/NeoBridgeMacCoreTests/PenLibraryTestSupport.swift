@@ -373,6 +373,9 @@ actor StubImportCoordinator: PenImportCoordinator {
     /// The report a publication retry returns.
     let retryReport: PenExportReport
 
+    /// The error a publication retry throws, or `nil` for one that returns a report.
+    let retryFailure: (any Error & Sendable)?
+
     /// The report a deleting batch's publication returns.
     let publishReport: PenExportReport
 
@@ -386,6 +389,7 @@ actor StubImportCoordinator: PenImportCoordinator {
         exporting: Gate = Gate(),
         retry: Gate = Gate(isOpen: true),
         retryReport: PenExportReport = PenExportReport(artifacts: []),
+        retryFailure: (any Error & Sendable)? = nil,
         publishReport: PenExportReport = PenExportReport(artifacts: [])
     ) {
         self.outcome = outcome
@@ -394,6 +398,7 @@ actor StubImportCoordinator: PenImportCoordinator {
         self.exporting = exporting
         self.retry = retry
         self.retryReport = retryReport
+        self.retryFailure = retryFailure
         self.publishReport = publishReport
     }
 
@@ -436,6 +441,7 @@ actor StubImportCoordinator: PenImportCoordinator {
 
     func retryExport(batchID: UUID, request: PenExportRequest) async throws -> PenExportReport {
         await retry.wait()
+        if let retryFailure { throw retryFailure }
         return retryReport
     }
 }
