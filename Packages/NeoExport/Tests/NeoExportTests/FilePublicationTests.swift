@@ -4,8 +4,8 @@ import XCTest
 
 @testable import NeoExport
 
-/// Tests for safe publication: atomic replacement, the bounded backup history,
-/// symlink refusal, per-file reporting, and retry.
+/// Tests for safe publication: atomic replacement, the format-specific backup
+/// rules, symlink refusal, per-file reporting, and retry.
 final class FilePublicationTests: XCTestCase {
     private let page = PageIdentity(section: 3, owner: 27, book: 700, page: 1)
     private var directory: TemporaryExportDirectory!
@@ -21,10 +21,13 @@ final class FilePublicationTests: XCTestCase {
 
     // MARK: - Helpers
 
-    private func stroke(x: Int32) -> Stroke {
+    private func stroke(
+        x: Int32,
+        origin: PenOriginTime = .reliable(milliseconds: 1_700_000_000_000)
+    ) -> Stroke {
         Stroke(
             page: page,
-            originTime: .reliable(milliseconds: 1_700_000_000_000),
+            originTime: origin,
             points: [PenPoint(x: x, y: 0, penTimeOffsetMilliseconds: 0, pressure: 5)],
             source: .offline
         )
@@ -34,8 +37,27 @@ final class FilePublicationTests: XCTestCase {
         PenExportRequest(pages: [page], destinationDirectory: directory.url.path)
     }
 
+    private func content(_ strokes: [Stroke]) -> [PenPageContent] {
+        [PenPageContent(page: page, strokes: strokes)]
+    }
+
     private func content(x: Int32) -> [PenPageContent] {
-        [PenPageContent(page: page, strokes: [stroke(x: x)])]
+        content([stroke(x: x)])
+    }
+
+    private func jsonText(_ strokes: [Stroke]) -> String {
+        String(
+            decoding: JSONPageRenderer.render(PageExportDocument(page: page, strokes: strokes)),
+            as: UTF8.self
+        )
+    }
+
+    private func backupPath(_ format: PenExportFormat, depth: Int) -> String {
+        "\(targetPath(format)).bak\(depth)"
+    }
+
+    private func backupExists(_ format: PenExportFormat, depth: Int = 1) -> Bool {
+        FileManager.default.fileExists(atPath: backupPath(format, depth: depth))
     }
 
     private func targetPath(_ format: PenExportFormat) -> String {
@@ -132,6 +154,213 @@ final class FilePublicationTests: XCTestCase {
         XCTAssertFalse(
             FileManager.default.fileExists(atPath: "\(path).bak4"),
             "the history is bounded at three versions"
+        )
+    }
+
+    // MARK: - Backups by format
+
+    func testOrdinaryPageGrowthReplacesTheJSONWithoutABackup() async throws {
+        let publisher = FilePenExportPublisher()
+        _ = await publisher.publish(request(), content: content(x: 10))
+
+        // The library's page grew: the export is the whole page, not the new
+        // strokes alone.
+        let report = await publisher.publish(
+            request(),
+            content: content([stroke(x: 10), stroke(x: 20)])
+        )
+
+        XCTAssertTrue(report.succeeded)
+        XCTAssertEqual(report.published.map(\.format), [.json, .svg, .markdown])
+
+        let json = try read(targetPath(.json))
+        XCTAssertTrue(json.contains("\"x\": 10"), "the earlier stroke must remain exported")
+        XCTAssertTrue(json.contains("\"x\": 20"))
+        XCTAssertFalse(
+            backupExists(.json),
+            "an export that only adds strokes must not create a backup"
+        )
+        XCTAssertFalse(backupExists(.svg), "a regenerated drawing needs no history")
+        XCTAssertFalse(backupExists(.markdown), "a regenerated page needs no history")
+    }
+
+    func testAJSONThatLostAStrokeIsPreservedBeforeReplacement() async throws {
+        let publisher = FilePenExportPublisher()
+        _ = await publisher.publish(request(), content: content([stroke(x: 10), stroke(x: 20)]))
+        let earlier = try read(targetPath(.json))
+
+        // The library no longer holds the x=10 stroke, so the old record holds
+        // data the new export cannot reproduce.
+        let report = await publisher.publish(request(), content: content(x: 20))
+
+        XCTAssertTrue(report.succeeded)
+        XCTAssertEqual(
+            try read(backupPath(.json, depth: 1)),
+            earlier,
+            "the record with the lost stroke must stay recoverable"
+        )
+        XCTAssertEqual(
+            try read(targetPath(.json)),
+            jsonText([stroke(x: 20)]),
+            "the target follows the library, and no prior file data is merged into it"
+        )
+        XCTAssertFalse(
+            backupExists(.svg),
+            "the drawing is regenerated, so it needs no history even when it changes"
+        )
+    }
+
+    func testALostDuplicateStrokeOccurrenceIsPreserved() async throws {
+        let publisher = FilePenExportPublisher()
+        // Two strokes with identical content: the library retained both, so the
+        // record legitimately holds two occurrences of one stroke.
+        _ = await publisher.publish(request(), content: content([stroke(x: 10), stroke(x: 10)]))
+        let earlier = try read(targetPath(.json))
+
+        let report = await publisher.publish(request(), content: content(x: 10))
+
+        XCTAssertTrue(report.succeeded)
+        XCTAssertEqual(
+            try read(backupPath(.json, depth: 1)),
+            earlier,
+            "losing one of two identical occurrences is still a loss"
+        )
+        XCTAssertEqual(try read(targetPath(.json)), jsonText([stroke(x: 10)]))
+    }
+
+    func testAJSONTargetThisBuildCannotCompareIsPreserved() async throws {
+        let publisher = FilePenExportPublisher()
+        let handWritten = "{\n  \"formatVersion\": 99,\n  \"note\": \"a later build\"\n}\n"
+        try write(handWritten, to: targetPath(.json))
+
+        let report = await publisher.publish(request(), content: content(x: 10))
+
+        XCTAssertTrue(report.succeeded)
+        XCTAssertEqual(try read(backupPath(.json, depth: 1)), handWritten)
+        XCTAssertEqual(try read(targetPath(.json)), jsonText([stroke(x: 10)]))
+    }
+
+    func testAJSONTargetOfAnotherPageIsPreserved() async throws {
+        let publisher = FilePenExportPublisher()
+        let otherPage = PageIdentity(section: 3, owner: 27, book: 700, page: 2)
+        let other = String(
+            decoding: JSONPageRenderer.render(
+                PageExportDocument(page: otherPage, strokes: [stroke(x: 10)])
+            ),
+            as: UTF8.self
+        )
+        try write(other, to: targetPath(.json))
+
+        let report = await publisher.publish(request(), content: content(x: 10))
+
+        XCTAssertTrue(report.succeeded)
+        XCTAssertEqual(
+            try read(backupPath(.json, depth: 1)),
+            other,
+            "a record of another page is kept rather than compared"
+        )
+        XCTAssertEqual(try read(targetPath(.json)), jsonText([stroke(x: 10)]))
+    }
+
+    func testARecordWhoseReportedOriginTimeChangedIsPreserved() async throws {
+        let publisher = FilePenExportPublisher()
+        _ = await publisher.publish(
+            request(),
+            content: content([stroke(x: 10, origin: .unreliable(reportedMilliseconds: nil))])
+        )
+        let earlier = try read(targetPath(.json))
+        XCTAssertTrue(
+            earlier.contains("\"originTimeMilliseconds\": null"),
+            "the first record must carry an absent reported time"
+        )
+
+        // The library now reports zero for the same mark. The two records say
+        // different things, so the file's version is not redundant.
+        let report = await publisher.publish(
+            request(),
+            content: content([stroke(x: 10, origin: .unreliable(reportedMilliseconds: 0))])
+        )
+
+        XCTAssertTrue(report.succeeded)
+        XCTAssertEqual(
+            try read(backupPath(.json, depth: 1)),
+            earlier,
+            "a record whose reported origin time changed must be preserved"
+        )
+        XCTAssertTrue(try read(targetPath(.json)).contains("\"originTimeMilliseconds\": 0"))
+    }
+
+    func testBackupFilesAnEarlierReleaseLeftAreLeftInPlace() async throws {
+        let publisher = FilePenExportPublisher()
+        _ = await publisher.publish(request(), content: content(x: 10))
+
+        // What an earlier release left beside each generated file, because it filed
+        // a backup for every format.
+        var legacy: [String: String] = [:]
+        for format in [PenExportFormat.svg, .markdown] {
+            for depth in 1...3 {
+                let path = backupPath(format, depth: depth)
+                let text = "\(format.fileExtension) backup \(depth)\n"
+                try write(text, to: path)
+                legacy[path] = text
+            }
+        }
+
+        // A later export replaces both generated files.
+        let report = await publisher.publish(
+            request(),
+            content: content([stroke(x: 10), stroke(x: 20)])
+        )
+
+        XCTAssertEqual(report.published.map(\.format), [.json, .svg, .markdown])
+        for (path, text) in legacy {
+            XCTAssertEqual(try read(path), text, "\(path) must be left exactly as it is")
+        }
+    }
+
+    func testAChangedDrawingAndPageAreReplacedWithoutBackups() async throws {
+        let publisher = FilePenExportPublisher()
+        _ = await publisher.publish(request(), content: content(x: 10))
+        let drawing = try read(targetPath(.svg))
+        let page = try read(targetPath(.markdown))
+
+        let report = await publisher.publish(
+            request(),
+            content: content([stroke(x: 10), stroke(x: 20)])
+        )
+
+        XCTAssertEqual(report.published.map(\.format), [.json, .svg, .markdown])
+        XCTAssertNotEqual(try read(targetPath(.svg)), drawing)
+        XCTAssertNotEqual(try read(targetPath(.markdown)), page)
+
+        for format in [PenExportFormat.svg, .markdown] {
+            XCTAssertFalse(backupExists(format), "\(format) must never file a backup")
+            XCTAssertFalse(
+                FileManager.default.fileExists(atPath: backupPath(format, depth: 3)),
+                "\(format) must never rotate a backup history"
+            )
+        }
+    }
+
+    func testASymlinkInAnUnusedBackupSlotDoesNotBlockAGeneratedFormat() async throws {
+        let publisher = FilePenExportPublisher()
+        _ = await publisher.publish(request(), content: content(x: 10))
+
+        // A link left beside a drawing by an older release: the drawing's current
+        // policy never touches that slot, so the export must not be refused for it.
+        let outside = directory.url.appendingPathComponent("outside.svg")
+        try write("outside\n", to: outside.path)
+        let slot = backupPath(.svg, depth: 1)
+        try FileManager.default.createSymbolicLink(atPath: slot, withDestinationPath: outside.path)
+
+        let report = await publisher.publish(request(), content: content(x: 20))
+
+        XCTAssertTrue(report.succeeded, "an unused backup slot is not a hazard")
+        XCTAssertEqual(report.published.map(\.format), [.json, .svg])
+        XCTAssertEqual(try read(outside.path), "outside\n", "the link target must not be written")
+        XCTAssertNotNil(
+            try? FileManager.default.destinationOfSymbolicLink(atPath: slot),
+            "the unused link must be left where it is"
         )
     }
 

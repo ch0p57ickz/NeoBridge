@@ -5,7 +5,8 @@ This record captures the Linux verification required by
 tasks 1.1, 1.2, and 4.2, by
 `openspec/changes/archive/2026-10-19-correct-a1-codec-from-hardware-evidence/tasks.md` task 3.5, and
 by `openspec/changes/archive/2026-10-19-add-macos-connect-and-sync/tasks.md` tasks 1.8 and 4.3,
-and by `openspec/changes/add-persistence-and-deterministic-export/tasks.md` tasks 1.2, 2.1–2.4, 3.1–3.3, 4.2, 5.1, 5.2, and 5.3.
+and by `openspec/changes/add-persistence-and-deterministic-export/tasks.md` tasks 1.2, 2.1–2.4, 3.1–3.3, 4.2, 5.1, 5.2, and 5.3,
+and by `openspec/changes/reduce-redundant-export-backups/tasks.md` task 3.2.
 
 ## Command
 
@@ -448,6 +449,133 @@ Linux side turns the pax `LIBARCHIVE.xattr.*` records a macOS `tar` emits into
 `._x.json` as a fixture, which fails with a JSON decode error. Strip them after
 copying (`find /work3 -name '._*' -delete`) or copy with a method that does not
 carry extended attributes.
+
+## Verification for `reduce-redundant-export-backups`
+
+Task 3.2 requires the portable script and the macOS app gate to pass with the new
+format-specific backup rule. Both hosts ran the whole script. The counts and the
+mutation table below are from the run that includes the review follow-up, which
+compares strokes by their complete content so that an absent reported origin time
+stays distinct from a reported zero.
+
+| Item | Linux | macOS |
+| --- | --- | --- |
+| Host platform | Ubuntu (aarch64) in a Docker container on macOS 27.2 (26B5112a), arm64 | macOS 27.2 (26B5112a), arm64 |
+| Toolchain | Swift 6.4.1 (swift-6.4.1-RELEASE), target `aarch64-unknown-linux-gnu` | Apple Swift 6.4 (swiftlang-6.4.0.34.1), target `arm64-apple-macosx27.2.0` |
+| Xcode | Not used | 27.1 (27A9275), SDK `MacOSX27.0` |
+| Bluetooth hardware | Not used | Not used |
+
+```bash
+docker run -d --name neobridge-swift64 -v "$PWD":/src:ro swift:6.4.1 sleep infinity
+docker exec neobridge-swift64 bash -lc 'apt-get update -qq && apt-get install -y -qq libsqlite3-dev'
+docker exec neobridge-swift64 bash -lc \
+  'mkdir -p /work && cd /src && tar --exclude=./.build --exclude=./.git -cf - . \
+     | (cd /work && tar -xf -) && cd /work && find . -name "._*" -delete \
+     && ./Scripts/test-portable.sh'
+```
+
+`libsqlite3-dev` is installed before the run because the `swift:6.4.1` image does
+not carry `sqlite3.h`, which check 4 of the script requires. The copy excludes
+`.build`, which holds macOS build products that a Linux container cannot reuse, and
+the `._*` sidecars are deleted for the reason recorded under *Copying the
+repository into the Linux container*.
+
+```text
+== Toolchain
+Swift version 6.4.1 (swift-6.4.1-RELEASE)
+Target: aarch64-unknown-linux-gnu
+== SQLite header check
+ok: the SQLite development header is available
+== Forbidden import check
+ok: Packages/NeoCore imports no Apple-only framework
+ok: Packages/NeoProtocol imports no Apple-only framework
+ok: Packages/NeoStorage imports no Apple-only framework
+ok: Packages/NeoExport imports no Apple-only framework
+ok: Tests/Integration imports no Apple-only framework
+== Pinned dependency resolution
+-- swift build --disable-automatic-resolution (Packages/NeoCore)
+-- swift build --disable-automatic-resolution (Packages/NeoProtocol)
+-- swift build --disable-automatic-resolution (Packages/NeoStorage)
+-- swift build --disable-automatic-resolution (Packages/NeoExport)
+-- swift build --disable-automatic-resolution (Tests/Integration)
+== Package tests
+-- swift test (Packages/NeoCore)      62 tests, 0 failures
+-- swift test (Packages/NeoProtocol)  177 tests, 0 failures
+-- swift test (Packages/NeoStorage)   91 tests, 0 failures
+-- swift test (Packages/NeoExport)    79 tests, 0 failures
+-- swift test (Tests/Integration)     21 tests, 0 failures
+== Result
+PASSED: portable packages build with pinned dependencies, import no Apple-only framework, and pass their tests, and the integration scenarios pass.
+```
+
+The same run under the Apple toolchain, with the app's own tests and the full Mac
+build behind it:
+
+```bash
+SWIFT="$HOME/.local/share/swiftly/bin/swift" Scripts/test-portable.sh
+(cd Apps/NeoBridgeMac && swift test)
+Scripts/remote-mac-build.sh
+```
+
+```text
+-- swift test (Packages/NeoCore)      62 tests, 0 failures
+-- swift test (Packages/NeoProtocol)  177 tests, 0 failures
+-- swift test (Packages/NeoStorage)   91 tests, 0 failures
+-- swift test (Packages/NeoExport)    79 tests, 0 failures
+-- swift test (Tests/Integration)     21 tests, 0 failures
+== Result
+PASSED: portable packages build with pinned dependencies, import no Apple-only framework, and pass their tests, and the integration scenarios pass.
+```
+
+```text
+Scripts/remote-mac-build.sh
+== App build (Xcode)
+ok: the Xcode build succeeded.
+== Bundle
+assembled Apps/NeoBridgeMac/.build/bundle/NeoBridgeMac.app
+== Bundle verification
+ok: CFBundleIdentifier = com.sushidev.neobridge.mac
+ok: NSBluetoothAlwaysUsageDescription = NeoBridge reads offline strokes from a Neo Smartpen A1 over Bluetooth.
+ok: LSUIElement = true
+== Result
+PASSED: portable packages verified, app built under SwiftPM and Xcode, bundle assembled.
+```
+
+```text
+(cd Apps/NeoBridgeMac && swift test)
+     Executed 159 tests, with 0 failures (0 unexpected)
+```
+
+`NeoExport` grew from 41 tests to 79. The 38 new ones are the comparison behind the
+backup rule, not another renderer pass:
+
+| Suite | Tests | Covers |
+| --- | --- | --- |
+| `ExistingJSONPageTests` | 15, new | The strict version-1 record reader and the multiset comparison, including an absent reported origin time against a reported zero |
+| `StrictJSONReaderTests` | 14, new | Duplicate keys, trailing content, escapes, numbers, nesting |
+| `FilePublicationTests` | 23, was 14 | Ordinary growth, a lost stroke, a lost duplicate occurrence, a changed reported origin time, an unreadable record, a record of another page, generated formats, an unused backup slot, and the backup files an earlier release left beside the SVG and Markdown targets |
+
+`PageExportGoldenTests` stays at 27, so the renderers were not touched.
+
+No other count moved: `NeoStorage` stays at 91, because the importer's own
+behaviour is unchanged, and `Tests/Integration` gained one scenario (20 to 21) for
+a library that no longer holds a page's earlier strokes.
+
+Five mutations were checked, and each one fails the tests that pin the behaviour:
+
+| Mutation | Fails |
+| --- | --- |
+| Compare distinct strokes instead of counted occurrences | `ExistingJSONPageTests.testALostDuplicateOccurrenceIsNotSuperseded`, `FilePublicationTests.testALostDuplicateStrokeOccurrenceIsPreserved` |
+| Compare strokes by the canonical encoding, which stores an absent reported origin time as zero | `ExistingJSONPageTests.testAnUnreportedOriginTimeIsNotAReportedZero`, `FilePublicationTests.testARecordWhoseReportedOriginTimeChangedIsPreserved` |
+| Let a repeated JSON member collapse into the last value | `ExistingJSONPageTests.testAFieldThisBuildCannotValidateIsRefused` (the page, stroke, and point cases) |
+| File a backup for a changed SVG and Markdown | four `FilePublicationTests` cases and `OfflineSessionIntegrationTests.testALaterReadAppendsToAStoredPageAndRepublishesTheCombinedFile` |
+| Never file a JSON backup | `OfflineSessionIntegrationTests.testARecordTheLibraryCannotAccountForIsPreservedBeforeItIsReplaced` |
+
+Recorded on 2026-10-21.
+
+Physical A1 acceptance was not run and is not required by this change: it alters no
+protocol command, no transfer option, and no deletion gate, so no new pen evidence
+is claimed here.
 
 ## Fixture sanitization
 

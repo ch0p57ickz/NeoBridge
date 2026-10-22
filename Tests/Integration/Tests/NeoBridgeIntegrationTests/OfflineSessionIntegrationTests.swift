@@ -12,6 +12,23 @@ import NeoBridgeIntegration
 /// Each scenario runs the whole portable path — session, storage, export — with
 /// no platform type and no radio, so it runs on Linux as well as macOS.
 final class OfflineSessionIntegrationTests: XCTestCase {
+    /// A stroke of one page, with a coordinate that identifies it.
+    private func stroke(page: PageIdentity, milliseconds: Int64) -> Stroke {
+        Stroke(
+            page: page,
+            originTime: .reliable(milliseconds: milliseconds),
+            points: [
+                PenPoint(
+                    x: Int32(milliseconds),
+                    y: 0,
+                    penTimeOffsetMilliseconds: 0,
+                    pressure: 2
+                )
+            ],
+            source: .offline
+        )
+    }
+
     // MARK: - Offline import
 
     func testOfflineSessionImportsAndExportsEveryPage() async throws {
@@ -121,6 +138,10 @@ final class OfflineSessionIntegrationTests: XCTestCase {
         )
         let svgPath = workspace.exportDirectory
             .appendingPathComponent(PageExportDocument(page: page, strokes: []).fileName(for: .svg))
+        let jsonPath = workspace.exportDirectory
+            .appendingPathComponent(PageExportDocument(page: page, strokes: []).fileName(for: .json))
+        let markdownPath = workspace.exportDirectory
+            .appendingPathComponent(PageExportDocument(page: page, strokes: []).fileName(for: .markdown))
         let svgBefore = try Data(contentsOf: svgPath)
 
         // A later read of the same page, carrying two strokes no read has delivered.
@@ -200,23 +221,124 @@ final class OfflineSessionIntegrationTests: XCTestCase {
             svgAfter.contains("<desc>\(storedAfter.count) stroke(s)"),
             "the regenerated SVG must carry every stored stroke, not only the new ones"
         )
-
-        // Replacing a differing target preserves the version it replaced.
-        let backupPath = workspace.exportDirectory
-            .appendingPathComponent(
-                PageExportDocument(page: page, strokes: [])
-                    .backupFileName(for: .svg, depth: 1)
-            )
-        let svgBackup = try Data(contentsOf: backupPath)
-        XCTAssertEqual(
-            svgBackup,
-            svgBefore,
-            "the SVG replaced by the combined version must stay recoverable"
-        )
         XCTAssertNotEqual(
             svgAfterData,
             svgBefore,
             "the SVG must have been regenerated, not left as the earlier version"
+        )
+
+        // The JSON record is the union too, and ordinary growth is not a conflict:
+        // the record it replaced held nothing the new export lost.
+        let jsonAfter = String(decoding: try Data(contentsOf: jsonPath), as: UTF8.self)
+        XCTAssertEqual(
+            jsonAfter.components(separatedBy: "\"originTimeReliable\"").count - 1,
+            storedAfter.count,
+            "the replacement record must carry every stored stroke, not only the new ones"
+        )
+        XCTAssertEqual(
+            jsonAfter,
+            String(
+                decoding: JSONPageRenderer.render(
+                    PageExportDocument(page: page, strokes: storedAfter)
+                ),
+                as: UTF8.self
+            ),
+            "the record must be derived from the stored page alone"
+        )
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: jsonPath.appendingPathExtension("bak1").path),
+            "ordinary page growth must not create a JSON backup"
+        )
+        // The generated formats are projections of the same page, so a changed one
+        // is replaced with no backup beside it.
+        for path in [svgPath, markdownPath] {
+            XCTAssertFalse(
+                FileManager.default.fileExists(atPath: path.appendingPathExtension("bak1").path),
+                "\(path.lastPathComponent) must not be backed up"
+            )
+        }
+    }
+
+    /// A library that no longer holds a page's earlier strokes must not lose the
+    /// record that still describes them.
+    ///
+    /// The record is the only copy of that data once the library has been reset, so
+    /// it is preserved before the target follows the library. The target itself is
+    /// never built from the file: no prior record data is merged into the export,
+    /// and the backup is not read back into the library.
+    func testARecordTheLibraryCannotAccountForIsPreservedBeforeItIsReplaced() async throws {
+        let fixture = try IntegrationFixtures.offlineSession()
+        let workspace = try IntegrationWorkspace()
+        defer { workspace.remove() }
+
+        let captured = try XCTUnwrap(fixture.expectedPage)
+        let page = PageIdentity(
+            section: captured.section,
+            owner: captured.owner,
+            book: captured.book,
+            page: captured.page
+        )
+        let names = PageExportDocument(page: page, strokes: [])
+        let jsonPath = workspace.exportDirectory.appendingPathComponent(names.fileName(for: .json))
+
+        // What an earlier and fuller library left in the export folder: two strokes
+        // of this page.
+        let earlierStrokes = [stroke(page: page, milliseconds: 1), stroke(page: page, milliseconds: 2)]
+        let earlier = JSONPageRenderer.render(
+            PageExportDocument(page: page, strokes: earlierStrokes)
+        )
+        try Data(earlier).write(to: jsonPath)
+
+        // A reset library: a fresh database in the same folder, which is what a user
+        // has after the library is deleted while the export folder stays. A later
+        // read delivers one of the two strokes, so the record holds the other.
+        let resetLibrary = try SQLitePenLibrary(
+            url: workspace.root.appendingPathComponent("reset.sqlite")
+        )
+        let reset = PenLibraryImporter(
+            store: resetLibrary,
+            batches: resetLibrary,
+            journal: resetLibrary,
+            publisher: FilePenExportPublisher(),
+            policy: workspace.policy
+        )
+        let second = try await reset.importRead(
+            PenReadTransfer(strokes: [earlierStrokes[1]], noteCount: 1),
+            export: workspace.exportRequest(pages: [page])
+        )
+        XCTAssertTrue(try XCTUnwrap(second.export).succeeded)
+
+        // The record the library cannot account for stays recoverable...
+        let preserved = try Data(contentsOf: jsonPath.appendingPathExtension("bak1"))
+        XCTAssertEqual(
+            preserved,
+            Data(earlier),
+            "a record with strokes the library lost must be preserved"
+        )
+        // ... the primary file follows the library, with nothing merged from it ...
+        let stored = try await resetLibrary.strokes(on: page)
+        XCTAssertEqual(stored.count, 1, "the older record must not be read back into the library")
+        let replaced = String(decoding: try Data(contentsOf: jsonPath), as: UTF8.self)
+        XCTAssertEqual(
+            replaced,
+            String(
+                decoding: JSONPageRenderer.render(
+                    PageExportDocument(page: page, strokes: stored)
+                ),
+                as: UTF8.self
+            ),
+            "the replacement record must be derived from the stored page alone"
+        )
+        XCTAssertTrue(replaced.contains("\"x\": 2"))
+        XCTAssertFalse(replaced.contains("\"x\": 1,"), "the lost stroke must not be merged back in")
+        // ... and a projection of the same page is replaced without a backup.
+        let drawingPath = workspace.exportDirectory
+            .appendingPathComponent(names.fileName(for: .svg))
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: drawingPath.appendingPathExtension("bak1").path
+            ),
+            "a changed drawing is replaced without a backup"
         )
     }
 

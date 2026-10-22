@@ -8,8 +8,13 @@ import NeoCore
 /// directory path and never asks the platform for permission. On macOS the app
 /// resolves the user's security-scoped bookmark first, then hands this type the
 /// path.
+///
+/// The library is the source of truth for every format. A JSON target is kept
+/// only when the record it holds cannot be validated or carries a stroke
+/// occurrence the new export does not, and the SVG and Markdown targets are
+/// replaced outright. See ``backupPolicy(for:document:)``.
 public struct FilePenExportPublisher: PenExportPublisher {
-    /// How many prior versions of each target file are kept.
+    /// How many prior versions of a JSON record are kept.
     public static let backupDepth = 3
 
     /// The file manager used for directory checks and backup rotation.
@@ -35,7 +40,11 @@ public struct FilePenExportPublisher: PenExportPublisher {
                 let bytes = Self.render(document, format: format)
                 let target = directory.appendingPathComponent(document.fileName(for: format))
                 let status: PenExportFileStatus = directoryProblem.map(PenExportFileStatus.failed)
-                    ?? writer.publish(bytes: bytes, to: target)
+                    ?? writer.publish(
+                        bytes: bytes,
+                        to: target,
+                        backup: Self.backupPolicy(for: format, document: document)
+                    )
 
                 artifacts.append(
                     PenExportArtifact(
@@ -57,6 +66,36 @@ public struct FilePenExportPublisher: PenExportPublisher {
         case .json: return JSONPageRenderer.render(document)
         case .svg: return SVGPageRenderer.render(document)
         case .markdown: return MarkdownPageRenderer.render(document)
+        }
+    }
+
+    /// What one format does with a target whose content changed.
+    ///
+    /// The JSON record is the only file that can hold data the library has lost:
+    /// a page that was later reset, or a library that was rebuilt from a partial
+    /// read, can leave a record with strokes the new export no longer has. Such a
+    /// record is validated against the version-1 layout and compared stroke
+    /// occurrence by occurrence, and its prior bytes are kept only when the new
+    /// export does not already carry everything the record says. Ordinary growth,
+    /// a reordering, a reformatting, or a record of another page compares as no
+    /// loss, so it is replaced without a backup.
+    ///
+    /// An SVG drawing and a Markdown page are projections of the same page data,
+    /// so a changed one is replaced without a backup whatever it contains.
+    static func backupPolicy(
+        for format: PenExportFormat,
+        document: PageExportDocument
+    ) -> BackupPolicy {
+        switch format {
+        case .svg, .markdown:
+            return .never
+        case .json:
+            return .whenNeeded { existing in
+                // Bytes this build cannot validate might carry page data, so they
+                // are kept rather than compared.
+                guard let record = ExistingJSONPage.read(existing) else { return true }
+                return !record.isSupersededBy(document)
+            }
         }
     }
 
